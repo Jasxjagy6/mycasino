@@ -4866,12 +4866,18 @@ class AutoSweeper:
 global_deposit_db = DepositDatabase()
 
 def build_deposit_menu():
-    """Build deposit menu dynamically based on available chains"""
+    """Build deposit menu dynamically based on available chains.
+
+    NOTE: this view intentionally uses plain unicode emoji rather than
+    premium <tg-emoji> tags because invalid emoji IDs make Telegram reject
+    the entire message with MESSAGE_HAS_INVALID_CUSTOM_EMOJI_ID, which
+    would cause /deposit to show users "an error occurred".
+    """
     # Build chain list based on availability
     chains_text = [
-        f"{pe('eth')} <b>Ethereum (ETH)</b> - ETH, USDT, USDC",
-        f"{pe('bnb')} <b>BNB Chain (BNB)</b> - BNB, USDT, USDC",
-        f"{pe('base')} <b>Base</b> - ETH, USDC",
+        "\U0001F539 <b>Ethereum (ETH)</b> - ETH, USDT, USDC",
+        "\U0001F538 <b>BNB Chain (BNB)</b> - BNB, USDT, USDC",
+        "\U0001F537 <b>Base</b> - ETH, USDC",
     ]
 
     keyboard_rows = [
@@ -4886,13 +4892,13 @@ def build_deposit_menu():
 
     # Add TRON if available
     if TRON_AVAILABLE:
-        chains_text.append(f"{pe('trx')} <b>TRON (TRX)</b> - TRX, USDT")
+        chains_text.append("\U0001F53A <b>TRON (TRX)</b> - TRX, USDT")
         keyboard_rows[-1].append(apply_button_style(InlineKeyboardButton("TRON", callback_data="deposit_TRON"), 'primary', None))
 
     # Add Solana if available
     row_3 = []
     if SOLANA_AVAILABLE:
-        chains_text.append(f"{pe('sol')} <b>Solana (SOL)</b> - SOL, USDT, USDC")
+        chains_text.append("\u25CE <b>Solana (SOL)</b> - SOL, USDT, USDC")
         row_3.append(apply_button_style(InlineKeyboardButton("Solana", callback_data="deposit_SOLANA"), 'primary', None))
 
     # TON deposit removed as per requirements
@@ -4990,18 +4996,24 @@ def check_maintenance(func):
 @check_banned
 @check_maintenance
 async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show deposit options"""
+    """Show deposit options.
+
+    Emojis in this command use plain unicode (no premium <tg-emoji> tags).
+    Invalid/missing custom-emoji IDs cause Telegram to reject the whole
+    message with MESSAGE_HAS_INVALID_CUSTOM_EMOJI_ID, which was surfacing to
+    users as "an error occurred" when running /deposit.
+    """
     user_id = update.effective_user.id
 
     if not DEPOSIT_ENABLED:
-        await update.message.reply_text(f"{pe('cross')} Deposits are currently disabled.")
+        await update.message.reply_text("\u274C Deposits are currently disabled.")
         return
 
     # In group chats, don't show inline buttons - redirect to DM
     if update.effective_chat.type in ['group', 'supergroup']:
         bot_username = await get_bot_username(context)
         await update.message.reply_text(
-            f"{pe('gem')} To deposit, please message me privately: @{bot_username}",
+            f"\U0001F48E To deposit, please message me privately: @{bot_username}",
             parse_mode=ParseMode.HTML
         )
         return
@@ -5036,7 +5048,7 @@ async def deposit_method_callback(update: Update, context: ContextTypes.DEFAULT_
     address = user_data.get(f"{chain.lower()}_address")
 
     if not address:
-        error_msg = f"{pe('cross')} <b>Error Generating {chain} Address</b>\n\n"
+        error_msg = f"\u274C <b>Error Generating {chain} Address</b>\n\n"
         if chain == 'TON':
             error_msg += "TON deposits are currently unavailable. The required library (pytoniq-core) is not installed.\n\n"
             error_msg += "Please contact the administrator or try another chain."
@@ -5078,18 +5090,18 @@ async def deposit_method_callback(update: Update, context: ContextTypes.DEFAULT_
     info = chain_info.get(chain, {})
 
     text = (
-        f"{pe('money')} <b>{info['name']} Deposit Address</b>\n\n"
+        f"\U0001F4B0 <b>{info['name']} Deposit Address</b>\n\n"
         f"<code>{address}</code>\n\n"
         f"<b>Supported Assets:</b> {info['tokens']}\n"
         f"<b>Network:</b> {info['name']}\n"
         f"<b>Min Deposit:</b> ${MIN_DEPOSIT_USD}\n\n"
-        f"{pe('warning')} <b>Important:</b>\n"
-        f"• Only send {info['tokens']} to this address\n"
-        f"• Deposits are automatically credited after {CONFIRMATIONS.get(chain, 10)} confirmations\n"
-        f"• This is your personal deposit address\n\n"
+        f"\u26A0\uFE0F <b>Important:</b>\n"
+        f"\u2022 Only send {info['tokens']} to this address\n"
+        f"\u2022 Deposits are automatically credited after {CONFIRMATIONS.get(chain, 10)} confirmations\n"
+        f"\u2022 This is your personal deposit address\n\n"
         f"<i>Scan QR code or copy address above</i>\n\n"
-        f"{pe('warning')} <b>IMPORTANT:</b> After you have sent your funds, you MUST tap the "
-        f"<b>🔄 Check Status</b> button below. The bot will then actively scan the "
+        f"\u26A0\uFE0F <b>IMPORTANT:</b> After you have sent your funds, you MUST tap the "
+        f"<b>\U0001F504 Check Status</b> button below. The bot will then actively scan the "
         f"blockchain for your deposit for the next 3 minutes."
     )
 
@@ -18756,13 +18768,20 @@ async def rpvp_pvb_target_callback(update: Update, context: ContextTypes.DEFAULT
     emoji = emoji_map.get(game_type, "\U0001f3b2")
     mode_text = "Highest total score wins" if match["mode"] == "normal" else "Lowest total score wins"
 
+    _co_round = match.get("current_round", 1)
+    _co_mult = calculate_cashout_multiplier(match, user_id=user.id)
+    _co_kb = _build_pvb_cashout_keyboard(match_id, _co_round, _co_mult)
+    _register_cashout_button(match_id, user.id, match["chat_id"], _co_round)
+
     await query.edit_message_text(
         f"{pe('game')} {game_type.capitalize()} vs Bot started! (ID: <code>{match_id}</code>)\n"
         f"<b>Mode:</b> {match['mode'].capitalize()} ({mode_text})\n"
         f"<b>Rolls per round:</b> {match['game_rolls']}\n"
         f"<b>Target:</b> First to {target} points wins ${match['bet_amount_usd']*1.96:.2f}.\n\n"
-        f"{user.mention_html()}, <b>Your turn first! Send {match['game_rolls']} {emoji} emoji{'s' if match['game_rolls'] > 1 else ''} to start.</b>",
-        parse_mode=ParseMode.HTML
+        f"{user.mention_html()}, <b>Your turn first! Send {match['game_rolls']} {emoji} emoji{'s' if match['game_rolls'] > 1 else ''} to start.</b>\n"
+        f"Or tap Cashout to collect <b>${match['bet_amount_usd'] * _co_mult:.2f}</b>:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_co_kb
     )
 
     # Schedule timeout
@@ -19388,6 +19407,7 @@ async def xdxw_playbot_callback(update: Update, context: ContextTypes.DEFAULT_TY
     match["user_score"] = 0
     match["bot_score"] = 0
     match["target_score"] = match.get("target_score", 1)
+    match["target_points"] = match["target_score"]
     match["current_round"] = 1
     match["history"] = []
     match["user_rolls"] = []
@@ -19396,18 +19416,27 @@ async def xdxw_playbot_callback(update: Update, context: ContextTypes.DEFAULT_TY
     match["game_mode"] = match.get("mode", "normal")
     match["bot_rolls_first"] = False  # Default: user rolls first
     match["waiting_for"] = "user"  # Track whose turn it is
+    match["players"] = [user.id, 0]
+    match["usernames"] = {user.id: match.get("host_username") or (user.username or f"User_{user.id}"), 0: "Bot"}
+    match["points"] = {user.id: 0, 0: 0}
+    match["player_rolls"] = {user.id: [], 0: []}
 
-    # Show message with option for bot to roll first
-    keyboard = [
-        [InlineKeyboardButton("Bot Rolls First", callback_data=f"xdxw_bot_first_{match_id}")]
-    ]
+    # Build keyboard with BLUE 'Bot Rolls First' on top and GREEN Cashout below.
+    bot_first_btn = apply_button_style(
+        InlineKeyboardButton("Bot Rolls First", callback_data=f"xdxw_bot_first_{match_id}"),
+        'primary', peb('robot')
+    )
+    _co_round = match.get("current_round", 1)
+    _co_mult = calculate_cashout_multiplier(match, user_id=user.id)
+    keyboard = _build_pvb_cashout_keyboard(match_id, _co_round, _co_mult, extra_top_row=[bot_first_btn])
+    _register_cashout_button(match_id, user.id, query.message.chat_id, _co_round)
 
     await query.edit_message_text(
         f"{pe('robot')} <b>PLAYING WITH BOT!</b>\n\n"
         f"<b>Your turn first!</b> Send {match['game_rolls']} {emoji} to start round 1.\n\n"
-        f"<i>Or tap the button below if you want the bot to roll first.</i>",
+        f"<i>Tap </i><b>Bot Rolls First</b><i> to swap turn order, or </i><b>Cashout</b><i> to collect </i><b>${match['bet_amount_usd'] * _co_mult:.2f}</b><i> now.</i>",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=keyboard
     )
 
 # Callback for "Bot Rolls First" in XdX'w PvB mode
@@ -19481,16 +19510,26 @@ async def xdxw_bot_first_callback(update: Update, context: ContextTypes.DEFAULT_
     # Clear rolling flag and store bot roll values
     match.pop('bot_is_rolling', None)
     context.user_data['pre_rolled_bot_values'] = bot_rolls
+    if "player_rolls" in match and 0 in match["player_rolls"]:
+        match["player_rolls"][0] = list(bot_rolls)
 
     # Get user for mention
     user_id = match.get("host_id")
     user_mention = f'<a href="tg://user?id={user_id}">Player</a>' if user_id else "Player"
 
+    # Cashout button (green) for the player
+    _co_round = match.get("current_round", 1)
+    _co_mult = calculate_cashout_multiplier(match, user_id=user_id)
+    _co_kb = _build_pvb_cashout_keyboard(match_id, _co_round, _co_mult)
+    _register_cashout_button(match_id, user_id, chat_id, _co_round)
+
     await context.bot.send_message(
         chat_id=chat_id,
         text=f"{pe('robot')} Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n"
-             f"{user_mention}, <b>Your turn!</b> Send {game_rolls} {emoji} to respond.",
-        parse_mode=ParseMode.HTML
+             f"{user_mention}, <b>Your turn!</b> Send {game_rolls} {emoji} to respond.\n"
+             f"Or tap Cashout to collect <b>${match.get('bet_amount_usd', match.get('bet_amount', 0)) * _co_mult:.2f}</b>:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_co_kb
     )
 
     # Schedule PvB timeout
@@ -19948,6 +19987,12 @@ async def group_challenge_cancel_callback(update: Update, context: ContextTypes.
     await query.answer()
     match["status"] = "cancelled"
 
+    # Void any side bets placed on this (never-started) match and refund bettors
+    try:
+        await void_sidebets_for_cashout(match_id, context)
+    except Exception as e:
+        logging.warning(f"Failed to void sidebets on group cancel: {e}")
+
     # Unpin if pinned
     if 'pinned_message_id' in match:
         try:
@@ -19959,6 +20004,51 @@ async def group_challenge_cancel_callback(update: Update, context: ContextTypes.
         f"{pe('cross')} Challenge cancelled by {user.mention_html()}.",
         parse_mode=ParseMode.HTML
     )
+
+
+# Callback for cancelling XdX'w challenge (after the "Accept Challenge" screen is shown)
+@check_banned
+@check_maintenance
+async def xdxw_cancel_match_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the ^xdxw_cancel_<match_id>$ cancel button shown next to
+    Play-with-Bot / Accept-Challenge. Only the host can cancel."""
+    query = update.callback_query
+    user = query.from_user
+    match_id = query.data.replace("xdxw_cancel_", "")
+    match = game_sessions.get(match_id)
+
+    if not match or match.get("status") != "pending":
+        await query.answer("This challenge is no longer available.", show_alert=True)
+        return
+
+    if user.id != match.get("host_id"):
+        await query.answer("Only the host can cancel this challenge!", show_alert=True)
+        return
+
+    await query.answer()
+    match["status"] = "cancelled"
+
+    # Void any side bets placed on this (never-started) match and refund bettors
+    try:
+        await void_sidebets_for_cashout(match_id, context)
+    except Exception as e:
+        logging.warning(f"Failed to void sidebets on xdxw cancel: {e}")
+
+    # Unpin if pinned
+    if 'pinned_message_id' in match:
+        try:
+            await context.bot.unpin_chat_message(match["chat_id"], match['pinned_message_id'])
+        except Exception:
+            pass
+
+    try:
+        await query.edit_message_text(
+            f"{pe('cross')} Challenge cancelled by {user.mention_html()}.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        # Message might already be edited / deleted — swallow to avoid breaking UX.
+        pass
 
 
 @check_banned
@@ -20024,17 +20114,26 @@ async def group_challenge_playbot_callback(update: Update, context: ContextTypes
     emoji_map = {"dice": "🎲", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
     emoji = emoji_map.get(game_type, "🎮")
 
-    # Show "Bot Rolls First" option
-    keyboard = [
-        [InlineKeyboardButton("Bot Rolls First", callback_data=f"gc_botfirst_{match_id}")]
-    ]
+    # Register active PvB game so cashout callback can find it
+    context.chat_data[f"active_pvb_game_{user.id}"] = match_id
+    active_pvb_games[user.id] = match_id
+
+    # Show BLUE "Bot Rolls First" on top + GREEN Cashout below
+    bot_first_btn = apply_button_style(
+        InlineKeyboardButton("Bot Rolls First", callback_data=f"gc_botfirst_{match_id}"),
+        'primary', peb('robot')
+    )
+    _co_round = match.get("current_round", 1)
+    _co_mult = calculate_cashout_multiplier(match, user_id=user.id)
+    keyboard = _build_pvb_cashout_keyboard(match_id, _co_round, _co_mult, extra_top_row=[bot_first_btn])
+    _register_cashout_button(match_id, user.id, query.message.chat_id, _co_round)
 
     await query.edit_message_text(
         f"{pe('robot')} <b>PLAYING WITH BOT!</b>\n\n"
         f"<b>Your turn first!</b> Send {match['rolls']} {emoji} to start round 1.\n\n"
-        f"Or tap below to let the bot roll first:",
+        f"<i>Tap </i><b>Bot Rolls First</b><i> to swap turn order, or </i><b>Cashout</b><i> to collect </i><b>${match['bet_amount_usd'] * _co_mult:.2f}</b><i> now.</i>",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=keyboard
     )
 
 # Callback for "Bot Rolls First" in group challenge PvB mode
@@ -20085,11 +20184,19 @@ async def group_challenge_botfirst_callback(update: Update, context: ContextType
     # Now it's user's turn
     match["waiting_for"] = "user"
 
+    # Cashout button (green) for the player
+    _co_round = match.get("current_round", 1)
+    _co_mult = calculate_cashout_multiplier(match, user_id=user.id)
+    _co_kb = _build_pvb_cashout_keyboard(match_id, _co_round, _co_mult)
+    _register_cashout_button(match_id, user.id, query.message.chat_id, _co_round)
+
     await query.edit_message_text(
         f"{pe('robot')} <b>BOT ROLLED FIRST!</b>\n\n"
         f"Bot rolled: {roll_values} = <b>{total_value}</b>\n\n"
-        f"{user.mention_html()}, <b>Your turn!</b> Send {rolls} {emoji} to respond.",
-        parse_mode=ParseMode.HTML
+        f"{user.mention_html()}, <b>Your turn!</b> Send {rolls} {emoji} to respond.\n"
+        f"Or tap Cashout to collect <b>${match['bet_amount_usd'] * _co_mult:.2f}</b>:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_co_kb
     )
 
     # Schedule PvB timeout
@@ -20255,10 +20362,18 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
         game_sessions[game_id].pop('bot_is_rolling', None)
         game_sessions[game_id]["waiting_for"] = "user"
 
+        # GREEN cashout button below (dynamic multiplier based on win probability)
+        _co_round = game_sessions[game_id].get("current_round", 1)
+        _co_mult = calculate_cashout_multiplier(game_sessions[game_id], user_id=user.id)
+        _co_kb = _build_pvb_cashout_keyboard(game_id, _co_round, _co_mult)
+        _register_cashout_button(game_id, user.id, chat_id, _co_round)
+
         await update.message.reply_text(
             f"{pe('robot')} Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n"
-            f"{user.mention_html()}, <b>Your turn!</b> Send {game_rolls} {emoji} emoji{'s' if game_rolls > 1 else ''} to respond.",
-            parse_mode=ParseMode.HTML
+            f"{user.mention_html()}, <b>Your turn!</b> Send {game_rolls} {emoji} emoji{'s' if game_rolls > 1 else ''} to respond.\n"
+            f"Or tap Cashout to collect <b>${bet_amount * _co_mult:.2f}</b>:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_co_kb
         )
 
         # Schedule PvB timeout
@@ -20279,14 +20394,21 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
                 name=f"pvb_finish_{game_id}"
             )
     else:
-        # User rolls first (default)
+        # User rolls first (default) - GREEN cashout button visible from the start at ~0.93x
+        _co_round = game_sessions[game_id].get("current_round", 1)
+        _co_mult = calculate_cashout_multiplier(game_sessions[game_id], user_id=user.id)
+        _co_kb = _build_pvb_cashout_keyboard(game_id, _co_round, _co_mult)
+        _register_cashout_button(game_id, user.id, chat_id, _co_round)
+
         await update.message.reply_text(
             f"{pe('game')} {game_type.capitalize()} vs Bot started! (ID: <code>{game_id}</code>)\n"
             f"<b>Mode:</b> {game_mode.capitalize()} ({mode_text})\n"
             f"<b>Rolls per round:</b> {game_rolls}\n"
             f"<b>Target:</b> First to {target_score} points wins ${bet_amount*1.96:.2f}.\n\n"
-            f"{user.mention_html()}, <b>Your turn first! Send {game_rolls} {emoji} emoji{'s' if game_rolls > 1 else ''} to start.</b>",
-            parse_mode=ParseMode.HTML
+            f"{user.mention_html()}, <b>Your turn first! Send {game_rolls} {emoji} emoji{'s' if game_rolls > 1 else ''} to start.</b>\n"
+            f"Or tap Cashout to collect <b>${bet_amount * _co_mult:.2f}</b>:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_co_kb
         )
 
         # Schedule PvB timeout
@@ -24986,38 +25108,12 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     username_display = user.first_name if user.first_name else "Player"
 
-                    # Calculate cashout multiplier for PvB cashout button
+                    # GREEN cashout button based on live match-win probability
                     _co_match_id = active_pvb_game_id
                     _co_round = game.get('current_round', 1)
-                    _co_mult = 0.93  # Default before any scoring
-                    try:
-                        # Build temporary match-like structure for probability calc
-                        _co_match_tmp = {
-                            "players": [user.id, 0],
-                            "points": {user.id: game.get('user_score', 0), 0: game.get('bot_score', 0)},
-                            "target_points": game.get('target_score', 1),
-                            "game_rolls": game_rolls,
-                            "game_mode": game.get('game_mode', 'normal'),
-                            "player_rolls": {user.id: [], 0: bot_rolls},
-                        }
-                        _co_mult = calculate_cashout_multiplier(_co_match_tmp)
-                    except Exception:
-                        pass
-
-                    # Build cashout button (green) + "Roll" instruction (blue)
-                    _co_keyboard = InlineKeyboardMarkup([[
-                        InlineKeyboardButton(
-                            f"Cashout ({_co_mult:.2f}x)",
-                            callback_data=f"pvb_cashout_{_co_match_id}_{_co_round}"
-                        )
-                    ]])
-
-                    # Register active cashout button
-                    _active_cashout_buttons[_co_match_id] = {
-                        "round": _co_round,
-                        "user_id": user.id,
-                        "chat_id": update.effective_chat.id,
-                    }
+                    _co_mult = calculate_cashout_multiplier(game, user_id=user.id)
+                    _co_keyboard = _build_pvb_cashout_keyboard(_co_match_id, _co_round, _co_mult)
+                    _register_cashout_button(_co_match_id, user.id, update.effective_chat.id, _co_round)
 
                     await update.message.reply_text(
                         f"{pe('robot')} <b>BOT ROLLED FIRST!</b>\n\n"
@@ -25046,11 +25142,19 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             name=f"pvb_finish_{active_pvb_game_id}"
                         )
                 else:
-                    # User rolls first for next round
+                    # User rolls first for next round - GREEN cashout available now
+                    _co_match_id = active_pvb_game_id
+                    _co_round = game.get('current_round', 1)
+                    _co_mult = calculate_cashout_multiplier(game, user_id=user.id)
+                    _co_keyboard = _build_pvb_cashout_keyboard(_co_match_id, _co_round, _co_mult)
+                    _register_cashout_button(_co_match_id, user.id, update.effective_chat.id, _co_round)
+
                     await update.message.reply_text(
                         f"Score: You {game['user_score']} - {game['bot_score']} Bot. (First to {game['target_score']})\n\n"
-                        f"{user.mention_html()}, <b>Your turn! Send {game_rolls} {expected_emoji}!</b>",
-                        parse_mode=ParseMode.HTML
+                        f"{user.mention_html()}, <b>Your turn! Send {game_rolls} {expected_emoji}!</b>\n"
+                        f"Or tap Cashout to collect <b>${round(game['bet_amount'] * _co_mult, 2):.2f}</b>:",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=_co_keyboard
                     )
 
                     # Schedule PvB timeout for next round
@@ -28419,7 +28523,13 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @check_banned
 @check_maintenance
 async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /currency command - show currency selection menu directly."""
+    """Handle /currency command - show currency selection menu directly.
+
+    Emojis in this command use plain unicode (no premium <tg-emoji> tags)
+    because invalid custom emoji IDs cause Telegram to reject the message
+    with MESSAGE_HAS_INVALID_CUSTOM_EMOJI_ID, which was surfacing as
+    "an error occurred" for users.
+    """
     user = update.effective_user
     await ensure_user_in_wallets(user.id, user.username, context=context)
 
@@ -28427,14 +28537,7 @@ async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_lang = get_user_lang(user.id)
     keyboard = []
 
-    crypto_emoji_map = {
-        'USDT': 'usdt', 'BTC': 'btc', 'ETH': 'eth', 'SOL': 'sol',
-        'BNB': 'bnb', 'TRX': 'trx', 'LTC': 'ltc', 'USDC': 'usdc',
-        'TON': 'ton', 'BASE': 'base'
-    }
-
     for curr in SUPPORTED_CRYPTOS:
-        emoji_key = crypto_emoji_map.get(curr, 'coin')
         bal = ensure_wallet_dict(user.id).get(curr, 0.0)
         price = LIVE_PRICES.get(curr, 1.0)
         usd_val = bal * price if curr != 'USDT' else bal
@@ -28447,7 +28550,7 @@ async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([apply_button_style(
             InlineKeyboardButton(text, callback_data=f"setcurrency_{curr}"),
             'success' if curr == current_currency else 'primary',
-            None  # Removed custom emoji IDs to prevent Telegram API errors
+            None  # No custom emoji IDs to prevent Telegram API errors
         )])
 
     keyboard.append([apply_button_style(
@@ -28455,12 +28558,13 @@ async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'danger', None
     )])
 
+    current_symbol = CRYPTO_SYMBOLS.get(current_currency, "\U0001F4B0")
     sent = await update.message.reply_text(
-        f"{pe('wallet')} <b>Select Active Currency</b>\n\n"
-        f"Current: {pe(crypto_emoji_map.get(current_currency, 'coin'))} <b>{current_currency}</b>\n\n"
+        f"\U0001F4B0 <b>Select Active Currency</b>\n\n"
+        f"Current: {current_symbol} <b>{current_currency}</b>\n\n"
         f"Choose your active crypto currency below.\n"
         f"All bets, tips, and games will use the selected currency.\n\n"
-        f"{pe('warning')} <i>Your balance in each coin is separate (segregated wallets).</i>",
+        f"\u26A0\uFE0F <i>Your balance in each coin is separate (segregated wallets).</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=create_styled_keyboard(keyboard)
     )
@@ -32032,9 +32136,16 @@ async def lose_bet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def resolve_sidebets_for_match(match_id: str, winner_player_index: str, context):
     """Resolve all side bets for a completed match.
-    winner_player_index is 'p1' or 'p2'."""
+    winner_player_index is 'p1' or 'p2'.
+
+    Win/lose notifications are sent to the bettor's private DM, NOT the
+    group chat, to avoid spamming the group and leaking individual wagers.
+    """
     if match_id not in match_sidebets:
         return
+
+    match_data = game_sessions.get(match_id, {})
+    game_type = match_data.get("game_type", "match").replace("pvp_", "").replace("pvb_", "").replace("group_challenge_", "").replace("xdxw_", "")
 
     sidebet_ids = match_sidebets.pop(match_id, [])
     for sb_id in sidebet_ids:
@@ -32045,6 +32156,7 @@ async def resolve_sidebets_for_match(match_id: str, winner_player_index: str, co
         bettor_id = sb["bettor_id"]
         bet_amount = sb["bet_amount_usd"]
         multiplier = sb["multiplier_at_placement"]
+        bet_on_label = "WIN" if sb.get("bet_on") == "p1" else "LOSS"
 
         if sb["bet_on"] == winner_player_index:
             # Winner! Pay out
@@ -32054,22 +32166,36 @@ async def resolve_sidebets_for_match(match_id: str, winner_player_index: str, co
             sb["payout"] = payout
 
             try:
-                match_data = game_sessions.get(match_id, {})
-                chat_id = match_data.get("chat_id")
-                if chat_id:
-                    bettor_name = sb.get("bettor_username", f"User {bettor_id}")
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"{pe('sidebet')} {pe('win')} <b>Side Bet Won!</b>\n\n"
-                             f"{display_at(bettor_name)} won <b>${payout:.2f}</b> ({multiplier}x) on side bet!",
-                        parse_mode=ParseMode.HTML
-                    )
+                await context.bot.send_message(
+                    chat_id=bettor_id,
+                    text=(
+                        f"\U0001F389 <b>Side Bet WON!</b>\n\n"
+                        f"Match: <code>{match_id}</code> ({game_type})\n"
+                        f"Your pick: <b>{bet_on_label}</b>\n"
+                        f"Stake: <b>${bet_amount:.2f}</b>\n"
+                        f"Payout: <b>${payout:.2f}</b> ({multiplier}x)"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
             except Exception as e:
-                logging.warning(f"Failed to notify sidebet win: {e}")
+                logging.warning(f"Failed to DM sidebet win to {bettor_id}: {e}")
         else:
-            # Lost
+            # Lost - still notify in DM so bettor knows the outcome
             sb["status"] = "lost"
             sb["payout"] = 0
+            try:
+                await context.bot.send_message(
+                    chat_id=bettor_id,
+                    text=(
+                        f"\U0001F614 <b>Side Bet LOST</b>\n\n"
+                        f"Match: <code>{match_id}</code> ({game_type})\n"
+                        f"Your pick: <b>{bet_on_label}</b>\n"
+                        f"Stake lost: <b>${bet_amount:.2f}</b>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logging.warning(f"Failed to DM sidebet loss to {bettor_id}: {e}")
 
         save_user_data(bettor_id)
         # Clean up
@@ -32085,29 +32211,100 @@ async def resolve_sidebets_for_match(match_id: str, winner_player_index: str, co
 # House edge on cashout: 7%
 # ============================================================================
 CASHOUT_HOUSE_EDGE = 0.07  # 7% house edge on cashouts
+CASHOUT_BASE_MULTIPLIER = round(2 * (1 - CASHOUT_HOUSE_EDGE), 2)  # 1.86x fair payout * 0.5 = 0.93 at 50/50
 
 # Track active cashout button message IDs to invalidate them
 # {match_id: {"message_id": int, "chat_id": int, "round": int, "user_id": int}}
 _active_cashout_buttons: dict = {}
 
 
-def calculate_cashout_multiplier(match_data: dict) -> float:
+def _build_pvb_match_view(game: dict, user_id: int = None) -> dict:
+    """Return a match-data structure compatible with calculate_match_win_probability
+    derived from a PvB game session (which uses user_score/bot_score/user_rolls/bot_rolls)."""
+    if user_id is None:
+        user_id = game.get("user_id") or game.get("host_id")
+    bot_id = 0
+    if user_id is None:
+        return {}
+
+    # Allow newer PvP-style PvB sessions (xdxw_playbot, gc_playbot) that already
+    # populate "players"/"points" without a user_score field.
+    user_score = game.get("user_score")
+    bot_score = game.get("bot_score")
+    if user_score is None and "points" in game:
+        user_score = game["points"].get(user_id, 0)
+        bot_score = game["points"].get(bot_id, 0)
+
+    user_rolls = game.get("user_rolls")
+    bot_rolls = game.get("bot_rolls")
+    if (user_rolls is None or bot_rolls is None) and "player_rolls" in game:
+        user_rolls = game["player_rolls"].get(user_id, [])
+        bot_rolls = game["player_rolls"].get(bot_id, [])
+
+    return {
+        "players": [user_id, bot_id],
+        "points": {user_id: int(user_score or 0), bot_id: int(bot_score or 0)},
+        "target_points": game.get("target_score") or game.get("target_points") or 1,
+        "game_rolls": game.get("game_rolls", 1),
+        "game_mode": game.get("game_mode", game.get("mode", "normal")),
+        "player_rolls": {
+            user_id: list(user_rolls or []),
+            bot_id: list(bot_rolls or []),
+        },
+    }
+
+
+def calculate_cashout_multiplier(match_data: dict, user_id: int = None) -> float:
     """Calculate the cashout multiplier for the player in a PvB game.
-    Returns the multiplier (e.g., 0.93x at start, higher if player is ahead)."""
+
+    Multiplier = P(player_wins_match) * 2 * (1 - 7% house edge), so initially
+    (50/50 odds, no rolls yet) the multiplier is 0.93x. As the player gains
+    advantage the multiplier rises; if they fall behind it drops.
+
+    Floor is 0.10x to avoid showing nonsense like 0.00x late in losing games.
+    """
+    # Detect PvB structures that need to be projected onto the
+    # calculate_match_win_probability schema first.
+    if "players" not in match_data and ("user_id" in match_data or "host_id" in match_data):
+        match_data = _build_pvb_match_view(match_data, user_id)
+
     odds = calculate_match_win_probability(match_data)
-    players = match_data.get("players", [])
-    if len(players) < 2:
-        return 0.93
-
-    # Player is always p1 in PvB (bot is p2 = 0)
     p_player_wins = odds.get("p_win_p1", 0.5)
-
-    # Cashout = probability * full_payout * (1 - house_edge)
-    # Full payout in PvB is bet * 2 (winner takes all minus house fee)
-    # So cashout_multiplier = p * 2 * (1 - edge)
     multiplier = p_player_wins * 2 * (1 - CASHOUT_HOUSE_EDGE)
-
+    # Clamp to a reasonable display range (0.10x .. 50x)
+    multiplier = max(0.10, min(multiplier, 50.0))
     return round(multiplier, 2)
+
+
+def _build_pvb_cashout_keyboard(match_id: str, cashout_round: int, multiplier: float,
+                                 extra_top_row: list = None) -> InlineKeyboardMarkup:
+    """Build the green cashout button (with optional extra top row e.g. blue 'Bot Rolls First').
+
+    Layout:
+      [optional top row buttons]
+      [Cashout (X.XXx)]      <- always green, always below the top row
+    """
+    cashout_btn = apply_button_style(
+        InlineKeyboardButton(
+            f"Cashout ({multiplier:.2f}x)",
+            callback_data=f"pvb_cashout_{match_id}_{cashout_round}"
+        ),
+        'success', peb('cashout')
+    )
+    rows = []
+    if extra_top_row:
+        rows.append(extra_top_row)
+    rows.append([cashout_btn])
+    return create_styled_keyboard(rows)
+
+
+def _register_cashout_button(match_id: str, user_id: int, chat_id: int, cashout_round: int):
+    """Track an active cashout button so subsequent rolls invalidate it."""
+    _active_cashout_buttons[match_id] = {
+        "round": cashout_round,
+        "user_id": user_id,
+        "chat_id": chat_id,
+    }
 
 
 def is_pvb_game(match_data: dict) -> bool:
@@ -32135,10 +32332,15 @@ async def pvb_cashout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("Game no longer exists.", show_alert=True)
         return
 
-    # Verify this is the correct player (STRICT: only the game player can cashout)
-    players = match_data.get("players", [])
-    player_id = [p for p in players if p != 0]
-    if not player_id or user.id != player_id[0]:
+    # Verify this is the correct player. PvB games may store the player either
+    # in "players" (e.g. xdxw_playbot/gc_playbot) or only in "user_id"/"host_id"
+    # (e.g. /dice play_vs_bot_game). Accept any of those.
+    players = match_data.get("players", []) or []
+    candidate_ids = [p for p in players if p != 0]
+    legacy_id = match_data.get("user_id") or match_data.get("host_id")
+    if legacy_id and legacy_id not in candidate_ids:
+        candidate_ids.append(legacy_id)
+    if not candidate_ids or user.id not in candidate_ids:
         await query.answer("This cashout button is not for you.", show_alert=True)
         return
 
@@ -32146,6 +32348,11 @@ async def pvb_cashout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     active_co = _active_cashout_buttons.get(match_id)
     if not active_co or active_co.get("round") != cashout_round:
         await query.answer("This cashout button has expired.", show_alert=True)
+        return
+
+    # Strict per-button ownership: only the registered user_id may use it
+    if active_co.get("user_id") and active_co["user_id"] != user.id:
+        await query.answer("This cashout button is not for you.", show_alert=True)
         return
 
     # Invalidate the cashout button immediately
@@ -32157,9 +32364,9 @@ async def pvb_cashout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.answer()
 
-    # Calculate cashout amount
+    # Calculate cashout amount based on current win probability of the match.
     bet_amount = match_data.get("bet_amount_usd", match_data.get("bet_amount", 0))
-    cashout_mult = calculate_cashout_multiplier(match_data)
+    cashout_mult = calculate_cashout_multiplier(match_data, user_id=user.id)
     cashout_amount = round(bet_amount * cashout_mult, 2)
 
     # Credit the player
@@ -32202,7 +32409,22 @@ async def pvb_cashout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     # Void and refund all side bets on this match
     await void_sidebets_for_cashout(match_id, context)
 
-    # Clean up
+    # Cancel any pending PvB timeout jobs - the game is over
+    try:
+        _cancel_pvb_timeout_jobs(context, user.id, match_id)
+    except Exception:
+        pass
+
+    # Clean up active-game indices so the player can start a new game
+    try:
+        if context.chat_data.get(f"active_pvb_game_{user.id}") == match_id:
+            del context.chat_data[f"active_pvb_game_{user.id}"]
+    except Exception:
+        pass
+    if active_pvb_games.get(user.id) == match_id:
+        active_pvb_games.pop(user.id, None)
+
+    # Persist & deindex
     game_sessions[match_id] = match_data
     _unindex_user_game(user.id, match_id)
 
@@ -32822,6 +33044,7 @@ def main():
     app.add_handler(CallbackQueryHandler(xdxw_accept_callback, pattern=r"^xdxw_accept_", block=False))
     app.add_handler(CallbackQueryHandler(xdxw_playbot_callback, pattern=r"^xdxw_playbot_", block=False))
     app.add_handler(CallbackQueryHandler(xdxw_bot_first_callback, pattern=r"^xdxw_bot_first_", block=False))
+    app.add_handler(CallbackQueryHandler(xdxw_cancel_match_callback, pattern=r"^xdxw_cancel_", block=False))
 
     # 6. Rebet/Double button handlers (MUST be before general game handlers)
     app.add_handler(CallbackQueryHandler(slots_rebet_double_callback, pattern=r"^slots_(rebet|double)_", block=False))
@@ -33427,17 +33650,29 @@ async def pvb_get_target_score(update: Update, context: ContextTypes.DEFAULT_TYP
 
     context.user_data['target_score'] = target_score
 
-    # Ask who should roll first
-    keyboard = [
-        [InlineKeyboardButton("You Roll First", callback_data="pvb_first_user")],
-        [InlineKeyboardButton("Bot Rolls First", callback_data="pvb_first_bot")],
-        [InlineKeyboardButton("Cancel", callback_data="cancel_game")]
-    ]
+    # Ask who should roll first - BLUE buttons for the roll-order choices, RED for cancel
+    you_first_btn = apply_button_style(
+        InlineKeyboardButton("You Roll First", callback_data="pvb_first_user"),
+        'primary', peb('user')
+    )
+    bot_first_btn = apply_button_style(
+        InlineKeyboardButton("Bot Rolls First", callback_data="pvb_first_bot"),
+        'primary', peb('robot')
+    )
+    cancel_btn = apply_button_style(
+        InlineKeyboardButton("Cancel", callback_data="cancel_game"),
+        'danger', peb('cross')
+    )
+    keyboard = create_styled_keyboard([
+        [you_first_btn],
+        [bot_first_btn],
+        [cancel_btn],
+    ])
     await update.message.reply_text(
         f"{pe('game')} <b>Who Rolls First?</b>\n\n"
         f"Choose who should roll first in each round:",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=keyboard
     )
     return SELECT_WHO_ROLLS_FIRST
 
@@ -33576,13 +33811,21 @@ async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TY
 
         game_sessions[game_id]["waiting_for"] = "user"
 
+        # GREEN cashout button below
+        _co_round = game_sessions[game_id].get("current_round", 1)
+        _co_mult = calculate_cashout_multiplier(game_sessions[game_id], user_id=user.id)
+        _co_kb = _build_pvb_cashout_keyboard(game_id, _co_round, _co_mult)
+        _register_cashout_button(game_id, user.id, chat_id, _co_round)
+
         username_display = user.first_name if user.first_name else "Player"
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"{pe('robot')} <b>BOT ROLLED FIRST!</b>\n\n"
                  f"Bot rolled: [{bot_rolls_text}] = {bot_total}\n\n"
-                 f"{username_display}, Your turn! Send {game_rolls} {emoji} to respond.",
-            parse_mode=ParseMode.HTML
+                 f"{username_display}, Your turn! Send {game_rolls} {emoji} to respond.\n"
+                 f"Or tap Cashout to collect <b>${bet_amount * _co_mult:.2f}</b>:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_co_kb
         )
 
         # Schedule PvB timeout
@@ -33603,15 +33846,22 @@ async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TY
                 name=f"pvb_finish_{game_id}"
             )
     else:
-        # User rolls first (default)
+        # User rolls first (default) - GREEN cashout button visible from the start
+        _co_round = game_sessions[game_id].get("current_round", 1)
+        _co_mult = calculate_cashout_multiplier(game_sessions[game_id], user_id=user.id)
+        _co_kb = _build_pvb_cashout_keyboard(game_id, _co_round, _co_mult)
+        _register_cashout_button(game_id, user.id, chat_id, _co_round)
+
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"{pe('game')} {game_type.capitalize()} vs Bot started! (ID: <code>{game_id}</code>)\n"
                  f"<b>Mode:</b> {game_mode.capitalize()} ({mode_text})\n"
                  f"<b>Rolls per round:</b> {game_rolls}\n"
                  f"<b>Target:</b> First to {target_score} points wins ${bet_amount*1.96:.2f}.\n\n"
-                 f"<b>Your turn first! Send {game_rolls} {emoji} emoji{'s' if game_rolls > 1 else ''} to start.</b>",
-            parse_mode=ParseMode.HTML
+                 f"<b>Your turn first! Send {game_rolls} {emoji} emoji{'s' if game_rolls > 1 else ''} to start.</b>\n"
+                 f"Or tap Cashout to collect <b>${bet_amount * _co_mult:.2f}</b>:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_co_kb
         )
 
         # Schedule PvB timeout
