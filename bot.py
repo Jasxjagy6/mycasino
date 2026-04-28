@@ -20109,6 +20109,17 @@ async def group_challenge_playbot_callback(update: Update, context: ContextTypes
     match["last_roller"] = None
     match["current_round"] = 1
     match["bot_rolls_first"] = False  # Default: user rolls first
+    # Legacy PvB bookkeeping that message_listener's PvB block relies on.
+    # Without these, `game["user_score"] += 1` hits KeyError after the first
+    # round and the bot replies with "An error occurred".
+    match["user_id"] = match["host_id"]
+    match["user_score"] = 0
+    match["bot_score"] = 0
+    match["user_rolls"] = []
+    match["bot_rolls"] = []
+    match["history"] = []
+    match["waiting_for"] = "user"
+    match["bet_amount"] = match.get("bet_amount_usd", match.get("bet_amount", 0))
 
     game_type = match["game_type"].replace("group_challenge_", "")
     emoji_map = {"dice": "🎲", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
@@ -20177,6 +20188,9 @@ async def group_challenge_botfirst_callback(update: Update, context: ContextType
 
     match.pop("bot_is_rolling", None)
     match["player_rolls"][0] = roll_values  # 0 = Bot
+    # Mirror into the legacy PvB slot so message_listener's PvB block (which
+    # reads game["bot_rolls"] for bot_rolls_first matches) can score round 1.
+    match["bot_rolls"] = list(roll_values)
     total_value = sum(roll_values)
 
     # Store bot roll values in context to prevent double rolling
@@ -24868,7 +24882,10 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.info(f"PVB IGNORED: user={user.id} tried to roll during bot's turn (game={active_pvb_game_id})")
             return
 
-        game_type = game['game_type'].replace("pvb_", "").replace("xdxw_", "")
+        game_type = (game['game_type']
+                     .replace("pvb_", "")
+                     .replace("xdxw_", "")
+                     .replace("group_challenge_", ""))
         # Handle different game_type naming variations
         emoji_map = {
             "dice": "🎲", "dice_bot": "🎲",
