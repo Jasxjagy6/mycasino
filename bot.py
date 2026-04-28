@@ -27275,7 +27275,7 @@ async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif game_type == 'tower':
         text = f"{pe('tower')} Resuming Tower Game (ID: <code>{game_id}</code>)..."
         keyboard = build_tower_keyboard(game)
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     elif game_type == 'coin_flip':
         text = f"{pe('coin')} Resuming Coin Flip (ID: <code>{game_id}</code>)..."
         multiplier = 2 ** game["streak"]
@@ -29252,9 +29252,9 @@ async def surprisedrop_command(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             amount = float(args[0])
         except ValueError:
-            amount = round(random.uniform(1, 10), 2)
+            amount = round(random.uniform(0.5, 3), 2)
     else:
-        amount = round(random.uniform(1, 10), 2)
+        amount = round(random.uniform(0.5, 3), 2)
 
     if args and len(args) >= 2:
         try:
