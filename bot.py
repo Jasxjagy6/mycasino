@@ -1083,22 +1083,38 @@ def get_total_balance_usd(user_id: int) -> float:
 
 def deduct_wallet(user_id: int, usd_amount: float, coin: str = None):
     """Deduct crypto equivalent of USD amount from user's wallet.
-    Returns (crypto_amount, coin). Allows negative balance if check was skipped."""
+    Returns (crypto_amount, coin).
+    SECURITY: Validates amount and prevents going negative."""
+    import math as _math_dw
+    if _math_dw.isnan(usd_amount) or _math_dw.isinf(usd_amount) or usd_amount <= 0:
+        logging.warning(f"deduct_wallet: rejected invalid amount {usd_amount} for user {user_id}")
+        return 0.0, coin or get_active_currency(user_id)
     wallet = ensure_wallet_dict(user_id)
     if coin is None:
         coin = get_active_currency(user_id)
     price = LIVE_PRICES.get(coin, 1.0)
     crypto_amount = usd_amount / price
     current = wallet.get(coin, 0.0)
-    if current < crypto_amount:
-        logging.warning(f"Deduct wallet: user {user_id} has {current} {coin} but deducting {crypto_amount} {coin}")
-    wallet[coin] = current - crypto_amount
+    if current < crypto_amount - 1e-10:
+        logging.warning(f"deduct_wallet: INSUFFICIENT user {user_id} has {current} {coin} but needs {crypto_amount} {coin}")
+        raise ValueError("INSUFFICIENT_FUNDS")
+    wallet[coin] = max(0.0, current - crypto_amount)
     return crypto_amount, coin
 
 
 def credit_wallet(user_id: int, usd_amount: float, coin: str = None):
     """Credit crypto equivalent of USD amount to user's wallet.
-    Returns (crypto_amount, coin)."""
+    Returns (crypto_amount, coin).
+    SECURITY: Validates amount before crediting to prevent exploit."""
+    import math as _math_cw
+    if _math_cw.isnan(usd_amount) or _math_cw.isinf(usd_amount) or usd_amount <= 0:
+        logging.warning(f"credit_wallet: rejected invalid amount {usd_amount} for user {user_id}")
+        return 0.0, coin or get_active_currency(user_id)
+    # Max payout circuit breaker
+    max_payout = bot_settings.get('bet_limits', {}).get('max_payout_any_game', 50000.0)
+    if usd_amount > max_payout:
+        logging.error(f"CIRCUIT BREAKER: credit_wallet blocked ${usd_amount:.2f} payout for user {user_id} (max: ${max_payout:.2f})")
+        usd_amount = max_payout
     wallet = ensure_wallet_dict(user_id)
     if coin is None:
         coin = get_active_currency(user_id)
@@ -1109,7 +1125,12 @@ def credit_wallet(user_id: int, usd_amount: float, coin: str = None):
 
 
 def credit_wallet_crypto(user_id: int, crypto_amount: float, coin: str):
-    """Credit a specific crypto amount directly (no conversion)."""
+    """Credit a specific crypto amount directly (no conversion).
+    SECURITY: Validates amount; allows negative only for rain deductions."""
+    import math as _math_cwc
+    if _math_cwc.isnan(crypto_amount) or _math_cwc.isinf(crypto_amount):
+        logging.warning(f"credit_wallet_crypto: rejected NaN/Inf for user {user_id}")
+        return
     wallet = ensure_wallet_dict(user_id)
     wallet[coin] = wallet.get(coin, 0.0) + crypto_amount
 
@@ -1136,7 +1157,12 @@ async def deduct_wallet_safe(user_id: int, usd_amount: float, coin: str = None):
 def credit_wallet_safe(user_id: int, usd_amount: float, coin: str = None):
     """
     Credit is always safe (wins/refunds). No lock needed for credit-only ops.
+    SECURITY: Validates amount before crediting.
     """
+    import math as _math_cws
+    if _math_cws.isnan(usd_amount) or _math_cws.isinf(usd_amount) or usd_amount <= 0:
+        logging.warning(f"credit_wallet_safe: rejected invalid amount {usd_amount} for user {user_id}")
+        return 0.0, coin or get_active_currency(user_id)
     wallet = ensure_wallet_dict(user_id)
     if coin is None:
         coin = get_active_currency(user_id)
@@ -1648,15 +1674,30 @@ def parse_bet_amount(amount_str: str, user_id: int) -> tuple:
     """
     Parse bet amount from user input (always in USD).
     Checks active crypto balance. Returns (amount_in_usd, amount_in_usd, 'USD').
+    SECURITY: Validates against NaN, Inf, negative, and excessive values.
     """
+    import math as _math_parse
     balance_usd = get_active_balance_usd(user_id)
 
     amount_str = amount_str.lower().strip()
 
     if amount_str == 'all':
         amount_usd = balance_usd
+    elif amount_str in ('half', '1/2'):
+        amount_usd = balance_usd / 2
     else:
         amount_usd = float(amount_str)
+
+    # SECURITY: Reject NaN, Inf, negative, zero, and absurdly large values
+    if _math_parse.isnan(amount_usd) or _math_parse.isinf(amount_usd):
+        raise ValueError("Invalid bet amount: NaN or Inf")
+    if amount_usd <= 0:
+        raise ValueError("Bet amount must be positive")
+    if amount_usd > 1_000_000_000:  # $1B sanity cap
+        raise ValueError("Bet amount exceeds maximum")
+
+    # Round to 2 decimal places to prevent float precision exploits
+    amount_usd = round(amount_usd, 2)
 
     return amount_usd, amount_usd, "USD"
 
@@ -30452,7 +30493,7 @@ async def _cleanup_game_sessions():
 
             if status == 'active' and age_hours > 2:
                 to_delete.append(game_id)   # abandoned
-            elif status in ('completed', 'cancelled', 'error', 'declined') and age_hours > 1:
+            elif status in ('completed', 'cancelled', 'error', 'declined', 'cashout') and age_hours > 1:
                 to_delete.append(game_id)   # was 24h, now 1h for completed
             elif status == 'pending' and age_hours > 0.167:   # 10 min
                 to_delete.append(game_id)
@@ -30483,6 +30524,11 @@ async def _cleanup_game_sessions():
             lock = _wallet_locks.get(uid)
             if lock and not lock.locked():
                 _wallet_locks.pop(uid, None)
+
+        # Clean up stale cashout buttons
+        stale_co = [mid for mid, co in list(_active_cashout_buttons.items()) if mid not in game_sessions]
+        for mid in stale_co:
+            _active_cashout_buttons.pop(mid, None)
 
         # Clean up active games index for stale entries
         for uid in list(_user_active_games_index.keys()):
