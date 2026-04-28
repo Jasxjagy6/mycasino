@@ -18489,6 +18489,11 @@ async def create_reply_pvp_challenge(update: Update, context: ContextTypes.DEFAU
         },
     }
 
+    # PERFORMANCE: Proactively index both players so message_listener's
+    # per-user games lookup is O(1) from the first roll onward.
+    _index_user_game(user.id, match_id)
+    _index_user_game(target_user.id, match_id)
+
     # Store in user's game sessions
     if 'game_sessions' not in user_stats.get(user.id, {}):
         user_stats.setdefault(user.id, {})['game_sessions'] = []
@@ -18927,6 +18932,9 @@ async def rpvp_pvb_target_callback(update: Update, context: ContextTypes.DEFAULT
     # Register in active PvB
     context.chat_data[f"active_pvb_game_{user.id}"] = match_id
     active_pvb_games[user.id] = match_id
+    # PERFORMANCE: Proactively index so message_listener's dice scan
+    # finds this match via the O(1) per-user index.
+    _index_user_game(user.id, match_id)
 
     emoji_map = {"dice": "\U0001f3b2", "darts": "\U0001f3af", "goal": "\u26bd", "bowl": "\U0001f3b3"}
     emoji = emoji_map.get(game_type, "\U0001f3b2")
@@ -19498,6 +19506,10 @@ async def xdxw_accept_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     match["last_roller"] = None
     match["current_round"] = 1
 
+    # PERFORMANCE: index both players on this match.
+    _index_user_game(match["host_id"], match["id"])
+    _index_user_game(match["opponent_id"], match["id"])
+
     # Add to opponent's game sessions
     if 'game_sessions' not in user_stats[user.id]:
         user_stats[user.id]['game_sessions'] = []
@@ -19585,6 +19597,9 @@ async def xdxw_playbot_callback(update: Update, context: ContextTypes.DEFAULT_TY
     match["usernames"] = {user.id: match.get("host_username") or (user.username or f"User_{user.id}"), 0: "Bot"}
     match["points"] = {user.id: 0, 0: 0}
     match["player_rolls"] = {user.id: [], 0: []}
+
+    # PERFORMANCE: index the xdxw play-with-bot match.
+    _index_user_game(user.id, match_id)
 
     # Build keyboard with BLUE 'Bot Rolls First' on top and GREEN Cashout below.
     bot_first_btn = apply_button_style(
@@ -20117,6 +20132,10 @@ async def group_challenge_accept_callback(update: Update, context: ContextTypes.
     if "target_points" not in match:
         match["target_points"] = match.get("target_score", 1)
 
+    # PERFORMANCE: index both players for the newly-accepted PvP match.
+    _index_user_game(match["host_id"], match["id"])
+    _index_user_game(user.id, match["id"])
+
     currency_symbol = CURRENCY_SYMBOLS.get(match["currency"], "$")
     formatted_bet = f"{currency_symbol}{match['bet_amount_currency']:.2f}"
 
@@ -20295,6 +20314,8 @@ async def group_challenge_playbot_callback(update: Update, context: ContextTypes
     # Register active PvB game so cashout callback can find it
     context.chat_data[f"active_pvb_game_{user.id}"] = match_id
     active_pvb_games[user.id] = match_id
+    # PERFORMANCE: index for fast per-user lookup in message_listener.
+    _index_user_game(user.id, match_id)
 
     # Show BLUE "Bot Rolls First" on top + GREEN Cashout below
     bot_first_btn = apply_button_style(
@@ -20426,6 +20447,10 @@ async def execute_group_challenge_game(update: Update, context: ContextTypes.DEF
     match["game_rolls"] = match.get("rolls", 1)
     match["last_roller"] = None
     match["current_round"] = 1
+
+    # PERFORMANCE: proactively index both players.
+    _index_user_game(match["host_id"], match_id)
+    _index_user_game(match["opponent_id"], match_id)
 
     mode_desc = "Highest wins" if match["mode"] == "normal" else "Lowest wins"
 
@@ -23928,6 +23953,11 @@ async def generic_emoji_game_command(update: Update, context: ContextTypes.DEFAU
         "round_timeout": default_round_timeout,  # Store timeout at creation time
     }
     game_sessions[match_id] = match_data
+    # PERFORMANCE: Proactively index both players so subsequent dice
+    # messages look up this match via O(user's games) instead of an
+    # O(all sessions) full scan.
+    _index_user_game(user.id, match_id)
+    _index_user_game(opponent_id, match_id)
     accept_btn = apply_button_style(
         InlineKeyboardButton("Accept", callback_data=f"accept_{match_id}"),
         'success', peb('confirm')
