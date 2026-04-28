@@ -1223,6 +1223,34 @@ leaderboard_last_update = {
     "monthly_reset": datetime.now(timezone.utc)
 }
 
+# -- Wagered-rank cache ------------------------------------------------------
+# Populated by _get_cached_wagered_rank below; consumed by the stats dashboard
+# to avoid an O(N log N) sort over every user on every single dashboard view.
+_wagered_rank_cache: dict = {}    # user_id -> rank (1-based)
+_wagered_rank_cache_built_at: float = 0.0
+_WAGERED_RANK_CACHE_TTL = 60.0    # seconds
+
+
+def _get_cached_wagered_rank(user_id: int) -> int | None:
+    """Return user_id's rank by total wagered, rebuilding the cache at most
+    once per minute. Thread-unsafe but called only from the event loop, and
+    the worst case on a race is a duplicate rebuild — not a correctness bug."""
+    global _wagered_rank_cache, _wagered_rank_cache_built_at
+    import time as _t
+    now_mono = _t.monotonic()
+    if (not _wagered_rank_cache or
+            now_mono - _wagered_rank_cache_built_at > _WAGERED_RANK_CACHE_TTL):
+        wagered = [
+            (uid, stats.get('bets', {}).get('amount', 0.0))
+            for uid, stats in user_stats.items()
+        ]
+        wagered = [(uid, amt) for uid, amt in wagered if amt > 0]
+        wagered.sort(key=lambda x: x[1], reverse=True)
+        _wagered_rank_cache = {uid: idx + 1 for idx, (uid, _) in enumerate(wagered)}
+        _wagered_rank_cache_built_at = now_mono
+    return _wagered_rank_cache.get(user_id)
+
+
 def _rebuild_leaderboards():
     """Rebuild all leaderboard caches from user_stats data."""
     now = datetime.now(timezone.utc)
@@ -1285,11 +1313,14 @@ def _rebuild_leaderboards():
                         break
             highest_wins.append((uid, display_name, last_win, game_type, win_ts))
 
-    # Sort and take top 10
-    leaderboard_data["all_time"] = sorted(all_time, key=lambda x: x[2], reverse=True)[:10]
-    leaderboard_data["weekly"] = sorted(weekly, key=lambda x: x[2], reverse=True)[:10]
-    leaderboard_data["monthly"] = sorted(monthly, key=lambda x: x[2], reverse=True)[:10]
-    leaderboard_data["highest_wins"] = sorted(highest_wins, key=lambda x: x[2], reverse=True)[:10]
+    # PERFORMANCE: heapq.nlargest is O(N log k) with k=10 — cheaper than
+    # sorted(...)[:10] which is O(N log N). Noticeable once user_stats grows
+    # past a few thousand entries.
+    import heapq as _heapq_rl
+    leaderboard_data["all_time"] = _heapq_rl.nlargest(10, all_time, key=lambda x: x[2])
+    leaderboard_data["weekly"] = _heapq_rl.nlargest(10, weekly, key=lambda x: x[2])
+    leaderboard_data["monthly"] = _heapq_rl.nlargest(10, monthly, key=lambda x: x[2])
+    leaderboard_data["highest_wins"] = _heapq_rl.nlargest(10, highest_wins, key=lambda x: x[2])
 
 # --- Global Control Flag ---
 bot_stopped = False
@@ -9388,19 +9419,15 @@ async def generate_stats_image(user_id: int, context: ContextTypes.DEFAULT_TYPE,
             display_name = get_display_name(gname)
             game_list.append({"name": display_name, "games": ggames, "wr": gwr, "pnl": gpnl, "pnl_positive": gpnl >= 0})
 
-        # Calculate rank from ALL users by wagered amount (not just top 10)
-        user_rank = None
-        user_total_wagered = stats.get('bets', {}).get('amount', 0.0)
-        all_users_wagered = []
-        for uid, ustats in user_stats.items():
-            uw = ustats.get('bets', {}).get('amount', 0.0)
-            if uw > 0:
-                all_users_wagered.append((uid, uw))
-        all_users_wagered.sort(key=lambda x: x[1], reverse=True)
-        for idx, (uid, uw) in enumerate(all_users_wagered):
-            if uid == user_id:
-                user_rank = idx + 1
-                break
+        # Calculate rank from ALL users by wagered amount.
+        # PERFORMANCE: Previously this iterated every user_stats entry and
+        # did an O(N log N) sort on every single dashboard view. At 5000
+        # users that's tens of megabytes of dict iteration + a sort per
+        # stats tap — a real CPU stall on the event loop. We now maintain
+        # a ranking cache recomputed at most every 60 seconds and shared
+        # across every user. Worst-case staleness: one minute, which is
+        # fine for a personal rank readout.
+        user_rank = _get_cached_wagered_rank(user_id)
         rank_str = f"#{user_rank}" if user_rank else "#---"
 
         text_data = {
@@ -9878,10 +9905,18 @@ async def generate_leaderboard_referral_image(context):
             _bot_username_cache = bot_info.username
         bot_username = _bot_username_cache
 
-        sorted_users = sorted(user_stats.items(), key=lambda item: len(item[1].get('referral', {}).get('referred_users', [])), reverse=True)
+        # PERFORMANCE: heapq.nlargest(10, ...) over a generator is O(N log 10)
+        # instead of O(N log N) from sorted(..., reverse=True). Matters at
+        # 5000+ users when the referral leaderboard gets tapped.
+        import heapq as _heapq_rl
+        sorted_users = _heapq_rl.nlargest(
+            10,
+            user_stats.items(),
+            key=lambda item: len(item[1].get('referral', {}).get('referred_users', [])),
+        )
 
         entries = []
-        for i, (uid, st) in enumerate(sorted_users[:10]):
+        for i, (uid, st) in enumerate(sorted_users):
             uname = st.get('userinfo', {}).get('username', f'User-{uid}').lstrip('@')
             rc = len(st.get('referral', {}).get('referred_users', []))
             if rc > 0:
@@ -10882,16 +10917,24 @@ def get_locked_balance_in_games(user_id: int) -> dict:
     locked_total = 0.0
     game_breakdown = []
 
-    for game_id, game in game_sessions.items():
-        if game.get('user_id') == user_id and game.get('status') == 'active':
-            bet_amount = game.get('bet_amount', 0.0)
-            game_type = game.get('game_type', 'unknown')
-            locked_total += bet_amount
-            game_breakdown.append({
-                'game_id': game_id,
-                'game_type': game_type,
-                'amount': bet_amount
-            })
+    # PERFORMANCE: Use the O(1) per-user active-games index. Previous
+    # implementation did a full dict scan over every game_session in the
+    # system on every single /balance view — O(total games) instead of
+    # O(just this user's games).
+    for game_id in list(_get_user_active_game_ids(user_id)):
+        game = game_sessions.get(game_id)
+        if not game or game.get('status') != 'active':
+            continue
+        if game.get('user_id') != user_id:
+            continue
+        bet_amount = game.get('bet_amount', 0.0)
+        game_type = game.get('game_type', 'unknown')
+        locked_total += bet_amount
+        game_breakdown.append({
+            'game_id': game_id,
+            'game_type': game_type,
+            'amount': bet_amount
+        })
 
     return {'total': locked_total, 'games': game_breakdown}
 
@@ -11275,24 +11318,38 @@ async def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False,
 
 
 async def _flush_leaderboard_buffer():
-    """Batch-process leaderboard updates every 10 seconds."""
-    logging.info("[LEADERBOARD] Flush task started - will process buffer every 10s")
+    """Batch-process leaderboard updates every 10 seconds.
+
+    PERFORMANCE: dropped the per-entry INFO log (fires once per bet, so in a
+    busy casino that's hundreds of file-I/O log records a minute for no
+    operational benefit). Kept a DEBUG line for troubleshooting and an
+    INFO only when something actually fails.
+    """
+    logging.debug("[LEADERBOARD] Flush task started (10s interval)")
     while True:
         await asyncio.sleep(10)
         async with _leaderboard_buffer_lock:
-            buf_size = len(_leaderboard_buffer)
             if not _leaderboard_buffer:
                 continue
             batch = list(_leaderboard_buffer)
             _leaderboard_buffer.clear()
-        logging.info(f"[LEADERBOARD] Processing batch of {len(batch)} entries")
+        failures = 0
         for (user_id, amount, win_amount, game_type, multiplier, ts) in batch:
             try:
                 update_leaderboards(user_id, amount, win_amount, game_type, multiplier)
-                logging.info(f"[LEADERBOARD] Updated for user {user_id}: bet={amount}, win={win_amount}, game={game_type}")
             except Exception as e:
-                logging.error(f"Leaderboard update error for {user_id}: {e}", exc_info=True)
-        logging.info(f"[LEADERBOARD] Current all_time entries: {len(leaderboard_data.get('all_time', []))}")
+                failures += 1
+                logging.error(
+                    f"Leaderboard update error for {user_id}: {e}",
+                    exc_info=True
+                )
+        if failures:
+            logging.warning(
+                f"[LEADERBOARD] batch of {len(batch)} processed, "
+                f"{failures} failure(s)"
+            )
+        else:
+            logging.debug(f"[LEADERBOARD] batch of {len(batch)} processed")
 
 def check_username_bonus(user_id):
     """Check if a user has the bot username tag in their Telegram name.
@@ -25998,7 +26055,15 @@ async def cashout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_in_wallets(user_id, update.effective_user.username, context=context)
 
     # Find active, cashout-able games for the user
-    active_games = [g for g in game_sessions.values() if g.get('user_id') == user_id and g.get('status') == 'active' and g.get('game_type') in ['mines', 'tower', 'coin_flip']]
+    # PERFORMANCE: lookup via per-user active-games index instead of
+    # scanning every game session in the system.
+    _cashoutable = {'mines', 'tower', 'coin_flip'}
+    active_games = []
+    for gid in list(_get_user_active_game_ids(user_id)):
+        g = game_sessions.get(gid)
+        if (g and g.get('user_id') == user_id and g.get('status') == 'active'
+                and g.get('game_type') in _cashoutable):
+            active_games.append(g)
 
     if not active_games:
         await update.message.reply_text("No active games to cash out from. Use `/continue <id>` to resume a game.")
@@ -29713,7 +29778,12 @@ async def active_games_command(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     await ensure_user_in_wallets(user.id, user.username, context=context)
 
-    active_games = [g for g in game_sessions.values() if g.get("status") == "active" and g.get("user_id") == user.id]
+    # PERFORMANCE: per-user active-games index keeps this O(user's games).
+    active_games = []
+    for gid in list(_get_user_active_game_ids(user.id)):
+        g = game_sessions.get(gid)
+        if g and g.get("status") == "active" and g.get("user_id") == user.id:
+            active_games.append(g)
 
     if not active_games:
         await update.message.reply_text("You have no active games. Start one from the /games menu!")
@@ -30958,10 +31028,17 @@ async def _cleanup_game_sessions():
                 _unindex_user_game(pid, game_id)
             if 'user_id' in game:
                 _unindex_user_game(game['user_id'], game_id)
-            # Clean up sidebet references
-            match_sidebets.pop(game_id, None)
+            # Clean up sidebet references — and ALSO purge the matching
+            # active_sidebets records. Previously only match_sidebets was
+            # cleared, leaving orphan entries in active_sidebets forever
+            # (small but unbounded leak once games get abandoned).
+            sb_ids = match_sidebets.pop(game_id, [])
+            for _sb_id in sb_ids:
+                active_sidebets.pop(_sb_id, None)
             # Remove from game locks
             _game_locks.pop(game_id, None)
+            # Remove cashout button tracking
+            _active_cashout_buttons.pop(game_id, None)
             # Remove session
             game_sessions.pop(game_id, None)
 
@@ -32362,6 +32439,15 @@ async def resolve_sidebets_for_match(match_id: str, winner_player_index: str, co
     game_type = match_data.get("game_type", "match").replace("pvp_", "").replace("pvb_", "").replace("group_challenge_", "").replace("xdxw_", "")
 
     sidebet_ids = match_sidebets.pop(match_id, [])
+
+    # PERFORMANCE: Fan out all DM notifications in parallel via safe_send_message
+    # (honours RetryAfter, skips blocked/deactivated users). The previous
+    # implementation awaited each DM sequentially — with 20 sidebets on a
+    # popular match that meant 20 round trips serialized, which with
+    # Telegram's per-chat 1 msg/s limit meant the losing group in a busy
+    # game had to wait many seconds for all resolutions to complete.
+    dm_tasks = []
+
     for sb_id in sidebet_ids:
         sb = active_sidebets.get(sb_id)
         if not sb or sb.get("status") != "active":
@@ -32373,47 +32459,36 @@ async def resolve_sidebets_for_match(match_id: str, winner_player_index: str, co
         bet_on_label = "WIN" if sb.get("bet_on") == "p1" else "LOSS"
 
         if sb["bet_on"] == winner_player_index:
-            # Winner! Pay out
             payout = bet_amount * multiplier
             credit_wallet(bettor_id, payout)
             sb["status"] = "won"
             sb["payout"] = payout
-
-            try:
-                await context.bot.send_message(
-                    chat_id=bettor_id,
-                    text=(
-                        f"\U0001F389 <b>Side Bet WON!</b>\n\n"
-                        f"Match: <code>{match_id}</code> ({game_type})\n"
-                        f"Your pick: <b>{bet_on_label}</b>\n"
-                        f"Stake: <b>${bet_amount:.2f}</b>\n"
-                        f"Payout: <b>${payout:.2f}</b> ({multiplier}x)"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception as e:
-                logging.warning(f"Failed to DM sidebet win to {bettor_id}: {e}")
+            text = (
+                f"\U0001F389 <b>Side Bet WON!</b>\n\n"
+                f"Match: <code>{match_id}</code> ({game_type})\n"
+                f"Your pick: <b>{bet_on_label}</b>\n"
+                f"Stake: <b>${bet_amount:.2f}</b>\n"
+                f"Payout: <b>${payout:.2f}</b> ({multiplier}x)"
+            )
         else:
-            # Lost - still notify in DM so bettor knows the outcome
             sb["status"] = "lost"
             sb["payout"] = 0
-            try:
-                await context.bot.send_message(
-                    chat_id=bettor_id,
-                    text=(
-                        f"\U0001F614 <b>Side Bet LOST</b>\n\n"
-                        f"Match: <code>{match_id}</code> ({game_type})\n"
-                        f"Your pick: <b>{bet_on_label}</b>\n"
-                        f"Stake lost: <b>${bet_amount:.2f}</b>"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception as e:
-                logging.warning(f"Failed to DM sidebet loss to {bettor_id}: {e}")
+            text = (
+                f"\U0001F614 <b>Side Bet LOST</b>\n\n"
+                f"Match: <code>{match_id}</code> ({game_type})\n"
+                f"Your pick: <b>{bet_on_label}</b>\n"
+                f"Stake lost: <b>${bet_amount:.2f}</b>"
+            )
 
+        dm_tasks.append(safe_send_message(
+            context.bot, bettor_id, text, parse_mode=ParseMode.HTML
+        ))
         save_user_data(bettor_id)
-        # Clean up
         active_sidebets.pop(sb_id, None)
+
+    if dm_tasks:
+        # return_exceptions so one dead DM doesn't abort the others.
+        await asyncio.gather(*dm_tasks, return_exceptions=True)
 
 
 # ============================================================================
