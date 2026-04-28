@@ -1,0 +1,2746 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Chicken Road</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --bg-dark: #0e1c27;
+      --bg-panel: #1a2c3d;
+      --bg-input: #142430;
+      --bg-button: #1e3345;
+      --border: #2a4055;
+      --text-white: #ffffff;
+      --text-muted: #7a8fa3;
+      --text-dim: #4a6278;
+      --green: #00e701;
+      --red: #ff4444;
+      --blue: #1a73e8;
+      --blue-light: #4fc3f7;
+      --blue-active: #1565c0;
+      --orange: #ff9800;
+      --yellow: #ffc107;
+      --coin-green: #2ecc71;
+      --road-bg: #0d1b2a;
+      --lane-line: #1a3050;
+      --sidewalk: #1a2c3d;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+    /* Performance optimizations */
+    .game-board, .road-track, .chicken {
+      transform: translateZ(0);
+      will-change: transform;
+    }
+
+    .road-container {
+      contain: strict;
+    }
+
+    .road-column {
+      contain: layout style;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg-dark);
+      color: var(--text-white);
+      min-height: 100vh;
+      overflow-x: hidden;
+      overflow-y: hidden;
+      position: fixed;
+      width: 100%;
+      height: 100%;
+    }
+
+    /* ===== LOADING SCREEN ===== */
+    .loading-screen {
+      position: fixed;
+      inset: 0;
+      background: var(--bg-dark);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      transition: opacity 0.3s ease;
+    }
+    .loading-screen.hidden {
+      opacity: 0;
+      pointer-events: none;
+      visibility: hidden;
+      display: none !important;
+    }
+    .loading-logo {
+      width: 80px;
+      height: 80px;
+      margin-bottom: 16px;
+    }
+    .loading-logo svg {
+      width: 100%;
+      height: 100%;
+    }
+    .loading-text {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--text-white);
+      margin-bottom: 20px;
+    }
+    .loading-spinner {
+      width: 32px;
+      height: 32px;
+      border: 3px solid var(--border);
+      border-top-color: var(--blue);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* ===== ERROR OVERLAY ===== */
+    .error-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.9);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 10000;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s;
+    }
+    .error-overlay.show {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .error-message {
+      text-align: center;
+      padding: 24px;
+    }
+    .error-message h2 {
+      color: var(--red);
+      margin-bottom: 12px;
+    }
+    .error-message p {
+      color: var(--text-muted);
+      margin-bottom: 20px;
+    }
+    #cr-retry-btn {
+      background: var(--blue);
+      color: var(--text-white);
+      border: none;
+      border-radius: 8px;
+      padding: 12px 32px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.15s;
+    }
+    #cr-retry-btn:active {
+      transform: scale(0.95);
+    }
+
+    /* ===== GAME CONTAINER ===== */
+    #gameUI {
+      display: none;
+      flex-direction: column;
+      height: 100vh;
+      height: 100dvh;
+    }
+
+    /* ===== TOP BAR ===== */
+    .top-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      z-index: 100;
+    }
+    .top-logo {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      overflow: hidden;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg-input);
+      border: 2px solid var(--border);
+    }
+    .top-logo img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      border-radius: 50%;
+    }
+    .top-logo .fallback-avatar {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: var(--blue);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-white);
+    }
+    .top-balance {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--bg-input);
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .coin-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 18px;
+      height: 18px;
+      background: var(--coin-green);
+      border-radius: 50%;
+      font-size: 11px;
+      font-weight: 700;
+      color: #fff;
+    }
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .top-icon {
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      color: var(--text-muted);
+      transition: color 0.2s;
+    }
+    .top-icon:hover { color: var(--text-white); }
+    .top-icon svg { width: 20px; height: 20px; fill: currentColor; }
+
+    /* ===== SETTINGS DROPDOWN ===== */
+    .settings-dropdown {
+      position: absolute;
+      top: 48px;
+      left: 8px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 8px 0;
+      min-width: 200px;
+      z-index: 200;
+      opacity: 0;
+      transform: translateY(-8px) scale(0.95);
+      pointer-events: none;
+      transition: all 0.2s ease;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+    .settings-dropdown.show {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+      pointer-events: auto;
+    }
+    .settings-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 16px;
+      cursor: pointer;
+      transition: background 0.15s;
+      font-size: 14px;
+      color: var(--text-white);
+    }
+    .settings-item:hover { background: var(--bg-button); }
+    .settings-item svg { width: 18px; height: 18px; fill: var(--text-muted); }
+    .settings-divider {
+      height: 1px;
+      background: var(--border);
+      margin: 4px 0;
+    }
+    .volume-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 16px;
+    }
+    .volume-row svg { width: 18px; height: 18px; fill: var(--text-muted); flex-shrink: 0; }
+    .volume-slider {
+      flex: 1;
+      -webkit-appearance: none;
+      appearance: none;
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      outline: none;
+    }
+    .volume-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      background: var(--blue);
+      border-radius: 50%;
+      cursor: pointer;
+    }
+
+    /* ===== GAME BOARD ===== */
+    .game-board {
+      position: relative;
+      width: 100%;
+      height: 320px;
+      background: var(--road-bg);
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+
+    /* Road surface */
+    .road-surface {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+    }
+
+    /* Lane lines */
+    .lane-lines {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      justify-content: space-around;
+      pointer-events: none;
+    }
+    .lane-line {
+      width: 2px;
+      height: 100%;
+      background: repeating-linear-gradient(
+        to bottom,
+        var(--lane-line) 0px,
+        var(--lane-line) 12px,
+        transparent 12px,
+        transparent 24px
+      );
+    }
+
+    /* Sidewalk area */
+    .sidewalk {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 80px;
+      height: 100%;
+      background: var(--sidewalk);
+      border-right: 2px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      z-index: 2;
+    }
+    .sidewalk-tiles {
+      display: flex;
+      gap: 2px;
+    }
+    .sidewalk-tile {
+      width: 14px;
+      height: 40px;
+      background: #253a4d;
+      border-radius: 2px;
+    }
+    .sidewalk-bush {
+      width: 50px;
+      height: 50px;
+      background: #1a3a2a;
+      border-radius: 50%;
+      margin-top: 8px;
+    }
+
+    /* Traffic light */
+    .traffic-light {
+      position: absolute;
+      left: 20px;
+      top: 30px;
+      width: 50px;
+      height: 80px;
+      z-index: 3;
+    }
+    .traffic-light-pole {
+      position: absolute;
+      left: 20px;
+      top: 30px;
+      width: 8px;
+      height: 60px;
+      background: #2a3a4a;
+      border-radius: 4px;
+    }
+    .traffic-light-head {
+      position: absolute;
+      left: 10px;
+      top: 20px;
+      width: 28px;
+      height: 16px;
+      background: #2a3a4a;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      padding: 2px;
+    }
+    .traffic-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #3a4a5a;
+    }
+    .traffic-dot.active {
+      background: #ffc107;
+      box-shadow: 0 0 6px #ffc107;
+    }
+
+    /* ===== SCROLLING ROAD CONTAINER ===== */
+    .road-container {
+      position: absolute;
+      left: 80px;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      overflow: hidden;
+    }
+    .road-track {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      transition: transform 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+      will-change: transform;
+    }
+
+    /* Road column - each column is 80px wide */
+    .road-column {
+      width: 80px;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      flex-shrink: 0;
+      position: relative;
+    }
+
+    /* Manhole cover */
+    .manhole {
+      width: 60px;
+      height: 36px;
+      background: #1a2a3a;
+      border-radius: 50%;
+      border: 2px solid #2a3a4a;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      transition: all 0.3s ease;
+    }
+    .manhole-inner {
+      width: 36px;
+      height: 20px;
+      background: #152535;
+      border-radius: 50%;
+      border: 1px solid #2a3a4a;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+    }
+    .manhole-lines {
+      display: flex;
+      gap: 2px;
+    }
+    .manhole-line {
+      width: 2px;
+      height: 12px;
+      background: #2a3a4a;
+      border-radius: 1px;
+    }
+
+    /* Manhole states */
+    .manhole.safe {
+      border-color: #4fc3f7;
+      background: #1a3a4a;
+    }
+    .manhole.fire {
+      border-color: var(--red);
+      background: #3a1a1a;
+    }
+
+    /* Barrier */
+    .barrier {
+      position: absolute;
+      top: -30px;
+      left: 50%;
+      transform: translateX(-50%) translateY(-10px);
+      opacity: 0;
+      transition: all 0.3s ease;
+      pointer-events: none;
+    }
+    .barrier.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+    .barrier-bar {
+      width: 50px;
+      height: 8px;
+      background: repeating-linear-gradient(
+        45deg,
+        #fff 0px,
+        #fff 6px,
+        var(--blue) 6px,
+        var(--blue) 12px
+      );
+      border-radius: 4px;
+      border: 1px solid var(--border);
+    }
+    .barrier-legs {
+      display: flex;
+      justify-content: space-between;
+      width: 50px;
+      margin-top: -1px;
+    }
+    .barrier-leg {
+      width: 4px;
+      height: 10px;
+      background: #4a5a6a;
+      border-radius: 0 0 2px 2px;
+    }
+
+    /* Fire effect */
+    .fire-effect {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) scale(0);
+      font-size: 28px;
+      opacity: 0;
+      transition: all 0.4s ease;
+      z-index: 5;
+    }
+    .fire-effect.show {
+      transform: translate(-50%, -50%) scale(1);
+      opacity: 1;
+    }
+    .fire-emoji {
+      display: block;
+      animation: firePulse 0.5s ease-in-out infinite;
+    }
+    @keyframes firePulse {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.1); }
+    }
+
+    /* Multiplier pills */
+    .mult-pill {
+      padding: 6px 12px;
+      background: #1a2a3a;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      transition: all 0.3s ease;
+      white-space: nowrap;
+    }
+    .mult-pill.active {
+      background: var(--blue);
+      color: var(--text-white);
+    }
+    .mult-pill.safe {
+      background: #1a3a2a;
+      color: var(--green);
+    }
+    .mult-pill.fire {
+      background: var(--red);
+      color: var(--text-white);
+    }
+
+    /* ===== CHICKEN ===== */
+    .chicken {
+      position: absolute;
+      width: 48px;
+      height: 48px;
+      z-index: 10;
+      transition: left 0.4s ease-out, top 0.4s ease-out;
+      will-change: transform, left, top;
+    }
+    .chicken.jump {
+      animation: jump 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+    }
+    .chicken.die {
+      animation: die 0.6s ease-in forwards;
+    }
+
+    /* Full chicken SVG sprite */
+    .chicken-svg {
+      width: 100%;
+      height: 100%;
+    }
+
+    /* Jump animation - arc that looks like jumping forward to next block */
+    @keyframes jump {
+      0%   { transform: translateX(0) translateY(0) scaleX(1) scaleY(1); }
+      15%  { transform: translateX(-10px) translateY(5px) scaleX(1.15) scaleY(0.85); }
+      35%  { transform: translateX(-15px) translateY(-30px) scaleX(0.9) scaleY(1.1) rotate(-4deg); }
+      50%  { transform: translateX(-5px) translateY(-40px) scaleX(1) scaleY(1) rotate(0deg); }
+      65%  { transform: translateX(10px) translateY(-15px) scaleX(0.95) scaleY(1.05) rotate(3deg); }
+      85%  { transform: translateX(15px) translateY(3px) scaleX(1.1) scaleY(0.9); }
+      100% { transform: translateX(0) translateY(0) scaleX(1) scaleY(1) rotate(0deg); }
+    }
+
+    @keyframes die {
+      0% { transform: scale(1) rotate(0deg); opacity: 1; }
+      20% { transform: scale(1.1) rotate(-5deg); opacity: 1; }
+      40% { transform: scale(0.9) rotate(15deg); opacity: 0.9; }
+      60% { transform: scale(0.7) rotate(45deg); opacity: 0.6; }
+      80% { transform: scale(0.4) rotate(70deg); opacity: 0.3; }
+      100% { transform: scale(0.2) rotate(90deg); opacity: 0; }
+    }
+
+    /* ===== WIN POPUP ===== */
+    .win-popup {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) scale(0.8);
+      background: var(--bg-panel);
+      border: 2px solid var(--green);
+      border-radius: 16px;
+      padding: 24px;
+      text-align: center;
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.3s ease;
+      z-index: 50;
+      min-width: 200px;
+    }
+    .win-popup.show {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+      pointer-events: auto;
+    }
+    .win-popup h3 {
+      color: var(--green);
+      font-size: 18px;
+      margin-bottom: 8px;
+    }
+    .win-amount {
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--text-white);
+      margin-bottom: 4px;
+    }
+    .win-mult {
+      font-size: 14px;
+      color: var(--text-muted);
+    }
+
+    /* ===== BET PANEL ===== */
+    .bet-panel {
+      flex: 1;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 12px;
+      background: var(--bg-panel);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .bet-panel::-webkit-scrollbar {
+      width: 4px;
+    }
+    .bet-panel::-webkit-scrollbar-thumb {
+      background: var(--border);
+      border-radius: 2px;
+    }
+
+    /* Action button (Bet/Cashout) */
+    .action-btn {
+      width: 100%;
+      padding: 14px;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .action-btn.bet {
+      background: var(--blue);
+      color: var(--text-white);
+    }
+    .action-btn.bet:active { background: var(--blue-active); }
+    .action-btn.cashout {
+      background: var(--green);
+      color: #000;
+    }
+    .action-btn.cashout:active { background: #00c000; }
+    .action-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    /* Bet amount row */
+    .bet-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .bet-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+    .bet-input-wrap {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .bet-input-wrap input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: var(--text-white);
+      padding: 10px 12px;
+      font-size: 14px;
+      outline: none;
+      min-width: 0;
+    }
+    .bet-input-wrap input:disabled {
+      opacity: 0.4;
+    }
+    .mod-btn {
+      background: var(--bg-button);
+      border: none;
+      color: var(--text-muted);
+      padding: 10px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+      border-left: 1px solid var(--border);
+    }
+    .mod-btn:active { background: var(--border); }
+    .mod-btn:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+
+    /* Go button */
+    .go-btn {
+      width: 100%;
+      padding: 14px;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      background: var(--bg-button);
+      color: var(--text-dim);
+      cursor: not-allowed;
+      transition: all 0.2s;
+    }
+    .go-btn.active {
+      background: var(--blue);
+      color: var(--text-white);
+      cursor: pointer;
+    }
+    .go-btn.active:active { background: var(--blue-active); }
+
+    /* Difficulty dropdown */
+    .diff-section {
+      position: relative;
+    }
+    .diff-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+    .diff-btn {
+      width: 100%;
+      padding: 12px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-white);
+      font-size: 14px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .diff-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    .diff-arrow {
+      transition: transform 0.2s;
+    }
+    .diff-arrow.up { transform: rotate(180deg); }
+    .diff-dropdown {
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-top: 4px;
+      overflow: hidden;
+      z-index: 50;
+      opacity: 0;
+      transform: translateY(-4px);
+      pointer-events: none;
+      transition: all 0.2s;
+    }
+    .diff-dropdown.show {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+    .diff-option {
+      padding: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .diff-option:hover { background: var(--bg-button); }
+    .diff-radio {
+      width: 18px;
+      height: 18px;
+      border: 2px solid var(--text-muted);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s;
+    }
+    .diff-radio.selected {
+      border-color: var(--blue);
+    }
+    .diff-radio.selected::after {
+      content: '';
+      width: 10px;
+      height: 10px;
+      background: var(--blue);
+      border-radius: 50%;
+    }
+
+    /* Profit display */
+    .profit-section {
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    .profit-header {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+    .profit-value {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 16px;
+      font-weight: 600;
+    }
+
+    /* Fairness button */
+    .fairness-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 10px;
+      background: var(--bg-button);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-white);
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .fairness-btn svg { width: 18px; height: 18px; fill: var(--green); }
+
+    /* Manual/Auto tabs */
+    .mode-tabs {
+      display: flex;
+      background: var(--bg-input);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .mode-tab {
+      flex: 1;
+      padding: 10px;
+      text-align: center;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      color: var(--text-muted);
+      background: transparent;
+      border: none;
+    }
+    .mode-tab.active {
+      background: var(--bg-button);
+      color: var(--text-white);
+    }
+
+    /* Auto controls */
+    .auto-controls {
+      display: none;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .auto-controls.show { display: flex; }
+    .auto-row {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .auto-row label {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .auto-select {
+      padding: 10px 12px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-white);
+      font-size: 14px;
+      outline: none;
+    }
+    .auto-input {
+      padding: 10px 12px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-white);
+      font-size: 14px;
+      outline: none;
+    }
+
+    /* Advanced toggle */
+    .advanced-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 0;
+    }
+    .advanced-row label {
+      font-size: 14px;
+      color: var(--text-white);
+    }
+    .toggle {
+      width: 44px;
+      height: 24px;
+      background: var(--border);
+      border-radius: 12px;
+      position: relative;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .toggle.on { background: var(--blue); }
+    .toggle::after {
+      content: '';
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 20px;
+      height: 20px;
+      background: #fff;
+      border-radius: 50%;
+      transition: transform 0.2s;
+    }
+    .toggle.on::after { transform: translateX(20px); }
+
+    /* Advanced section */
+    .advanced-section {
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      padding: 8px 0;
+    }
+    .advanced-section.show { display: flex; }
+    .on-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .on-row label {
+      font-size: 12px;
+      color: var(--text-muted);
+      flex: 1;
+    }
+    .on-btn {
+      padding: 6px 10px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text-muted);
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .on-btn.selected {
+      background: var(--blue);
+      color: var(--text-white);
+      border-color: var(--blue);
+    }
+
+    /* Bottom bar */
+    .bottom-bar {
+      display: none;
+      background: var(--bg-panel);
+      border-top: 1px solid var(--border);
+      padding: 8px 12px;
+      flex-shrink: 0;
+    }
+    .bottom-tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .bottom-tab {
+      padding: 6px 12px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-muted);
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .bottom-tab.active {
+      background: var(--bg-button);
+      color: var(--text-white);
+    }
+    .bet-history {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+    .bet-history-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 8px;
+      background: var(--bg-input);
+      border-radius: 6px;
+      font-size: 12px;
+    }
+    .bet-history-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .bet-history-mode {
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+    .bet-history-mode.easy { background: #1a3a2a; color: var(--green); }
+    .bet-history-mode.medium { background: #2a2a1a; color: var(--yellow); }
+    .bet-history-mode.hard { background: #3a1a1a; color: var(--orange); }
+    .bet-history-mode.expert { background: #2a1a3a; color: #c77dff; }
+    .bet-history-details { color: var(--text-muted); }
+    .bet-history-profit { font-weight: 600; }
+    .bet-history-profit.win { color: var(--green); }
+    .bet-history-profit.loss { color: var(--red); }
+
+    /* ===== FAIRNESS MODAL ===== */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.7);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s;
+      padding: 16px;
+    }
+    .modal-overlay.show {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .modal {
+      background: var(--bg-panel);
+      border-radius: 12px;
+      width: 100%;
+      max-width: 400px;
+      max-height: 80vh;
+      overflow-y: auto;
+    }
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .modal-header h3 { font-size: 16px; }
+    .modal-close {
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg-input);
+      border: none;
+      border-radius: 50%;
+      color: var(--text-muted);
+      font-size: 18px;
+      cursor: pointer;
+    }
+    .modal-tabs {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+    }
+    .modal-tab {
+      flex: 1;
+      padding: 12px;
+      text-align: center;
+      font-size: 13px;
+      cursor: pointer;
+      color: var(--text-muted);
+      border-bottom: 2px solid transparent;
+      transition: all 0.2s;
+    }
+    .modal-tab.active {
+      color: var(--text-white);
+      border-bottom-color: var(--blue);
+    }
+    .modal-body { padding: 16px; }
+    .modal-section { display: none; }
+    .modal-section.active { display: block; }
+    .modal-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 0;
+      font-size: 13px;
+    }
+    .modal-row-label { color: var(--text-muted); }
+    .modal-row-value {
+      color: var(--text-white);
+      font-family: monospace;
+      word-break: break-all;
+      text-align: right;
+      max-width: 60%;
+    }
+    .copy-btn {
+      background: var(--bg-button);
+      border: none;
+      color: var(--text-muted);
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+      margin-left: 8px;
+    }
+
+    /* ===== RESUME BANNER ===== */
+    .resume-banner {
+      position: absolute;
+      top: 8px;
+      left: 50%;
+      transform: translateX(-50%) translateY(-20px);
+      background: var(--blue);
+      color: var(--text-white);
+      padding: 6px 16px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      opacity: 0;
+      transition: all 0.3s;
+      z-index: 100;
+      pointer-events: none;
+    }
+    .resume-banner.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+
+    /* ===== NOTIFICATION TOAST ===== */
+    .toast-notification {
+      position: fixed;
+      top: 60px;
+      left: 50%;
+      transform: translateX(-50%) translateY(-20px);
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 20px;
+      color: var(--text-white);
+      font-size: 14px;
+      font-weight: 500;
+      z-index: 10001;
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+      max-width: 90%;
+      text-align: center;
+    }
+    .toast-notification.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+      pointer-events: auto;
+    }
+    .toast-notification.error {
+      border-color: var(--red);
+      background: #2a1a1a;
+    }
+    .toast-notification.success {
+      border-color: var(--green);
+      background: #1a2a1a;
+    }
+    .toast-notification.info {
+      border-color: var(--blue);
+      background: #1a2a3a;
+    }
+
+    /* ===== HISTORY TOGGLE BUTTON ===== */
+    .history-toggle {
+      width: 100%;
+      padding: 10px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-muted);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: all 0.2s;
+      margin-top: 8px;
+    }
+    .history-toggle:hover { background: var(--bg-button); color: var(--text-white); }
+    .history-toggle.active { background: var(--bg-button); color: var(--text-white); border-color: var(--blue); }
+    .history-toggle svg { width: 16px; height: 16px; fill: currentColor; transition: transform 0.2s; }
+    .history-toggle.active svg { transform: rotate(180deg); }
+
+    /* ===== CARS ===== */
+    .car {
+      position: absolute;
+      font-size: 20px;
+      z-index: 1;
+      animation: carDrive 3s linear infinite;
+    }
+    @keyframes carDrive {
+      0% { top: 100%; }
+      100% { top: -30px; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Loading Screen -->
+  <div id="loadingScreen" class="loading-screen">
+    <div class="loading-logo">
+      <svg viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <!-- Road -->
+        <rect x="10" y="30" width="60" height="30" rx="4" fill="#1a2a3a"/>
+        <!-- Manholes -->
+        <ellipse cx="25" cy="45" rx="8" ry="5" fill="#0d1b2a" stroke="#2a3a4a" stroke-width="1.5"/>
+        <ellipse cx="40" cy="45" rx="8" ry="5" fill="#0d1b2a" stroke="#2a3a4a" stroke-width="1.5"/>
+        <ellipse cx="55" cy="45" rx="8" ry="5" fill="#0d1b2a" stroke="#2a3a4a" stroke-width="1.5"/>
+        <!-- Chicken (full body) -->
+        <ellipse cx="25" cy="22" rx="10" ry="8" fill="#fff"/>
+        <circle cx="25" cy="14" r="6" fill="#fff"/>
+        <path d="M22 8 Q25 4 28 8" fill="#ff4444"/>
+        <polygon points="28,14 34,15 28,17" fill="#ff9800"/>
+        <circle cx="27" cy="13" r="1.5" fill="#000"/>
+        <polygon points="30,15 35,16 30,17" fill="#ff9800"/>
+        <ellipse cx="18" cy="22" rx="4" ry="6" fill="#fff"/>
+        <polygon points="22,28 24,34 20,34" fill="#ff9800"/>
+        <polygon points="26,28 28,34 24,34" fill="#ff9800"/>
+        <path d="M15 20 Q12 18 14 15" fill="#fff"/>
+      </svg>
+    </div>
+    <div class="loading-text">Chicken Road</div>
+    <div class="loading-spinner"></div>
+  </div>
+
+  <!-- Error Overlay -->
+  <div id="errorOverlay" class="error-overlay">
+    <div class="error-message">
+      <h2>Connection Error</h2>
+      <p id="errorText">Please open this game from the Telegram bot.</p>
+      <button id="cr-retry-btn" onclick="retryChickenInit()">Retry</button>
+    </div>
+  </div>
+
+  <!-- Game UI -->
+  <div id="gameUI">
+    <!-- Top Bar -->
+    <div class="top-bar">
+      <div class="top-logo" id="logoBtn">
+        <img id="userProfilePic" src="" alt="Profile" style="display:none;" />
+        <div class="fallback-avatar" id="fallbackAvatar">?</div>
+      </div>
+      <div class="top-balance">
+        <span id="balanceDisplay">0.00000000</span>
+        <span class="coin-icon">T</span>
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M3 5l3 3 3-3" stroke="currentColor" stroke-width="1.5"/></svg>
+      </div>
+      <div class="top-actions">
+        <div class="top-icon" id="walletBtn">
+          <svg viewBox="0 0 24 24"><path d="M20 7H4a2 2 0 00-2 2v8a2 2 0 002 2h16a2 2 0 002-2V9a2 2 0 00-2-2zM4 9h16v8H4V9z"/><circle cx="16" cy="13" r="1.5"/></svg>
+        </div>
+        <div class="top-icon" id="profileBtn">
+          <svg viewBox="0 0 24 24"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/></svg>
+        </div>
+        <div class="top-icon" id="notifBtn">
+          <svg viewBox="0 0 24 24"><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Dropdown -->
+    <div class="settings-dropdown" id="settingsDropdown">
+      <div class="settings-item" id="muteToggleBtn">
+        <svg id="muteIcon" viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>
+        <span id="muteLabel">Sound: ON</span>
+      </div>
+      <div class="settings-divider"></div>
+      <div class="settings-item" id="instantBetBtn">
+        <svg viewBox="0 0 24 24"><path d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>
+        <span>Instant Bet</span>
+      </div>
+      <div class="settings-item" id="animationsBtn">
+        <svg viewBox="0 0 24 24"><path d="M21 3L3 10.53v.98l6.84 2.65L12.48 21h.98L21 3z"/></svg>
+        <span>Animations</span>
+      </div>
+      <div class="settings-divider"></div>
+      <div class="settings-item" id="maxBetBtn">
+        <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+        <span>Max Bet</span>
+      </div>
+      <div class="settings-item" id="gameInfoBtn">
+        <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+        <span>Game Info</span>
+      </div>
+      <div class="settings-item" id="hotkeysBtn">
+        <svg viewBox="0 0 24 24"><path d="M20 5H4c-1.1 0-1.99.9-1.99 2L2 17c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm-9 3h2v2h-2V8zm0 3h2v2h-2v-2zM8 8h2v2H8V8zm0 3h2v2H8v-2zm-1 2H5v-2h2v2zm0-3H5V8h2v2zm9 7H8v-2h8v2zm0-4h-2v-2h2v2zm0-3h-2V8h2v2zm3 3h-2v-2h2v2zm0-3h-2V8h2v2z"/></svg>
+        <span>Hotkeys</span>
+      </div>
+    </div>
+
+    <!-- Game Board -->
+    <div class="game-board" id="gameBoard">
+      <!-- Resume banner -->
+      <div class="resume-banner" id="resumeBanner">Game restored</div>
+
+      <!-- Sidewalk -->
+      <div class="sidewalk" id="sidewalk">
+        <div class="traffic-light">
+          <div class="traffic-light-head">
+            <div class="traffic-dot active"></div>
+            <div class="traffic-dot"></div>
+          </div>
+          <div class="traffic-light-pole"></div>
+        </div>
+        <div class="sidewalk-tiles">
+          <div class="sidewalk-tile"></div>
+          <div class="sidewalk-tile"></div>
+          <div class="sidewalk-tile"></div>
+          <div class="sidewalk-tile"></div>
+          <div class="sidewalk-tile"></div>
+        </div>
+        <div class="sidewalk-bush"></div>
+      </div>
+
+      <!-- Scrolling road container -->
+      <div class="road-container" id="roadContainer">
+        <div class="road-track" id="roadTrack">
+          <!-- Columns are generated dynamically -->
+        </div>
+      </div>
+
+      <!-- Chicken -->
+      <div class="chicken" id="chicken" style="display:none;">
+        <svg class="chicken-svg" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <!-- Body -->
+          <ellipse cx="24" cy="28" rx="14" ry="10" fill="#ffffff"/>
+          <!-- Head -->
+          <circle cx="24" cy="16" r="9" fill="#ffffff"/>
+          <!-- Comb -->
+          <path d="M20 7 Q22 3 24 7 Q26 3 28 7" fill="#ff4444"/>
+          <!-- Beak -->
+          <polygon points="32,15 40,17 32,20" fill="#ff9800"/>
+          <!-- Eye -->
+          <circle cx="27" cy="14" r="2.5" fill="#ffffff"/>
+          <circle cx="28" cy="14" r="1.5" fill="#000000"/>
+          <!-- Wing -->
+          <ellipse cx="16" cy="28" rx="5" ry="8" fill="#f0f0f0"/>
+          <!-- Feet -->
+          <polygon points="18,36 20,44 16,44" fill="#ff9800"/>
+          <polygon points="24,36 26,44 22,44" fill="#ff9800"/>
+          <!-- Tail -->
+          <path d="M10 24 Q6 20 10 16" fill="#ffffff"/>
+          <path d="M11 26 Q6 22 11 18" fill="#f8f8f8"/>
+        </svg>
+      </div>
+
+      <!-- Win popup -->
+      <div class="win-popup" id="winPopup">
+        <h3>You Won!</h3>
+        <div class="win-amount" id="winAmount">0.00000000</div>
+        <div class="win-mult" id="winMult">1.00x</div>
+      </div>
+    </div>
+
+    <!-- Bet Panel -->
+    <div class="bet-panel" id="betPanel">
+      <!-- Action button -->
+      <button id="actionBtn" class="action-btn bet">Bet</button>
+
+      <!-- Bet amount -->
+      <div>
+        <div class="bet-label">Bet Amount</div>
+        <div class="bet-input-wrap">
+          <input type="number" id="betInput" value="0.00" step="0.01" min="0">
+          <span class="coin-icon" style="margin-right:8px;">T</span>
+          <button id="btnHalf" class="mod-btn">1/2</button>
+          <button id="btnDouble" class="mod-btn">2x</button>
+          <button id="btnMax" class="mod-btn">Max</button>
+        </div>
+      </div>
+
+      <!-- Go button -->
+      <button id="goBtn" class="go-btn" disabled>Go</button>
+
+      <!-- Difficulty -->
+      <div class="diff-section">
+        <div class="diff-label">Difficulty</div>
+        <button class="diff-btn" id="diffBtn">
+          <span id="diffLabel">Easy</span>
+          <span class="diff-arrow" id="diffArrow">&#9660;</span>
+        </button>
+        <div class="diff-dropdown" id="diffDropdown">
+          <div class="diff-option" data-value="easy">
+            <span>Easy</span>
+            <div class="diff-radio selected" id="radioEasy"></div>
+          </div>
+          <div class="diff-option" data-value="medium">
+            <span>Medium</span>
+            <div class="diff-radio" id="radioMedium"></div>
+          </div>
+          <div class="diff-option" data-value="hard">
+            <span>Hard</span>
+            <div class="diff-radio" id="radioHard"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Profit display -->
+      <div class="profit-section">
+        <div class="profit-header">
+          <span>Total Profit (<span id="profitMultLabel">1.00</span>x)</span>
+          <span id="profitUsdLabel">$0.00</span>
+        </div>
+        <div class="profit-value">
+          <span id="profitValue">0.00000000</span>
+          <span class="coin-icon">T</span>
+        </div>
+      </div>
+
+      <!-- Manual/Auto tabs -->
+      <div class="mode-tabs">
+        <button class="mode-tab active" data-tab="manual">Manual</button>
+        <button class="mode-tab" data-tab="auto">Auto</button>
+      </div>
+
+      <!-- Auto controls -->
+      <div class="auto-controls" id="autoControls">
+        <div class="auto-row">
+          <label>Steps</label>
+          <select class="auto-select" id="autoSteps">
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+            <option value="5" selected>5</option>
+            <option value="10">10</option>
+            <option value="20">20</option>
+            <option value="50">50</option>
+          </select>
+        </div>
+        <div class="auto-row">
+          <label>Number of Bets</label>
+          <input class="auto-input" id="autoBets" type="number" value="0" min="0">
+        </div>
+        <div class="advanced-row">
+          <label>Advanced</label>
+          <div class="toggle" id="advancedToggle"></div>
+        </div>
+        <div class="advanced-section" id="advancedSection">
+          <div class="on-row">
+            <label>On Win</label>
+            <button class="on-btn selected" id="onWinReset">Reset</button>
+            <button class="on-btn" id="onWinIncrease">Increase by</button>
+          </div>
+          <div class="on-row">
+            <label>On Loss</label>
+            <button class="on-btn selected" id="onLossReset">Reset</button>
+            <button class="on-btn" id="onLossIncrease">Increase by</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Bottom buttons -->
+      <div style="display:flex;gap:8px;margin-top:auto;padding-top:8px;">
+        <div class="top-icon" id="settingsBtn" style="cursor:pointer;">
+          <svg viewBox="0 0 24 24" fill="var(--text-muted)"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 00-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+        </div>
+        <div class="top-icon" id="statsBtn" style="cursor:pointer;">
+          <svg viewBox="0 0 24 24" fill="var(--text-muted)"><path d="M3.5 18.49l6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99z"/></svg>
+        </div>
+        <div style="flex:1;"></div>
+        <button class="fairness-btn" id="fairnessBtn">
+          <svg viewBox="0 0 24 24"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4z"/></svg>
+          Fairness
+        </button>
+      </div>
+    </div>
+
+      <!-- History toggle -->
+      <button class="history-toggle" id="historyToggle">
+        <svg viewBox="0 0 24 24"><path d="M13 3a9 9 0 00-9 9h1l1.5-1.5A7 7 0 0113 3zm-1 5v5l4.5 2.5.75-1.23-3.75-2.27V8h-2z"/></svg>
+        <span>Recent Bets (Last 10)</span>
+      </button>
+
+      <!-- History panel (hidden by default) -->
+      <div class="bet-history" id="historyPanel" style="display:none;max-height:200px;margin-top:8px;"></div>
+    </div>
+  </div>
+
+  <!-- Toast Notification -->
+  <div class="toast-notification" id="toastNotification"></div>
+
+  <!-- Fairness Modal -->
+  <div class="modal-overlay" id="pfModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Provably Fair</h3>
+        <button class="modal-close" id="pfModalClose">&times;</button>
+      </div>
+      <div class="modal-tabs">
+        <div class="modal-tab active" data-tab="overview">Overview</div>
+        <div class="modal-tab" data-tab="seeds">Seeds</div>
+        <div class="modal-tab" data-tab="verify">Verify</div>
+      </div>
+      <div class="modal-body">
+        <div class="modal-section active" id="pfOverview">
+          <p style="color:var(--text-muted);font-size:13px;line-height:1.6;">
+            Chicken Road uses provably fair technology to ensure each game outcome is random and verifiable.
+            The server seed is hashed and shown before each bet. After the game ends, the original server seed is revealed.
+          </p>
+        </div>
+        <div class="modal-section" id="pfSeeds">
+          <div class="modal-row">
+            <span class="modal-row-label">Server Seed Hash</span>
+            <span class="modal-row-value" id="pfServerHash">-</span>
+          </div>
+          <div class="modal-row">
+            <span class="modal-row-label">Client Seed</span>
+            <span class="modal-row-value" id="pfClientSeed">-</span>
+          </div>
+          <div class="modal-row">
+            <span class="modal-row-label">Nonce</span>
+            <span class="modal-row-value" id="pfNonce">0</span>
+          </div>
+          <div class="modal-row">
+            <span class="modal-row-label">Revealed Server Seed</span>
+            <span class="modal-row-value" id="pfRevealedSeed">-</span>
+          </div>
+          <div class="modal-row">
+            <span class="modal-row-label">Crash Step</span>
+            <span class="modal-row-value" id="pfCrashStep">-</span>
+          </div>
+        </div>
+        <div class="modal-section" id="pfVerify">
+          <p style="color:var(--text-muted);font-size:13px;line-height:1.6;">
+            You can verify any game result by computing:<br>
+            <code style="color:var(--text-white);">HMAC-SHA256(server_seed, client_seed:nonce)</code><br>
+            The first byte of the result determines the crash step.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ===== Global Loading Screen Handler =====
+    let loadingScreenHidden = false;
+    function hideLoadingScreen() {
+      if (loadingScreenHidden) return;
+      loadingScreenHidden = true;
+      console.log('[Chicken Road] Hiding loading screen');
+      try {
+        const loadingEl = document.getElementById('loadingScreen');
+        const gameUIEl = document.getElementById('gameUI');
+        if (loadingEl) {
+          loadingEl.classList.add('hidden');
+        }
+        if (gameUIEl) {
+          gameUIEl.style.display = 'flex';
+        }
+        console.log('[Chicken Road] Loading screen hidden, gameUI visible');
+      } catch(e) {
+        console.error('[Chicken Road] Error hiding loading screen:', e);
+      }
+    }
+
+    function showErrorOverlay(message) {
+      console.error('[Chicken Road] Showing error:', message);
+      const overlay = document.getElementById('errorOverlay');
+      const textEl = document.getElementById('errorText');
+      if (textEl) textEl.textContent = message;
+      if (overlay) overlay.classList.add('show');
+      hideLoadingScreen();
+    }
+
+    function hideErrorOverlay() {
+      const overlay = document.getElementById('errorOverlay');
+      if (overlay) overlay.classList.remove('show');
+    }
+
+    // Backup timeout: hide loading screen after 3 seconds no matter what
+    setTimeout(hideLoadingScreen, 3000);
+
+    // ===== Telegram WebApp =====
+    let tg = null;
+    let initData = '';
+    let userInfo = { id: 0, first_name: 'Player', username: '', photo_url: '' };
+
+    function initTelegramSDK() {
+      try {
+        tg = window.Telegram?.WebApp;
+        if (tg) {
+          tg.ready();
+          tg.expand();
+          initData = tg.initData || '';
+          console.log('[Chicken Road] Telegram WebApp initialized');
+          try {
+            const params = new URLSearchParams(initData);
+            const userStr = params.get('user');
+            if (userStr) userInfo = JSON.parse(userStr);
+            console.log('[Chicken Road] User info:', userInfo);
+          } catch(e) {
+            console.warn('[Chicken Road] Error parsing user info:', e);
+          }
+        }
+        return !!tg && !!initData;
+      } catch(e) {
+        console.error('[Chicken Road] Error during Telegram init:', e);
+        return false;
+      }
+    }
+
+    // ===== Load User Profile Picture =====
+    function loadUserProfilePicture() {
+      const img = document.getElementById('userProfilePic');
+      const fallback = document.getElementById('fallbackAvatar');
+      
+      if (userInfo.photo_url) {
+        // User has a profile photo - load it
+        img.src = userInfo.photo_url;
+        img.style.display = 'block';
+        fallback.style.display = 'none';
+        
+        // Handle image load error
+        img.onerror = () => {
+          img.style.display = 'none';
+          fallback.style.display = 'flex';
+          fallback.textContent = (userInfo.first_name || 'P').charAt(0).toUpperCase();
+        };
+      } else {
+        // No profile photo - show fallback with first letter of name
+        img.style.display = 'none';
+        fallback.style.display = 'flex';
+        fallback.textContent = (userInfo.first_name || 'P').charAt(0).toUpperCase();
+      }
+    }
+
+    // ===== Mode Configs (Easy/Medium/Hard only) =====
+    const MODE_CONFIGS = {
+      easy:   { steps: 24, trapRate: 0.04, label: 'Easy' },
+      medium: { steps: 22, trapRate: 0.12, label: 'Medium' },
+      hard:   { steps: 20, trapRate: 0.20, label: 'Hard' }
+    };
+    const VISIBLE_COLS = 4;
+    const COL_WIDTH = 80;
+    const CHICKEN_COL = 1;
+
+    function buildMultTable(mode) {
+      const cfg = MODE_CONFIGS[mode];
+      const table = [];
+      for (let n = 1; n <= cfg.steps; n++) {
+        table.push(0.98 / Math.pow(1 - cfg.trapRate, n));
+      }
+      return table;
+    }
+
+    let state = {
+      balance: 0, mode: 'easy', currentGameId: null, stepsTaken: 0,
+      currentMult: 0.0, maxSteps: 24, multTable: [], gameState: 'idle',
+      betAmount: 0, history: [], serverSeedHash: '', clientSeed: '',
+      nonce: 0, revealedServerSeed: null, crashStep: null,
+      autoMode: false, autoSteps: 5, roadOffset: 0,
+      cooldownUntil: 0, // Timestamp when bet button becomes enabled
+      chickenNeedsPositioning: false // Flag for positioning after UI becomes visible
+    };
+    let stepDebounce = false;
+    let audioCtx = null;
+    let volume = 0.5; // Master SFX volume (50% default)
+    let isMuted = false; // Global mute toggle state
+
+    // Background music - MP3 file
+    let bgMusic = null;
+    let bgMusicVolume = 0.5; // 50% by default
+
+    // ===== Toast Notification System =====
+    let toastTimeout = null;
+    function showToast(message, type = 'info', duration = 3000) {
+      const toast = document.getElementById('toastNotification');
+      toast.textContent = message;
+      toast.className = 'toast-notification ' + type;
+
+      // Force reflow
+      void toast.offsetWidth;
+      toast.classList.add('show');
+
+      // Auto-hide
+      if (toastTimeout) clearTimeout(toastTimeout);
+      toastTimeout = setTimeout(() => {
+        toast.classList.remove('show');
+      }, duration);
+    }
+
+    function hideToast() {
+      const toast = document.getElementById('toastNotification');
+      toast.classList.remove('show');
+      if (toastTimeout) clearTimeout(toastTimeout);
+    }
+
+    function initAudio() {
+      try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e) {}
+    }
+
+    function startAmbience() {
+      if (bgMusic) return; // Already playing
+      try {
+        // Initialize audio context first (required by some browsers)
+        if (!audioCtx) initAudio();
+        if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+
+        console.log('[Chicken Road] Starting background music...');
+        bgMusic = new Audio('/chicken-road/fm-freemusic-happy-and-joyful-children(chosic.com).mp3');
+        bgMusic.loop = true;
+        bgMusic.volume = isMuted ? 0 : bgMusicVolume;
+        bgMusic.play().then(() => {
+          console.log('[Chicken Road] Background music started successfully');
+        }).catch(e => {
+          console.warn('[Chicken Road] Background music autoplay blocked:', e);
+          // Try again on first user interaction
+          document.addEventListener('click', () => {
+            if (bgMusic && bgMusic.paused) {
+              bgMusic.play().then(() => {
+                console.log('[Chicken Road] Background music started on click');
+              }).catch(() => {});
+            }
+          }, { once: true });
+        });
+      } catch(e) {
+        console.error('[Chicken Road] Failed to start background music:', e);
+      }
+    }
+
+    function stopAmbience() {
+      if (bgMusic) {
+        bgMusic.pause();
+        bgMusic.currentTime = 0;
+        bgMusic = null;
+      }
+    }
+
+    function setAmbienceVolume(percent) {
+      // percent: 0-100
+      bgMusicVolume = percent / 100;
+      if (bgMusic && !isMuted) {
+        bgMusic.volume = bgMusicVolume;
+      }
+    }
+
+    function toggleMute() {
+      isMuted = !isMuted;
+      const muteIcon = document.getElementById('muteIcon');
+      const muteLabel = document.getElementById('muteLabel');
+
+      if (isMuted) {
+        // Mute everything
+        muteIcon.innerHTML = '<path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>';
+        muteLabel.textContent = 'Sound: OFF';
+        if (bgMusic) bgMusic.volume = 0;
+      } else {
+        // Unmute - restore volumes
+        muteIcon.innerHTML = '<path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/>';
+        muteLabel.textContent = 'Sound: ON';
+        if (bgMusic) bgMusic.volume = bgMusicVolume;
+      }
+    }
+
+    function playSound(type) {
+      if (!audioCtx || isMuted) return;
+      try {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        const now = audioCtx.currentTime;
+        // 200% volume boost: multiply by 2.0
+        const v = Math.min(volume * 2.0, 1.0); // Cap at 1.0 to prevent distortion
+        switch(type) {
+          case 'hop': {
+            // Chicken hop/jump sound - quick upward chirp
+            const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+            o.type = 'sine';
+            o.frequency.setValueAtTime(400, now);
+            o.frequency.exponentialRampToValueAtTime(800, now + 0.08);
+            o.frequency.exponentialRampToValueAtTime(500, now + 0.15);
+            g.gain.setValueAtTime(v * 0.8, now);
+            g.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+            o.connect(g); g.connect(audioCtx.destination);
+            o.start(now); o.stop(now + 0.15);
+            break;
+          }
+          case 'cashout': {
+            // Win sound - ascending triumphant notes
+            [523.25, 659.25, 783.99, 1046.50].forEach((f, i) => {
+              const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+              o.type = 'sine'; o.frequency.value = f;
+              g.gain.setValueAtTime(v * 0.6, now + i * 0.1);
+              g.gain.exponentialRampToValueAtTime(0.01, now + i * 0.1 + 0.2);
+              o.connect(g); g.connect(audioCtx.destination);
+              o.start(now + i * 0.1); o.stop(now + i * 0.1 + 0.2);
+            });
+            break;
+          }
+          case 'fire': {
+            // Death/explosion sound - descending harsh noise
+            const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+            o.type = 'sawtooth';
+            o.frequency.setValueAtTime(300, now);
+            o.frequency.exponentialRampToValueAtTime(50, now + 0.5);
+            g.gain.setValueAtTime(v * 0.6, now);
+            g.gain.exponentialRampToValueAtTime(0.01, now + 0.5);
+            o.connect(g); g.connect(audioCtx.destination);
+            o.start(now); o.stop(now + 0.5);
+
+            // Add noise burst
+            const bufSize = audioCtx.sampleRate * 0.3;
+            const buf = audioCtx.createBuffer(1, bufSize, audioCtx.sampleRate);
+            const data = buf.getChannelData(0);
+            for (let i = 0; i < bufSize; i++) data[i] = (Math.random() * 2 - 1);
+            const src = audioCtx.createBufferSource(), g2 = audioCtx.createGain();
+            src.buffer = buf;
+            g2.gain.setValueAtTime(v * 0.4, now);
+            g2.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+            src.connect(g2); g2.connect(audioCtx.destination);
+            src.start(now); src.stop(now + 0.3);
+            break;
+          }
+          case 'bet': {
+            // Bet placed sound - quick confirmation beep
+            const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+            o.type = 'sine'; o.frequency.value = 700;
+            g.gain.setValueAtTime(v * 0.4, now);
+            g.gain.exponentialRampToValueAtTime(0.01, now + 0.08);
+            o.connect(g); g.connect(audioCtx.destination);
+            o.start(now); o.stop(now + 0.08);
+            break;
+          }
+          case 'step': {
+            // Footstep on manhole - soft thud
+            const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+            o.type = 'triangle';
+            o.frequency.setValueAtTime(200, now);
+            o.frequency.exponentialRampToValueAtTime(100, now + 0.1);
+            g.gain.setValueAtTime(v * 0.5, now);
+            g.gain.exponentialRampToValueAtTime(0.01, now + 0.1);
+            o.connect(g); g.connect(audioCtx.destination);
+            o.start(now); o.stop(now + 0.1);
+            break;
+          }
+        }
+      } catch(e) {}
+    }
+
+    async function apiCall(path, method = 'GET', body = null) {
+      const opts = { method, headers: { 'Content-Type': 'application/json', 'X-Auth-Token': initData }, cache: 'no-cache' };
+      if (body) opts.body = JSON.stringify(body);
+      const resp = await fetch(path, { ...opts, signal: AbortSignal.timeout(method === 'POST' ? 5000 : 3000) });
+      return resp.json();
+    }
+    async function loadUser() {
+      try {
+        const data = await apiCall('/chicken-road/api/user');
+        if (data.error) {
+          showToast('Failed to load user data: ' + data.error, 'error', 5000);
+          return false;
+        }
+        state.balance = data.balance || 0;
+        state.serverSeedHash = data.server_seed_hash || '';
+        state.clientSeed = data.client_seed || '';
+        state.nonce = data.nonce || 0;
+        updateBalance(); updatePFPanel();
+        if (data.active_game) restoreGame(data.active_game);
+        return true;
+      } catch(e) {
+        showToast('Connection error - check Telegram auth', 'error', 5000);
+        return false;
+      }
+    }
+    async function loadHistory() {
+      try {
+        const data = await apiCall('/chicken-road/api/history');
+        if (data.rounds) { state.history = data.rounds; renderHistory(); }
+      } catch(e) {}
+    }
+
+    async function startGame() {
+      const amt = parseFloat(document.getElementById('betInput').value);
+      if (isNaN(amt) || amt <= 0) {
+        showToast('Invalid bet amount', 'error');
+        return;
+      }
+      if (amt > state.balance) {
+        showToast('Insufficient balance', 'error');
+        return;
+      }
+      playSound('bet');
+      const btn = document.getElementById('actionBtn');
+      btn.disabled = true;
+      try {
+        const data = await apiCall('/chicken-road/api/bet', 'POST', { bet_amount: amt, mode: state.mode });
+        if (data.error) {
+          // Silently ignore "already have an active round" error - don't show notification
+          if (!data.error.includes('active round') && !data.error.includes('active game')) {
+            showToast(data.error, 'error');
+          }
+          btn.disabled = false;
+          return;
+        }
+        state.currentGameId = data.game_id;
+        state.stepsTaken = 0; state.currentMult = 0.0;
+        state.maxSteps = data.max_steps;
+        // ALWAYS use backend's multiplier table
+        state.multTable = data.mult_table || buildMultTable(state.mode);
+        state.gameState = 'in_game'; state.betAmount = amt;
+        state.balance -= amt; // Deduct bet amount immediately
+        state.revealedServerSeed = null; state.crashStep = null;
+        state.roadOffset = 0;
+
+        // Build road WITHOUT scrolling - just show initial state
+        buildRoad();
+        // Set road track to initial position (no scroll)
+        const track = document.getElementById('roadTrack');
+        track.style.transition = 'none';
+        track.style.transform = 'translateX(0px)';
+
+        // Update UI - Cashout disabled, Go enabled
+        setInGameUI(true);
+        updateBalance();
+        updateProfitDisplay();
+
+        // Duck ambience to 7% during active game
+        setAmbienceVolume(7);
+
+        // Show chicken on sidewalk ONLY - don't move to road yet
+        setTimeout(() => showChickenOnSidewalk(), 200);
+      } catch(e) { btn.disabled = false; }
+    }
+
+    async function takeStep() {
+      if (stepDebounce || !state.currentGameId) return;
+      stepDebounce = true;
+      const goBtn = document.getElementById('goBtn');
+      goBtn.disabled = true;
+
+      // Show loading state on cashout button
+      const cashoutBtn = document.getElementById('actionBtn');
+      const originalCashoutText = cashoutBtn.textContent;
+      cashoutBtn.innerHTML = '<span style="opacity:0.6;">⏳</span>';
+      cashoutBtn.disabled = true;
+
+      try {
+        const data = await apiCall('/chicken-road/api/step', 'POST', { game_id: state.currentGameId });
+        if (data.error) {
+          showToast(data.error, 'error');
+          goBtn.disabled = false;
+          cashoutBtn.textContent = originalCashoutText;
+          cashoutBtn.disabled = state.stepsTaken < 1;
+          stepDebounce = false;
+          return;
+        }
+
+        if (data.outcome === 'safe') {
+          state.stepsTaken = data.steps_taken;
+          // ALWAYS use backend's current_mult
+          state.currentMult = data.current_mult;
+          playSound('hop');
+
+          // Rebuild road with new state
+          buildRoad();
+
+          // If this is the FIRST step, chicken moves from sidewalk to road
+          if (state.stepsTaken === 1) {
+            // Scroll road and animate chicken to first manhole
+            scrollRoadToStep(1);
+          } else {
+            // For subsequent steps, just scroll road (chicken stays in place visually)
+            scrollRoad();
+          }
+
+          // Update profit AFTER setting currentMult
+          updateProfitDisplay();
+
+          // Restore cashout button
+          setTimeout(() => {
+            cashoutBtn.textContent = originalCashoutText;
+            if (state.gameState === 'in_game') {
+              cashoutBtn.disabled = false;
+              goBtn.disabled = false;
+            }
+          }, 500);
+
+          // Auto mode check
+          if (state.autoMode && state.autoSteps > 0 && state.stepsTaken >= state.autoSteps) {
+            setTimeout(() => cashOut(), 600);
+            return;
+          }
+        } else if (data.outcome === 'fire') {
+          state.gameState = 'fire';
+          state.balance = data.new_balance;
+          state.revealedServerSeed = data.server_seed;
+          state.crashStep = data.crash_step;
+          playSound('fire');
+          buildRoad();
+          scrollRoad();
+          animateChickenDie();
+          updateBalance();
+          updatePFReveal();
+          cashoutBtn.textContent = originalCashoutText;
+          setTimeout(() => { resetToIdle(); loadHistory(); }, 2500);
+        } else if (data.outcome === 'complete') {
+          state.gameState = 'complete';
+          state.balance = data.new_balance;
+          state.revealedServerSeed = data.server_seed;
+          state.crashStep = data.crash_step;
+          playSound('cashout');
+          buildRoad();
+          scrollRoad();
+          showWinPopup(data.payout);
+          updateBalance();
+          updatePFReveal();
+          cashoutBtn.textContent = originalCashoutText;
+          setTimeout(() => { resetToIdle(); loadHistory(); }, 2500);
+        }
+      } catch(e) {
+        goBtn.disabled = false;
+        cashoutBtn.textContent = originalCashoutText;
+        cashoutBtn.disabled = state.stepsTaken < 1;
+      }
+      setTimeout(() => { stepDebounce = false; }, 500);
+    }
+
+    async function cashOut() {
+      if (!state.currentGameId || state.stepsTaken < 1) return;
+      const btn = document.getElementById('actionBtn');
+      const originalText = btn.textContent;
+      btn.disabled = true;
+      btn.innerHTML = '<span style="opacity:0.6;">⏳</span>';
+
+      // Immediately clear game state to prevent race conditions
+      const gameId = state.currentGameId;
+      state.currentGameId = null; // Clear immediately to prevent double-cashout
+      state.gameState = 'cashout'; // Prevent further steps
+
+      try {
+        const data = await apiCall('/chicken-road/api/cashout', 'POST', { game_id: gameId });
+        if (data.error) {
+          // Silently ignore "already have an active round" error - don't show notification
+          if (!data.error.includes('active round') && !data.error.includes('active game')) {
+            showToast(data.error, 'error');
+          }
+          // Restore state if cashout failed
+          state.currentGameId = gameId;
+          state.gameState = 'in_game';
+          btn.textContent = originalText;
+          btn.disabled = false;
+          return;
+        }
+        state.balance = data.new_balance;
+        state.revealedServerSeed = data.server_seed;
+        state.crashStep = data.crash_step;
+        state.currentMult = data.multiplier;
+        playSound('cashout');
+        showWinPopup(data.payout);
+        updateBalance();
+        updatePFReveal();
+        btn.textContent = originalText;
+        setTimeout(() => { resetToIdle(); loadHistory(); }, 2000);
+      } catch(e) {
+        // Restore state on error
+        state.currentGameId = gameId;
+        state.gameState = 'in_game';
+        btn.textContent = originalText;
+        btn.disabled = false;
+      }
+    }
+
+    function updateBalance() {
+      document.getElementById('balanceDisplay').textContent = state.balance.toFixed(8);
+    }
+    function updateProfitDisplay() {
+      // currentMult starts at 0.0, so if no steps taken yet, show 0 profit
+      if (state.stepsTaken === 0 || state.currentMult === 0.0) {
+        document.getElementById('profitMultLabel').textContent = '1.00';
+        document.getElementById('profitUsdLabel').textContent = '0.00';
+        document.getElementById('profitValue').textContent = '0.00000000';
+        return;
+      }
+      const profit = state.betAmount * (state.currentMult - 1);
+      document.getElementById('profitMultLabel').textContent = state.currentMult.toFixed(2);
+      document.getElementById('profitUsdLabel').textContent = profit.toFixed(2);
+      document.getElementById('profitValue').textContent = profit.toFixed(8);
+    }
+    function updatePFPanel() {
+      document.getElementById('pfServerHash').textContent = state.serverSeedHash || '-';
+      document.getElementById('pfClientSeed').textContent = state.clientSeed || '-';
+      document.getElementById('pfNonce').textContent = state.nonce || 0;
+    }
+    function updatePFReveal() {
+      if (state.revealedServerSeed) {
+        document.getElementById('pfRevealedSeed').textContent = state.revealedServerSeed;
+        document.getElementById('pfCrashStep').textContent = state.crashStep || '-';
+      }
+    }
+
+    function setInGameUI(inGame) {
+      const btn = document.getElementById('actionBtn');
+      const goBtn = document.getElementById('goBtn');
+      const diffBtn = document.getElementById('diffBtn');
+      const betInput = document.getElementById('betInput');
+      const modBtns = document.querySelectorAll('.mod-btn');
+
+      if (inGame) {
+        btn.textContent = 'Cashout';
+        btn.className = 'action-btn cashout';
+        // Cashout disabled until first step
+        btn.disabled = state.stepsTaken < 1;
+        btn.onclick = cashOut;
+
+        goBtn.className = 'go-btn active';
+        goBtn.disabled = false;
+        goBtn.onclick = takeStep;
+
+        diffBtn.disabled = true;
+        betInput.disabled = true;
+        modBtns.forEach(b => b.disabled = true);
+      } else {
+        btn.textContent = 'Bet';
+        btn.className = 'action-btn bet';
+        btn.disabled = false;
+        btn.onclick = startGame;
+
+        goBtn.className = 'go-btn';
+        goBtn.disabled = true;
+        goBtn.onclick = null;
+
+        diffBtn.disabled = false;
+        betInput.disabled = false;
+        modBtns.forEach(b => b.disabled = false);
+
+        document.getElementById('chicken').style.display = 'none';
+        document.getElementById('winPopup').classList.remove('show');
+      }
+    }
+
+    function buildRoad() {
+      const track = document.getElementById('roadTrack');
+      track.innerHTML = '';
+
+      // Create ALL columns for the entire game mode (not just visible window)
+      const totalCols = state.maxSteps;
+      const multTable = state.multTable.length > 0 ? state.multTable : buildMultTable(state.mode);
+      const revealed = (state.gameState === 'fire' || state.gameState === 'complete');
+      const crashIdx = state.crashStep ? state.crashStep - 1 : -1;
+
+      for (let i = 0; i < totalCols; i++) {
+        const col = document.createElement('div');
+        col.className = 'road-column';
+        col.dataset.colIndex = i;
+
+        const manhole = document.createElement('div');
+        manhole.className = 'manhole';
+
+        // Show barriers for ALL passed safe columns
+        if (revealed && i < crashIdx) {
+          manhole.classList.add('safe');
+          const barrier = document.createElement('div');
+          barrier.className = 'barrier show';
+          barrier.innerHTML = '<div class="barrier-bar"></div><div class="barrier-legs"><div class="barrier-leg"></div><div class="barrier-leg"></div></div>';
+          manhole.appendChild(barrier);
+        } else if (revealed && i === crashIdx) {
+          manhole.classList.add('fire');
+          const fire = document.createElement('div');
+          fire.className = 'fire-effect show';
+          fire.innerHTML = '<span class="fire-emoji">🍗</span>';
+          manhole.appendChild(fire);
+        } else if (state.gameState === 'in_game' && i < state.stepsTaken) {
+          manhole.classList.add('safe');
+          const barrier = document.createElement('div');
+          barrier.className = 'barrier show';
+          barrier.innerHTML = '<div class="barrier-bar"></div><div class="barrier-legs"><div class="barrier-leg"></div><div class="barrier-leg"></div></div>';
+          manhole.appendChild(barrier);
+        }
+
+        const inner = document.createElement('div');
+        inner.className = 'manhole-inner';
+        const lines = document.createElement('div');
+        lines.className = 'manhole-lines';
+        for (let l = 0; l < 4; l++) {
+          const ln = document.createElement('div');
+          ln.className = 'manhole-line';
+          lines.appendChild(ln);
+        }
+        inner.appendChild(lines);
+        manhole.appendChild(inner);
+        col.appendChild(manhole);
+
+        const pill = document.createElement('div');
+        pill.className = 'mult-pill';
+        const mult = multTable[i] || 1.0;
+        pill.textContent = mult.toFixed(2) + 'x';
+        if (revealed && i < crashIdx) pill.classList.add('safe');
+        else if (revealed && i === crashIdx) pill.classList.add('fire');
+        else if (state.gameState === 'in_game' && i === state.stepsTaken) pill.classList.add('active');
+        else if (state.gameState === 'in_game' && i < state.stepsTaken) pill.classList.add('safe');
+        col.appendChild(pill);
+        track.appendChild(col);
+      }
+
+      // Calculate offset to keep chicken centered at column position
+      const newOffset = Math.max(0, (state.stepsTaken - CHICKEN_COL) * COL_WIDTH);
+      state.roadOffset = newOffset;
+      track.style.transform = `translateX(-${state.roadOffset}px)`;
+      track.style.transition = 'none';
+    }
+
+    function renderRoadView() {
+      scrollRoad();
+    }
+
+    function scrollRoadToStep(stepNum) {
+      // For first step: animate chicken from sidewalk to first manhole with JUMP
+      const track = document.getElementById('roadTrack');
+      const chicken = document.getElementById('chicken');
+      const board = document.getElementById('gameBoard');
+      const boardHeight = board.offsetHeight;
+      const sidewalkWidth = 80;
+
+      // Calculate new road offset
+      const newOffset = Math.max(0, (stepNum - CHICKEN_COL) * COL_WIDTH);
+
+      // Move chicken from sidewalk to road (first manhole position)
+      // First manhole is at column 0, which starts at sidewalk_width
+      const targetX = sidewalkWidth + COL_WIDTH / 2;
+      chicken.style.transition = 'left 0.4s ease-out, top 0.4s ease-out';
+      chicken.style.left = (targetX - 24) + 'px';
+      chicken.style.top = (boardHeight / 2 - 24) + 'px';
+
+      // Scroll road simultaneously
+      track.style.transition = 'transform 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94)';
+      track.style.transform = `translateX(-${newOffset}px)`;
+      state.roadOffset = newOffset;
+
+      // Trigger jump animation
+      chicken.classList.remove('jump');
+      void chicken.offsetWidth; // Force reflow
+      chicken.classList.add('jump');
+
+      // Clean up jump class after animation
+      setTimeout(() => chicken.classList.remove('jump'), 400);
+    }
+
+    function scrollRoad() {
+      const track = document.getElementById('roadTrack');
+      const chicken = document.getElementById('chicken');
+      const newOffset = Math.max(0, (state.stepsTaken - CHICKEN_COL) * COL_WIDTH);
+
+      // Scroll road - chicken stays at fixed screen position (column 1)
+      track.style.transition = 'transform 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94)';
+      track.style.transform = `translateX(-${newOffset}px)`;
+      state.roadOffset = newOffset;
+
+      // Trigger jump animation (vertical hop, road scrolls underneath)
+      chicken.classList.remove('jump');
+      void chicken.offsetWidth; // Force reflow
+      chicken.classList.add('jump');
+
+      // Clean up jump class after animation
+      setTimeout(() => chicken.classList.remove('jump'), 400);
+    }
+
+    function showChickenOnSidewalk() {
+      const chicken = document.getElementById('chicken');
+      const board = document.getElementById('gameBoard');
+      const boardHeight = board.offsetHeight;
+      
+      // Reset any leftover styles from previous animations
+      chicken.classList.remove('die', 'jump');
+      chicken.style.display = 'block';
+      chicken.style.left = '16px';
+      chicken.style.top = (boardHeight / 2 - 24) + 'px';
+    }
+
+    function positionChicken() {
+      const chicken = document.getElementById('chicken');
+      const board = document.getElementById('gameBoard');
+      const boardHeight = board.offsetHeight;
+      const sidewalkWidth = 80;
+
+      // Chicken stays in column 2 (CHICKEN_COL) position
+      const cx = sidewalkWidth + CHICKEN_COL * COL_WIDTH + COL_WIDTH / 2;
+      const cy = boardHeight / 2;
+
+      chicken.style.display = 'block';
+      chicken.style.left = (cx - 24) + 'px';
+      chicken.style.top = (cy - 30) + 'px';
+    }
+
+    function animateChickenDie() {
+      const chicken = document.getElementById('chicken');
+      chicken.classList.remove('hop');
+      chicken.classList.add('die');
+      // Show death animation for 0.5 seconds, then hide chicken
+      setTimeout(() => {
+        chicken.style.display = 'none';
+        chicken.classList.remove('die');
+        // Reset chicken position to starting point
+        chicken.style.left = '';
+        chicken.style.top = '';
+      }, 500);
+    }
+
+    function showWinPopup(payout) {
+      document.getElementById('winMult').textContent = state.currentMult.toFixed(2) + 'x';
+      document.getElementById('winAmount').textContent = payout.toFixed(8);
+      document.getElementById('winPopup').classList.add('show');
+    }
+
+    function resetToIdle() {
+      // Restore ambience to 50% (default)
+      setAmbienceVolume(50);
+
+      state.gameState = 'idle'; state.currentGameId = null;
+      state.stepsTaken = 0; state.currentMult = 0.0; state.betAmount = 0;
+      state.roadOffset = 0;
+      // Set cooldown to 1 second from now
+      state.cooldownUntil = Date.now() + 1000;
+
+      setInGameUI(false);
+      buildRoad();
+      document.getElementById('profitMultLabel').textContent = '1.00';
+      document.getElementById('profitUsdLabel').textContent = '0.00';
+      document.getElementById('profitValue').textContent = '0.00000000';
+
+      // Return chicken to starting position on sidewalk
+      const chicken = document.getElementById('chicken');
+      chicken.classList.remove('die', 'jump');
+      chicken.style.display = 'none'; // Hide chicken until next bet
+
+      // Start cooldown timer for bet button
+      startBetCooldown();
+    }
+
+    let cooldownInterval = null;
+    function startBetCooldown() {
+      if (cooldownInterval) clearInterval(cooldownInterval);
+
+      const btn = document.getElementById('actionBtn');
+      const startTime = Date.now();
+
+      cooldownInterval = setInterval(() => {
+        const elapsed = Date.now() - startTime;
+        const remaining = Math.max(0, state.cooldownUntil - Date.now());
+
+        if (remaining <= 0 || elapsed > 2000) { // Safety timeout after 2s
+          clearInterval(cooldownInterval);
+          cooldownInterval = null;
+          btn.style.opacity = '1';
+          // Only reset to "Bet" if we're in idle state
+          if (state.gameState === 'idle') {
+            btn.textContent = 'Bet';
+            btn.disabled = false;
+          }
+          return;
+        }
+
+        // Show countdown on button
+        btn.style.opacity = '0.5';
+        btn.textContent = `Wait ${(remaining / 1000).toFixed(1)}s`;
+        btn.disabled = true;
+      }, 50); // Update every 50ms for smoother countdown
+    }
+
+    function restoreGame(activeGame) {
+      state.currentGameId = activeGame.game_id;
+      state.stepsTaken = activeGame.steps_taken || 0;
+      // ALWAYS use backend's current_mult
+      state.currentMult = activeGame.current_mult || 0.0;
+      state.maxSteps = activeGame.max_steps;
+      // ALWAYS use backend's mult_table
+      state.multTable = activeGame.mult_table || buildMultTable(activeGame.mode || 'easy');
+      state.mode = activeGame.mode || 'easy';
+      state.gameState = 'in_game';
+      state.betAmount = activeGame.bet_amount || 0;
+      state.roadOffset = Math.max(0, (state.stepsTaken - CHICKEN_COL) * COL_WIDTH);
+
+      document.getElementById('diffLabel').textContent = MODE_CONFIGS[state.mode]?.label || 'Easy';
+      setInGameUI(true);
+
+      // Build road with current state
+      buildRoad();
+
+      // Set road to correct position immediately (no animation on restore)
+      const track = document.getElementById('roadTrack');
+      track.style.transition = 'none';
+      track.style.transform = `translateX(-${state.roadOffset}px)`;
+
+      updateProfitDisplay();
+
+      // CRITICAL: Don't position chicken here - UI is still hidden
+      // Chicken will be positioned after UI becomes visible in mainInit
+      state.chickenNeedsPositioning = true;
+
+      const banner = document.getElementById('resumeBanner');
+      banner.classList.add('show');
+      showToast('Game session restored', 'success', 2000);
+      setTimeout(() => banner.classList.remove('show'), 1500);
+    }
+
+    function renderHistory() {
+      const panel = document.getElementById('historyPanel');
+      panel.innerHTML = '';
+      if (state.history.length > 0) {
+        state.history.slice(0, 10).forEach(game => {
+          const item = document.createElement('div');
+          item.className = 'bet-history-item';
+          const isWin = game.profit >= 0;
+          item.innerHTML = '<div class="bet-history-left"><span class="bet-history-mode ' + (game.mode || 'easy') + '">' + (game.mode || 'easy') + '</span><span class="bet-history-details">' + (game.steps_taken || 0) + '/' + (game.max_steps || 0) + ' · ' + (game.multiplier || 0).toFixed(2) + 'x</span></div><span class="bet-history-profit ' + (isWin ? 'win' : 'loss') + '">' + (isWin ? '+' : '') + (game.profit || 0).toFixed(2) + '</span>';
+          panel.appendChild(item);
+        });
+      } else {
+        panel.innerHTML = '<div style="text-align:center;padding:16px;color:var(--text-muted);font-size:13px;">No bets yet</div>';
+      }
+    }
+
+    // ===== Event Handlers =====
+    document.getElementById('actionBtn').addEventListener('click', startGame);
+    document.getElementById('goBtn').addEventListener('click', takeStep);
+    document.getElementById('btnHalf').addEventListener('click', () => {
+      const i = document.getElementById('betInput');
+      i.value = Math.max(0, parseFloat(i.value) / 2).toFixed(2);
+    });
+    document.getElementById('btnDouble').addEventListener('click', () => {
+      const i = document.getElementById('betInput');
+      i.value = (parseFloat(i.value) * 2).toFixed(2);
+    });
+    document.getElementById('btnMax').addEventListener('click', () => {
+      document.getElementById('betInput').value = state.balance.toFixed(2);
+    });
+    document.getElementById('diffBtn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      document.getElementById('diffDropdown').classList.toggle('show');
+      document.getElementById('diffArrow').classList.toggle('up');
+    });
+    document.querySelectorAll('.diff-option').forEach(opt => {
+      opt.addEventListener('click', () => {
+        const val = opt.dataset.value;
+        state.mode = val;
+        document.getElementById('diffLabel').textContent = MODE_CONFIGS[val].label;
+        document.getElementById('diffDropdown').classList.remove('show');
+        document.getElementById('diffArrow').classList.remove('up');
+        document.querySelectorAll('.diff-radio').forEach(r => r.classList.remove('selected'));
+        document.getElementById('radio' + val.charAt(0).toUpperCase() + val.slice(1)).classList.add('selected');
+        state.multTable = buildMultTable(val);
+        if (state.gameState === 'idle') buildRoad();
+      });
+    });
+    document.addEventListener('click', () => {
+      document.getElementById('diffDropdown').classList.remove('show');
+      document.getElementById('diffArrow').classList.remove('up');
+    });
+    document.querySelectorAll('.mode-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.mode-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById('autoControls').className = tab.dataset.tab === 'auto' ? 'auto-controls show' : 'auto-controls';
+        state.autoMode = tab.dataset.tab === 'auto';
+      });
+    });
+    document.getElementById('advancedToggle').addEventListener('click', function() {
+      this.classList.toggle('on');
+      document.getElementById('advancedSection').classList.toggle('show');
+    });
+    ['onWinReset', 'onWinIncrease', 'onLossReset', 'onLossIncrease'].forEach(id => {
+      document.getElementById(id).addEventListener('click', function() {
+        this.closest('.on-row').querySelectorAll('.on-btn').forEach(b => b.classList.remove('selected'));
+        this.classList.add('selected');
+      });
+    });
+    document.getElementById('fairnessBtn').addEventListener('click', () => {
+      document.getElementById('pfModal').classList.add('show');
+    });
+    document.getElementById('pfModalClose').addEventListener('click', () => {
+      document.getElementById('pfModal').classList.remove('show');
+    });
+    document.getElementById('pfModal').addEventListener('click', (e) => {
+      if (e.target === document.getElementById('pfModal')) document.getElementById('pfModal').classList.remove('show');
+    });
+    document.querySelectorAll('.modal-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.modal-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        document.querySelectorAll('.modal-section').forEach(s => s.classList.remove('active'));
+        document.getElementById('pf' + tab.dataset.tab.charAt(0).toUpperCase() + tab.dataset.tab.slice(1)).classList.add('active');
+      });
+    });
+    document.getElementById('settingsBtn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      document.getElementById('settingsDropdown').classList.toggle('show');
+    });
+    document.addEventListener('click', () => {
+      document.getElementById('settingsDropdown').classList.remove('show');
+    });
+    document.getElementById('volumeSlider')?.addEventListener('input', (e) => {
+      volume = parseInt(e.target.value) / 100;
+    });
+
+    // Mute toggle in settings
+    document.getElementById('muteToggleBtn')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleMute();
+    });
+
+    // History toggle
+    document.getElementById('historyToggle').addEventListener('click', (e) => {
+      e.stopPropagation();
+      const panel = document.getElementById('historyPanel');
+      const toggle = document.getElementById('historyToggle');
+      const isVisible = panel.style.display !== 'none';
+
+      if (isVisible) {
+        panel.style.display = 'none';
+        toggle.classList.remove('active');
+      } else {
+        panel.style.display = 'flex';
+        toggle.classList.add('active');
+        // Load history if empty
+        if (panel.innerHTML === '') {
+          renderHistory();
+        }
+      }
+    });
+
+    document.addEventListener('click', () => {
+      if (!audioCtx) initAudio();
+      // Start background music on first user interaction
+      if (!bgMusic) startAmbience();
+    }, { once: true });
+    document.addEventListener('touchstart', () => {
+      if (!audioCtx) initAudio();
+      // Start background music on first touch
+      if (!bgMusic) startAmbience();
+    }, { once: true });
+
+    async function mainInit(retryCount = 0) {
+      const maxRetries = 5;
+      try {
+        console.log(`[Chicken Road] mainInit starting (attempt ${retryCount + 1}/${maxRetries + 1})`);
+        hideErrorOverlay();
+
+        // Initialize Telegram SDK with retry
+        let sdkReady = initTelegramSDK();
+
+        // Wait for Telegram SDK to fully populate initData (critical for first load)
+        if (sdkReady) {
+          await new Promise(r => setTimeout(r, 500));
+          // Re-read initData after waiting
+          initData = tg?.initData || '';
+          sdkReady = !!initData;
+        }
+
+        // Retry if initData not available yet
+        if (!sdkReady && retryCount < maxRetries) {
+          console.warn(`[Chicken Road] SDK not ready on attempt ${retryCount + 1}, retrying...`);
+          await new Promise(r => setTimeout(r, 500 * (retryCount + 1)));
+          return mainInit(retryCount + 1);
+        }
+
+        if (!sdkReady || !initData) {
+          console.error('[Chicken Road] No initData after retries - not opened from Telegram');
+          loadUserProfilePicture();
+          state.multTable = buildMultTable(state.mode);
+          buildRoad();
+          loadHistory();
+          hideLoadingScreen();
+          showErrorOverlay('Please open this game from the Telegram bot.');
+          return;
+        }
+
+        // Load user profile picture AFTER SDK is initialized
+        loadUserProfilePicture();
+
+        // Set timeout to hide loading screen even if API fails
+        const loadingTimeout = setTimeout(() => {
+          console.warn('[Chicken Road] API timeout - showing UI anyway');
+          hideLoadingScreen();
+        }, 2500);
+
+        try {
+          // Try loading user with retries
+          let loaded = false;
+          for (let attempt = 0; attempt <= 2; attempt++) {
+            try {
+              if (attempt > 0) {
+                console.log(`[Chicken Road] Retrying loadUser (attempt ${attempt + 1}/3)`);
+                await new Promise(r => setTimeout(r, 1000 * attempt));
+              }
+              const loadWithTimeout = Promise.race([
+                loadUser(),
+                new Promise(resolve => setTimeout(() => resolve(false), 3000))
+              ]);
+              loaded = await loadWithTimeout;
+              if (loaded) break;
+            } catch (e) {
+              console.error(`[Chicken Road] loadUser attempt ${attempt + 1} failed:`, e);
+            }
+          }
+
+          clearTimeout(loadingTimeout);
+          console.log('[Chicken Road] User loaded:', loaded);
+
+          state.multTable = buildMultTable(state.mode);
+          buildRoad();
+          loadHistory();
+
+          // Show game UI
+          setTimeout(() => {
+            hideLoadingScreen();
+
+            // Position chicken after UI is visible (if restoring a game)
+            if (state.chickenNeedsPositioning) {
+              requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                  if (state.stepsTaken === 0) {
+                    showChickenOnSidewalk();
+                  } else {
+                    positionChicken();
+                  }
+                  state.chickenNeedsPositioning = false;
+                });
+              });
+            }
+          }, 200);
+
+          if (!loaded) {
+            showErrorOverlay('Connection error. Tap Retry or close and reopen the game.');
+          }
+        } catch(apiError) {
+          console.error('[Chicken Road] API error:', apiError);
+          clearTimeout(loadingTimeout);
+          if (retryCount < maxRetries) {
+            console.log('[Chicken Road] Retrying after API error...');
+            await new Promise(r => setTimeout(r, 1500));
+            return mainInit(retryCount + 1);
+          }
+          setTimeout(() => {
+            hideLoadingScreen();
+            showErrorOverlay('Connection error. Tap Retry or close and reopen the game.');
+          }, 200);
+        }
+      } catch(e) {
+        console.error('[Chicken Road] Fatal error in mainInit:', e);
+        if (retryCount < maxRetries) {
+          console.log('[Chicken Road] Retrying after fatal error...');
+          await new Promise(r => setTimeout(r, 1500));
+          return mainInit(retryCount + 1);
+        }
+        setTimeout(() => {
+          hideLoadingScreen();
+          showErrorOverlay('An error occurred. Tap Retry or close and reopen the game.');
+        }, 100);
+      }
+    }
+
+    async function retryChickenInit() {
+      hideErrorOverlay();
+      console.log('[Chicken Road] User initiated retry');
+      // Reset SDK and retry
+      initData = '';
+      tg = null;
+      await mainInit(0);
+    }
+
+    // Start init immediately (don't wait for DOMContentLoaded which may have already fired)
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', mainInit);
+    } else {
+      mainInit();
+    }
+  </script>
+</body>
+</html>
+
