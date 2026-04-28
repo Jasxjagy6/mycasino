@@ -25392,8 +25392,27 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if DEBUG_EMOJI_GAMES:
                 logging.info(f"PVP DICE: user={user.id}, chat={chat_id}, emoji={emoji}, value={dice_obj.value}")
 
-            for match_id, match_data in list(game_sessions.items()):
-                if match_data.get("chat_id") == chat_id and match_data.get("status") == 'active' and user.id in match_data.get("players", []):
+            # PERFORMANCE: previously this iterated every game_session in
+            # the entire bot on every dice message in every group. At
+            # 5000 users with thousands of active sessions that was O(N)
+            # per dice roll on the hottest path. Prefer the per-user
+            # active-games index when it has entries; fall back to a
+            # full scan only if the index is empty for this user (which
+            # happens for freshly created matches that haven't been
+            # indexed yet). We also auto-index on the fallback hit so
+            # subsequent rolls are O(user's games).
+            _indexed_ids = _get_user_active_game_ids(user.id)
+            if _indexed_ids:
+                _candidate_items = [(gid, game_sessions.get(gid)) for gid in list(_indexed_ids)]
+            else:
+                _candidate_items = list(game_sessions.items())
+            for match_id, match_data in _candidate_items:
+                if not match_data:
+                    continue
+                if (match_data.get("chat_id") == chat_id and match_data.get("status") == 'active' and user.id in match_data.get("players", [])):
+                    # Auto-index for subsequent rolls on the fast path.
+                    if not _indexed_ids:
+                        _index_user_game(user.id, match_id)
                     if DEBUG_EMOJI_GAMES:
                         logging.info(f"PVP MATCH FOUND: match_id={match_id}, type={match_data.get('game_type')}, players={match_data.get('players')}, points={match_data.get('points')}")
 
