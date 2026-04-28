@@ -25794,7 +25794,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_in_wallets(update.effective_user.id, update.effective_user.username, context=context)
     message_text = update.message.text.strip().split()
     if len(message_text) != 2:
-        await update.message.reply_text("Usage: /cancel <match_id | deal_id>")
+        await update.message.reply_text("Usage: /cancel <match_id | deal_id | raffle_id>")
         return
     item_id = message_text[1]
 
@@ -25849,7 +25849,52 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(deal['buyer']['id'], f"Your escrow deal {item_id} has been cancelled by the bot owner.")
         except Exception as e: logging.warning(f"Could not notify users about deal cancellation: {e}")
         return
-    await update.message.reply_text("No active match or deal found with that ID.")
+
+    # Check if it's a raffle
+    if item_id in active_raffles:
+        raffle = active_raffles[item_id]
+        prize = raffle.get('prize_usd', 0.0)
+        creator_id = raffle.get('creator')
+        ticket_participants = raffle.get('participants', {})
+
+        # Add raffle prize to house balance (not refunded to creator)
+        bot_settings["house_balance"] = bot_settings.get("house_balance", 0) + prize
+
+        # Refund ticket costs to all participants
+        refund_count = 0
+        for participant_id_str, participant_data in ticket_participants.items():
+            try:
+                pid = int(participant_id_str)
+                ticket_cost_paid = participant_data.get('paid', 0.0)
+                if ticket_cost_paid > 0:
+                    credit_wallet(pid, ticket_cost_paid)
+                    save_user_data(pid)
+                    refund_count += 1
+                    try:
+                        await context.bot.send_message(
+                            pid,
+                            f"{pe('warning')} Raffle <code>{item_id}</code> has been cancelled by admin.\n"
+                            f"Your ticket cost of ${ticket_cost_paid:.2f} has been refunded.",
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
+            except (ValueError, TypeError):
+                continue
+
+        # Remove from active raffles completely
+        del active_raffles[item_id]
+        save_bot_state()
+
+        await update.message.reply_text(
+            f"{pe('check')} Raffle <code>{item_id}</code> cancelled.\n"
+            f"Prize: ${prize:.2f} added to house balance.\n"
+            f"Refunded {refund_count} participant(s) ticket costs.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    await update.message.reply_text("No active match, deal, or raffle found with that ID.")
 
 # --- DICE INVITE HANDLER (accept/decline) ---
 @check_banned
@@ -30022,6 +30067,84 @@ async def cancel_withdrawal_conversation(update: Update, context: ContextTypes.D
     return ConversationHandler.END
 
 
+async def withdrawinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: Show withdrawal details and re-present approve/decline buttons.
+    If already processed, show the status and TXID."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Only the bot owner can use this command.")
+        return
+
+    args = update.message.text.strip().split()
+    if len(args) != 2:
+        await update.message.reply_text(
+            "Usage: /withdrawinfo <withdrawal_id>\n"
+            "Example: /withdrawinfo WD-240428-ABC123"
+        )
+        return
+
+    withdrawal_id = args[1]
+    withdrawal = withdrawal_requests.get(withdrawal_id)
+
+    if not withdrawal:
+        await update.message.reply_text(
+            f"{pe('cross')} Withdrawal request <code>{withdrawal_id}</code> not found.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    status = withdrawal.get("status", "unknown")
+    user_id = withdrawal.get("user_id", "N/A")
+    username = withdrawal.get("username", "N/A")
+    amount_usd = withdrawal.get("amount_usd", 0)
+    crypto_amount = withdrawal.get("crypto_amount", 0)
+    coin = withdrawal.get("coin", "USDT")
+    address = withdrawal.get("withdrawal_address", "N/A")
+    timestamp = withdrawal.get("timestamp", "N/A")
+    txid = withdrawal.get("txid")
+
+    formatted_crypto = format_crypto_amount(crypto_amount, coin) if crypto_amount else "N/A"
+
+    text = (
+        f"{pe('withdraw')} <b>Withdrawal Details</b>\n\n"
+        f"<b>Request ID:</b> <code>{withdrawal_id}</code>\n"
+        f"<b>User ID:</b> <code>{user_id}</code>\n"
+        f"<b>User:</b> @{username}\n"
+        f"<b>USD Value:</b> ${amount_usd:.2f}\n"
+        f"<b>Coin:</b> {coin}\n"
+        f"<b>Crypto Amount:</b> {formatted_crypto} {coin}\n"
+        f"<b>Address:</b> <code>{address}</code>\n"
+        f"<b>Requested:</b> {timestamp}\n"
+    )
+
+    if status == "pending":
+        text += f"\n<b>Status:</b> {pe('warning')} <b>PENDING</b>"
+        # Show approve/decline buttons (fresh ones that won't expire)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Approve", callback_data=f"withdrawal_approve_{withdrawal_id}"),
+             InlineKeyboardButton("Cancel", callback_data=f"withdrawal_cancel_{withdrawal_id}")]
+        ])
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    elif status == "approved":
+        approved_at = withdrawal.get("approved_at", "N/A")
+        text += (
+            f"\n<b>Status:</b> {pe('check')} <b>APPROVED</b>\n"
+            f"<b>Approved At:</b> {approved_at}\n"
+            f"<b>TXID:</b> <code>{txid or 'N/A'}</code>"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    elif status == "cancelled":
+        cancelled_at = withdrawal.get("cancelled_at", "N/A")
+        text += (
+            f"\n<b>Status:</b> {pe('cross')} <b>CANCELLED</b>\n"
+            f"<b>Cancelled At:</b> {cancelled_at}\n"
+            f"Funds were returned to user's balance."
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    else:
+        text += f"\n<b>Status:</b> {status.upper()}"
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
 async def recover_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != 'private':
         await update.message.reply_text("For security, please use the /recover command in a private chat with me.")
@@ -32522,6 +32645,7 @@ def main():
     app.add_handler(CommandHandler(["maxbet", "limits"], maxbet_command, block=False))
     app.add_handler(CommandHandler("admin", admin_dashboard_command, block=False))
     app.add_handler(CommandHandler("setbal", setbal_command, block=False))
+    app.add_handler(CommandHandler("withdrawinfo", withdrawinfo_command, block=False))
     app.add_handler(CommandHandler("resetleaderboard", resetleaderboard_command, block=False))
     app.add_handler(CommandHandler("setdaily", setdaily_command, block=False)) # NEW
     app.add_handler(CommandHandler("dailyoff", dailyoff_command, block=False)) # NEW
