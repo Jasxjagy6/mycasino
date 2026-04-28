@@ -628,15 +628,36 @@ def create_optional_rate_limiter():
         return None
 
 def _init_helper_bot(token, name="Helper Bot"):
-    """Initialize a single helper bot if token is provided."""
-    if token:
+    """Initialize a single helper bot if token is provided.
+
+    PERFORMANCE: The default ``Bot(token)`` instance uses an HTTPX pool of
+    size 1, which serialises every send_dice/send_message the helper makes.
+    Under heavy load (2000+ concurrent games) this collapses the whole point
+    of having helper bots. We explicitly configure a large connection pool
+    and generous timeouts so each helper can run many requests in parallel.
+    Falls back gracefully on old PTB versions that don't expose HTTPXRequest.
+    """
+    if not token:
+        return None
+    try:
         try:
+            from telegram.request import HTTPXRequest
+            request = HTTPXRequest(
+                connection_pool_size=128,
+                connect_timeout=10.0,
+                read_timeout=20.0,
+                write_timeout=20.0,
+                pool_timeout=20.0,
+            )
+            bot = Bot(token=token, request=request)
+        except Exception:
+            # Older PTB or missing HTTPXRequest — fall back to default.
             bot = Bot(token=token)
-            logging.info(f"{name} initialized successfully")
-            return bot
-        except Exception as e:
-            logging.warning(f"Failed to initialize {name}: {e}")
-    return None
+        logging.info(f"{name} initialized successfully")
+        return bot
+    except Exception as e:
+        logging.warning(f"Failed to initialize {name}: {e}")
+        return None
 
 # Initialize all helper bots
 helper_bot = _init_helper_bot(HELPER_BOT_TOKEN, "Helper Bot 1")
@@ -1005,12 +1026,20 @@ CRYPTO_PRECISION = {
 async def _get_http_client() -> httpx.AsyncClient:
     global _shared_http_client
     if _shared_http_client is None or _shared_http_client.is_closed:
+        # PERFORMANCE: grown from 100/20 → 200/50. The bot fans out HTTP
+        # calls to MEXC (prices), Oxapay (deposit/withdraw/webhook),
+        # Tronscan, BscScan, etherscan, etc. Under load — especially during
+        # a price-update tick that coincides with sweep_deposits — the
+        # undersized pool caused HTTPX connection acquisition to queue on
+        # the event loop.
         _shared_http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(10.0),
+            timeout=httpx.Timeout(15.0, connect=10.0),
             limits=httpx.Limits(
-                max_connections=100,
-                max_keepalive_connections=20,
+                max_connections=200,
+                max_keepalive_connections=50,
+                keepalive_expiry=30.0,
             ),
+            http2=False,  # Telegram + most crypto RPCs are HTTP/1.1 friendly
         )
     return _shared_http_client
 
@@ -4973,16 +5002,21 @@ def check_maintenance(func):
             return await func(update, context, *args, **kwargs)
 
         # Maintenance mode is ON and user is not admin
-        # Allow ongoing game interactions
+        # Allow ongoing game interactions.
+        # PERFORMANCE: Use the O(1) per-user active-games index instead of
+        # iterating all game_sessions — a full scan was O(N) in games which
+        # becomes painful once there are thousands of live/stale sessions.
         if update.message and update.message.dice:
             active_pvb_game_id = context.chat_data.get(f"active_pvb_game_{user.id}")
             if active_pvb_game_id and active_pvb_game_id in game_sessions:
                 return await func(update, context, *args, **kwargs)
 
             chat_id = update.effective_chat.id
-            for match_id, match_data in list(game_sessions.items()):
-                if match_data.get("chat_id") == chat_id and match_data.get("status") == 'active' and user.id in match_data.get("players", []):
-                     return await func(update, context, *args, **kwargs)
+            for match_id in list(_get_user_active_game_ids(user.id)):
+                match_data = game_sessions.get(match_id)
+                if (match_data and match_data.get("chat_id") == chat_id
+                        and match_data.get("status") == 'active'):
+                    return await func(update, context, *args, **kwargs)
 
         # Block new commands/interactions
         if update.message:
@@ -6051,10 +6085,10 @@ async def start_plinko_web_server(application=None):
             logging.info("Plinko web dashboard disabled.")
             return
 
-        print(f"DEBUG: Starting Plinko web server setup on port {PLINKO_WEB_PORT}...")
-        with open("/tmp/plinko_starting.txt", "w") as f:
-            f.write(f"Plinko starting attempt at {datetime.now()}, port={PLINKO_WEB_PORT}")
-        logging.info("Starting Plinko web server setup (optimized for high concurrency)...")
+        logging.info(
+            f"Starting Plinko web server on port {PLINKO_WEB_PORT} "
+            f"(high-concurrency mode)..."
+        )
 
         # Initialize semaphore for this server
         _plinko_semaphore = asyncio.Semaphore(_PLINKO_CONCURRENCY_LIMIT)
@@ -6129,26 +6163,23 @@ async def start_plinko_web_server(application=None):
 async def start_plinko_web_server_with_restart(application=None):
     """Start Plinko web server with automatic restart on failure."""
     global _plinko_server_running
-    with open("/tmp/plinko_wrapper_called.txt", "w") as f:
-        f.write(f"Wrapper called at {datetime.now()}")
+    # PERFORMANCE: dropped five blocking open('/tmp/...','w') debug
+    # breadcrumbs from the restart loop — they fired every iteration and
+    # were just noise, never read operationally.
     restart_count = 0
     max_restarts = 100  # Essentially unlimited restarts
     base_delay = 1  # Start with 1 second delay
 
     while restart_count < max_restarts and not bot_stopped:
-        with open("/tmp/plinko_loop_iter.txt", "w") as f:
-            f.write(f"Loop iteration: restart_count={restart_count}, bot_stopped={bot_stopped}")
         try:
             if not PLINKO_WEB_ENABLED:
-                with open("/tmp/plinko_disabled.txt", "w") as f:
-                    f.write("Plinko disabled")
                 return
-            with open("/tmp/plinko_before_start.txt", "w") as f:
-                f.write(f"About to call start_plinko_web_server at {datetime.now()}")
 
-            # If server was running but crashed, log the restart
             if restart_count > 0:
-                logging.warning(f"Plinko server restart attempt {restart_count} (server crashed)")
+                logging.warning(
+                    f"Plinko server restart attempt {restart_count} "
+                    "(server crashed)"
+                )
 
             await start_plinko_web_server(application)
 
@@ -7752,21 +7783,69 @@ def increment_user_nonce(user_id):
 emoji_send_timestamps = {}  # Track last emoji send time per chat
 
 async def safe_send_message(bot, chat_id, text, **kwargs):
-    """Send message with automatic retry on Telegram rate limits (429 errors)."""
+    """Send a message with automatic retry on Telegram flood / timeout errors.
+
+    PERFORMANCE / CORRECTNESS:
+      - Honours Telegram's ``retry_after`` from PTB's ``RetryAfter`` exception
+        instead of a blind 2^n backoff. When Telegram tells us exactly how
+        long to wait, sleeping longer wastes latency, sleeping shorter just
+        gets flood-limited again.
+      - Recognises permanent failures (user blocked the bot / chat gone /
+        deactivated account) and returns ``None`` immediately — don't waste
+        retries on a dead DM.
+      - Bounded backoff (capped at 60s) so a rogue chat can never hold a
+        handler hostage.
+    """
+    try:
+        from telegram.error import RetryAfter, TimedOut, NetworkError, Forbidden as _Forbidden, BadRequest as _BadRequest
+    except Exception:  # pragma: no cover
+        RetryAfter = TimedOut = NetworkError = _Forbidden = _BadRequest = ()  # type: ignore
+
     for attempt in range(3):
         try:
             return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        except RetryAfter as e:
+            wait = min(float(getattr(e, 'retry_after', 1.0)) + 0.5, 60.0)
+            logging.warning(
+                f"Flood-limited on send to {chat_id}, sleeping {wait:.1f}s "
+                f"(attempt {attempt + 1}/3)"
+            )
+            await asyncio.sleep(wait)
+        except (TimedOut, NetworkError) as e:
+            if attempt == 2:
+                logging.error(
+                    f"safe_send_message network error to {chat_id} after retries: {e}"
+                )
+                return None
+            await asyncio.sleep(0.5 * (attempt + 1))
+        except _Forbidden:
+            # User blocked bot, deactivated, or kicked — permanent.
+            return None
+        except _BadRequest as e:
+            msg = str(e).lower()
+            if ("chat not found" in msg or "user is deactivated" in msg
+                    or "bot was blocked" in msg or "forbidden" in msg):
+                return None
+            if attempt == 2:
+                logging.error(f"safe_send_message BadRequest to {chat_id}: {e}")
+                return None
+            await asyncio.sleep(0.3)
         except Exception as e:
-            err = str(e)
-            if "429" in err or "rate limit" in err.lower() or "flood" in err.lower():
-                wait = 2 ** attempt
-                logging.warning(f"Rate limited on send to {chat_id}, retrying in {wait}s (attempt {attempt+1})")
+            err = str(e).lower()
+            if "429" in err or "flood" in err or "rate limit" in err:
+                wait = min(2 ** attempt, 30)
+                logging.warning(
+                    f"Rate limited on send to {chat_id}, retrying in {wait}s"
+                )
                 await asyncio.sleep(wait)
-            elif "forbidden" in err.lower() or "chat not found" in err.lower() or "blocked" in err.lower() or "deactivated" in err.lower():
-                return None  # Permanent error - don't retry
+            elif ("forbidden" in err or "chat not found" in err
+                    or "blocked" in err or "deactivated" in err):
+                return None
             else:
                 if attempt == 2:
-                    logging.error(f"safe_send_message failed after 3 attempts to {chat_id}: {e}")
+                    logging.error(
+                        f"safe_send_message failed after 3 attempts to {chat_id}: {e}"
+                    )
                     return None
                 await asyncio.sleep(0.5)
     return None
@@ -8170,13 +8249,16 @@ async def _flush_dirty_users():
         if not _dirty_users:
             continue
         async with _dirty_lock:
-            batch = set(_dirty_users)
+            batch = list(_dirty_users)
             _dirty_users.clear()
         loop = asyncio.get_running_loop()
-        # PERFORMANCE: Batch into chunks to avoid overwhelming the executor
+        # PERFORMANCE: Batch into chunks to avoid overwhelming the executor.
+        # Materialise the list once (the previous code rebuilt `list(batch)`
+        # on every chunk which was O(n) per iteration — fine at 50 users,
+        # wasteful at 5000).
         chunk_size = 50
         for i in range(0, len(batch), chunk_size):
-            chunk = list(batch)[i:i + chunk_size]
+            chunk = batch[i:i + chunk_size]
             tasks = [
                 loop.run_in_executor(_save_executor, _sync_write_user, uid)
                 for uid in chunk
@@ -8273,11 +8355,34 @@ def _sync_save_bot_state_json():
 
 
 def save_bot_state():
-    """Shutdown save — writes all users synchronously via thread pool."""
+    """Persist non-user-data ("bot state") — called from many admin handlers.
+
+    PERFORMANCE: This used to blast every user's record to disk (thousands of
+    json files) and ``concurrent.futures.wait(... timeout=30)`` *inside the
+    event loop*, which froze every handler for up to 30 s on a single admin
+    click. User data is already persisted continuously via the write-behind
+    ``_dirty_users`` flush task — we only need to save the truly global
+    state here (withdrawals, settings, group/escrow/raffle registries).
+    ``save_bot_state_full()`` below still does the fat shutdown save; call
+    that path only from actual shutdown.
+    """
+    try:
+        _sync_save_bot_state_json()
+        save_all_escrow_deals()
+        save_all_group_settings()
+        save_all_recovery_data()
+        save_all_gift_codes()
+    except Exception as e:
+        logging.error(f"save_bot_state partial failure: {e}")
+
+
+def save_bot_state_full():
+    """Full shutdown save — flushes EVERY user file synchronously via thread
+    pool, plus all global registries. Only call from the shutdown path."""
     logging.info("Shutdown: saving all user data...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        futures = [ex.submit(_sync_write_user, uid) for uid in user_stats.keys()]
-        concurrent.futures.wait(futures, timeout=30)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+        futures = [ex.submit(_sync_write_user, uid) for uid in list(user_stats.keys())]
+        concurrent.futures.wait(futures, timeout=60)
     _sync_save_bot_state_json()
     save_all_escrow_deals()
     save_all_group_settings()
@@ -8287,8 +8392,8 @@ def save_bot_state():
 
 
 def save_all_data():
-    """Alias for save_bot_state - saves all user data, game sessions, and bot state."""
-    save_bot_state()
+    """Alias used by shutdown/atexit hooks — routes to the full save."""
+    save_bot_state_full()
 
 def load_bot_state():
     """Loads the bot state from PostgreSQL (preferred) or JSON files (fallback)."""
@@ -8512,7 +8617,7 @@ def save_all_gift_codes():
     logging.info("All gift codes saved.")
 
 
-atexit.register(save_bot_state)
+atexit.register(save_bot_state_full)
 
 def _signal_handler(signum, frame):
     """Handle SIGTERM/SIGINT for graceful shutdown."""
@@ -8520,10 +8625,12 @@ def _signal_handler(signum, frame):
     # Don't call sys.exit() during async startup - just set flag
     global bot_stopped
     bot_stopped = True
-    # Save state but don't exit - let async code handle graceful shutdown
+    # Save state but don't exit - let async code handle graceful shutdown.
+    # Full save here (signal path), because the write-behind flush won't
+    # drain if the process is being torn down.
     try:
-        save_bot_state()
-    except:
+        save_bot_state_full()
+    except Exception:
         pass
 
 import signal
@@ -29064,24 +29171,72 @@ async def set_daily_bonus_step(update: Update, context: ContextTypes.DEFAULT_TYP
     # --- FIX ENDS HERE ---
 
 async def admin_broadcast_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return ConversationHandler.END
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
     message_text = update.message.text
     all_user_ids = get_all_registered_user_ids()
-    sent_count = 0
-    failed_count = 0
+    total = len(all_user_ids)
 
-    await update.message.reply_text(f"Starting broadcast to {len(all_user_ids)} users...")
+    await update.message.reply_text(f"Starting broadcast to {total} users…")
 
-    for user_id in all_user_ids:
+    # PERFORMANCE: The previous implementation was a serial for-loop with a
+    # flat 0.1 s sleep — that's ~10 messages/s so a 2000-user broadcast took
+    # 200 s and the 5000-user projection was 500 s+ per broadcast while
+    # blocking the admin handler the whole time. Telegram's global bot limit
+    # is ~30 msg/s; we stay safely under it by gating with a semaphore of 25
+    # in-flight sends plus the AIORateLimiter that PTB already wraps every
+    # call with. Permanent failures (blocked/deactivated) don't waste retries
+    # thanks to safe_send_message.
+    sent = 0
+    failed = 0
+    sem = asyncio.Semaphore(25)
+
+    async def _send_one(uid: int):
+        nonlocal sent, failed
+        async with sem:
+            try:
+                res = await safe_send_message(
+                    context.bot, uid, message_text, parse_mode=ParseMode.HTML
+                )
+                if res is None:
+                    failed += 1
+                else:
+                    sent += 1
+            except Exception as e:
+                failed += 1
+                logging.debug(f"Broadcast send to {uid} failed: {e}")
+
+    # Fire the whole broadcast in a background task so the admin handler
+    # returns immediately — admin gets a progress confirmation once it's done
+    # via a DM follow-up. This also frees the conversation state so the bot
+    # isn't stuck inside an admin flow for the entire duration of the send.
+    admin_user_id = update.effective_user.id
+
+    async def _broadcast_runner():
+        tasks = [asyncio.create_task(_send_one(uid)) for uid in all_user_ids]
+        # Progress pings every 500 sends
+        progress_chat_id = admin_user_id
+        for i in range(0, len(tasks), 500):
+            batch = tasks[i:i + 500]
+            await asyncio.gather(*batch, return_exceptions=True)
+            try:
+                await context.bot.send_message(
+                    chat_id=progress_chat_id,
+                    text=(f"Broadcast progress: {sent + failed}/{total}  "
+                          f"(ok={sent} fail={failed})"),
+                )
+            except Exception:
+                pass
         try:
-            await context.bot.send_message(chat_id=user_id, text=message_text, parse_mode=ParseMode.HTML)
-            sent_count += 1
-        except (BadRequest, Forbidden) as e:
-            logging.warning(f"Broadcast failed for user {user_id}: {e}")
-            failed_count += 1
-        await asyncio.sleep(0.1) # Avoid hitting rate limits
+            await context.bot.send_message(
+                chat_id=progress_chat_id,
+                text=(f"Broadcast finished.\n{pe('check')} Sent: {sent}\n"
+                      f"{pe('cross')} Failed: {failed}")
+            )
+        except Exception:
+            pass
 
-    await update.message.reply_text(f"Broadcast finished.\n{pe('check')} Sent: {sent_count}\n{pe('cross')} Failed: {failed_count}")
+    asyncio.create_task(_broadcast_runner())
 
     context.user_data.clear()
     await admin_dashboard_command(update, context)
@@ -30537,22 +30692,42 @@ async def leaderboard_referral_command(update: Update, context: ContextTypes.DEF
     set_menu_owner(sent_message, update.effective_user.id)
 
 async def _event_loop_watchdog():
-    """Watchdog task to confirm event loop is still running."""
-    import time
+    """Watchdog task to confirm event loop is still running.
+
+    PERFORMANCE: Ticks every 30s and only logs at DEBUG on the happy path.
+    The old INFO-every-10s write caused noticeable log volume (+file I/O
+    every 10s) that served no operational purpose once we know the loop is
+    alive. WARNING logs still fire on anomalies (queue backlog, task
+    explosions) which is what operators actually care about."""
     counter = 0
+    last_task_count = 0
     while True:
-        await asyncio.sleep(10)
+        await asyncio.sleep(30)
         counter += 1
         task_count = len(asyncio.all_tasks())
-        logging.info(f"[WATCHDOG] Event loop alive - tick #{counter}, active tasks: {task_count}")
-        # Check if update queue is backed up
+        # Only warn on alarming conditions
+        if task_count > 2000:
+            logging.warning(
+                f"[WATCHDOG] High active-task count: {task_count} (tick #{counter})"
+            )
+        elif task_count > last_task_count * 3 and task_count > 500:
+            logging.warning(
+                f"[WATCHDOG] Task count spiked: {last_task_count} -> {task_count}"
+            )
+        else:
+            logging.debug(
+                f"[WATCHDOG] alive tick={counter} tasks={task_count}"
+            )
+        last_task_count = task_count
+
         try:
             app_instance = app
             if hasattr(app_instance, 'update_queue'):
                 qsize = app_instance.update_queue.qsize()
-                logging.info(f"[WATCHDOG] Update queue size: {qsize}")
                 if qsize > 100:
-                    logging.warning(f"[WATCHDOG] Update queue is backed up! {qsize} pending updates")
+                    logging.warning(
+                        f"[WATCHDOG] Update queue backed up: {qsize} pending"
+                    )
         except Exception as e:
             logging.error(f"[WATCHDOG] Error checking queue: {e}")
 
@@ -30562,9 +30737,9 @@ async def post_init(application: Application):
     This runs after the event loop is started by run_polling().
     OPTIMIZED: Async data loading and all background tasks registered here.
     """
-    # Immediate file write to confirm post_init is called
-    with open("/tmp/post_init_called.txt", "w") as f:
-        f.write("post_init was called at " + str(datetime.now()))
+    # Note: the /tmp/post_init_called.txt debug breadcrumb was removed —
+    # post_init is exercised on every startup and a blocking open()/write()
+    # during startup was just noise, not a useful signal.
     logging.info("post_init starting...")
     
     # Start event loop watchdog
@@ -30608,8 +30783,6 @@ async def post_init(application: Application):
         application.create_task(start_oxapay_webhook_server(application))
 
         # Start Plinko web dashboard server with auto-restart
-        with open("/tmp/post_init_plinko_task.txt", "w") as f:
-            f.write(f"Creating plinko task at {datetime.now()}")
         application.create_task(start_plinko_web_server_with_restart(application))
 
         # Start Chicken Road rate limit cleanup task
@@ -30687,8 +30860,10 @@ async def on_bot_shutdown(application: Application):
             # Save all remaining user data
             save_all_user_data()
         
-        # Save all bot state (games, settings, escrow, etc.)
-        save_bot_state()
+        # Save all bot state (games, settings, escrow, etc.) + user files
+        # defensively in case any dirtied-but-not-marked records slipped
+        # through the flush.
+        save_bot_state_full()
         logging.info("Bot shutdown save complete.")
     except Exception as e:
         logging.error(f"Error during bot shutdown: {e}", exc_info=True)
@@ -30790,16 +30965,24 @@ async def _cleanup_game_sessions():
             # Remove session
             game_sessions.pop(game_id, None)
 
-        # Clean up wallet locks for users with no active games (prevent unbounded growth)
+        # Clean up wallet locks for users with no active games (prevent
+        # unbounded growth). PERFORMANCE: bumped batch cap from 200 -> 1000
+        # so a 5000-user bot can actually drain the backlog within one cycle
+        # instead of slowly bleeding forever.
         stale_lock_users = []
         for uid in list(_wallet_locks.keys()):
             if uid not in _user_active_games_index and uid not in active_pvb_games:
                 stale_lock_users.append(uid)
-        # Only clean up locks that are not currently held
-        for uid in stale_lock_users[:200]:  # Batch: max 200 per cycle
+        for uid in stale_lock_users[:1000]:
             lock = _wallet_locks.get(uid)
             if lock and not lock.locked():
                 _wallet_locks.pop(uid, None)
+
+        # Same story for withdrawal locks — they grow per-user and never shrink.
+        for uid in list(_withdrawal_locks.keys())[:1000]:
+            lock = _withdrawal_locks.get(uid)
+            if lock and not lock.locked():
+                _withdrawal_locks.pop(uid, None)
 
         # Clean up stale cashout buttons
         stale_co = [mid for mid, co in list(_active_cashout_buttons.items()) if mid not in game_sessions]
@@ -32657,20 +32840,57 @@ def main():
     log_filename = os.path.join(LOGS_DIR, f"bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     os.makedirs(LOGS_DIR, exist_ok=True)
     
-    # Remove any existing handlers to force fresh configuration
+    # PERFORMANCE: Non-blocking logging via QueueHandler + QueueListener so
+    # disk I/O never blocks the asyncio event loop. A background thread drains
+    # the queue into a size-capped RotatingFileHandler + stderr. Under 2000+
+    # concurrent users the previous synchronous FileHandler was a real event-
+    # loop staller — a slow disk flush during a noisy moment (e.g. the
+    # watchdog ticking while 30 message handlers all log) would pause every
+    # user's update for the duration of the fsync.
+    import queue as _queue_mod
+    from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
+
     root_logger = logging.getLogger()
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-    
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=logging.INFO,
-        handlers=[
-            logging.FileHandler(log_filename),
-            logging.StreamHandler()
-        ],
-        force=True
+    # Tear down any pre-existing config (basicConfig from imports, etc.)
+    for _h in list(root_logger.handlers):
+        try:
+            root_logger.removeHandler(_h)
+            _h.close()
+        except Exception:
+            pass
+
+    _log_queue: _queue_mod.Queue = _queue_mod.Queue(-1)  # unbounded — never drop
+    _log_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
+    # Rotate at 50 MB, keep 5 backups (250 MB total cap) — prevents the log
+    # file from growing without bound and chewing up disk on long-lived bots.
+    _rotating_file_handler = RotatingFileHandler(
+        log_filename, maxBytes=50 * 1024 * 1024, backupCount=5, encoding='utf-8'
+    )
+    _rotating_file_handler.setFormatter(_log_formatter)
+    _stream_handler = logging.StreamHandler()
+    _stream_handler.setFormatter(_log_formatter)
+
+    _log_listener = QueueListener(
+        _log_queue, _rotating_file_handler, _stream_handler,
+        respect_handler_level=True
+    )
+    _log_listener.start()
+    # Save a reference so atexit can flush it cleanly.
+    globals()['_log_queue_listener'] = _log_listener
+
+    _queue_handler = QueueHandler(_log_queue)
+    root_logger.addHandler(_queue_handler)
+    root_logger.setLevel(logging.INFO)
+
+    # Mute noisy third-party INFO logging on the hot path (the bot's own
+    # INFO logs stay intact). httpx logs every single request at INFO which
+    # is massive once helper bots are rolling dice in parallel.
+    for _noisy in ("httpx", "httpcore", "telegram.ext.Application",
+                   "aiosqlite", "asyncio"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+
     logging.info(f"Log file: {log_filename}")
     logging.info("Starting bot...")
 
@@ -32724,18 +32944,27 @@ def main():
     if w3_bsc and w3_bsc.is_connected(): logging.info(f"BSC connected. Chain ID: {w3_bsc.eth.chain_id}")
     else: logging.warning("BSC connection failed")
 
-    # OPTIMIZED: Single ApplicationBuilder call with performance tuning
-    # Conservative settings to avoid Telegram rate limits
+    # PERFORMANCE: Tuned for 5000+ concurrent users.
+    #   - concurrent_updates=512  → PTB dispatches up to 512 update tasks at
+    #     once (was 256). For a pure-dice spike from a few thousand users
+    #     we want headroom; anything past this gets queued, not dropped.
+    #   - connection_pool_size=512 → HTTPX connection pool keeps enough hot
+    #     sockets open for worst-case parallel outbound fan-out (broadcast,
+    #     sidebet DM storms, raffle completion, admin broadcast).
+    #   - PTB's AIORateLimiter (attached below) is what actually shapes
+    #     traffic to Telegram; growing the pool doesn't break rate limits,
+    #     it just prevents the pool from becoming a bottleneck when the
+    #     rate limiter is willing to let us through.
     app_builder = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(post_init)
-        .concurrent_updates(256)
+        .concurrent_updates(512)
         .get_updates_pool_timeout(30)
         .get_updates_connect_timeout(15)
         .get_updates_read_timeout(15)
         .get_updates_write_timeout(15)
-        .connection_pool_size(256)
+        .connection_pool_size(512)
         .pool_timeout(30)
         .connect_timeout(15)
         .read_timeout(30)
@@ -33363,15 +33592,18 @@ def main():
     # Set up helper bot with callback handlers for group messages
     if helper_bot and HELPER_BOT_TOKEN:
         try:
+            # PERFORMANCE: helper_app also needs real headroom — the previous
+            # 15/15 pool would starve the moment multiple groups were
+            # generating leaderboard/price callbacks simultaneously.
             helper_app = (
                 ApplicationBuilder()
                 .token(HELPER_BOT_TOKEN)
-                .concurrent_updates(15)
-                .connection_pool_size(15)
-                .pool_timeout(10)
+                .concurrent_updates(128)
+                .connection_pool_size(128)
+                .pool_timeout(20)
                 .connect_timeout(10)
-                .read_timeout(10)
-                .write_timeout(15)
+                .read_timeout(20)
+                .write_timeout(20)
                 .build()
             )
 
@@ -33396,11 +33628,19 @@ def main():
                 await app.initialize()
                 await app.start()
                 await post_init(app)
-                await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+                # drop_pending_updates avoids a restart causing a thundering-
+                # herd replay of every update queued while the bot was down.
+                await app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True,
+                )
 
                 await helper_app.initialize()
                 await helper_app.start()
-                await helper_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+                await helper_app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True,
+                )
 
                 # Keep both running using an event
                 stop_event = asyncio.Event()
