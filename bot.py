@@ -5856,8 +5856,10 @@ async def plinko_api_bet(request: aiohttp.web.Request) -> aiohttp.web.Response:
 
     if bet_amount < PLINKO_WEB_MIN_BET:
         return aiohttp.web.json_response({"error": f"Minimum bet is ${PLINKO_WEB_MIN_BET:.2f}"}, status=400)
-    if bet_amount > PLINKO_WEB_MAX_BET:
-        return aiohttp.web.json_response({"error": f"Maximum bet is ${PLINKO_WEB_MAX_BET:.2f}"}, status=400)
+    # Use dynamic max bet (min of static and dynamic)
+    _plinko_dyn_max = min(PLINKO_WEB_MAX_BET, get_dynamic_max_bet("originals", "plinko"))
+    if bet_amount > _plinko_dyn_max:
+        return aiohttp.web.json_response({"error": f"Maximum bet is ${_plinko_dyn_max:.2f}"}, status=400)
 
     # Round to 2 decimal places to prevent floating point exploits
     bet_amount = round(bet_amount, 2)
@@ -6484,9 +6486,11 @@ async def cr_api_bet(request: aiohttp.web.Request) -> aiohttp.web.Response:
     if bet_amount < CHICKEN_ROAD_WEB_MIN_BET:
         return aiohttp.web.json_response(
             {"error": f"Minimum bet is ${CHICKEN_ROAD_WEB_MIN_BET:.2f}"}, status=400)
-    if bet_amount > CHICKEN_ROAD_WEB_MAX_BET:
+    # Use dynamic max bet (min of static and dynamic)
+    _cr_dyn_max = min(CHICKEN_ROAD_WEB_MAX_BET, get_dynamic_max_bet("originals", "chicken_road"))
+    if bet_amount > _cr_dyn_max:
         return aiohttp.web.json_response(
-            {"error": f"Maximum bet is ${CHICKEN_ROAD_WEB_MAX_BET:.2f}"}, status=400)
+            {"error": f"Maximum bet is ${_cr_dyn_max:.2f}"}, status=400)
 
     lock = _chicken_road_locks.setdefault(user_id, asyncio.Lock())
     async with lock:
@@ -8518,22 +8522,36 @@ load_bot_state()
 
 # --- HELPER TO CHECK BET LIMITS ---
 async def check_bet_limits(update: Update, bet_amount: float, game_name: str, user_id: int = None) -> bool:
+    import math as _math_cbl
     if user_id is None and update.effective_user:
         user_id = update.effective_user.id
     user_lang = get_user_lang(user_id) if user_id else DEFAULT_LANG
     user_currency = get_user_currency(user_id) if user_id else "USD"
 
+    # SECURITY: Reject NaN, Inf, negative, and zero bet amounts
+    if _math_cbl.isnan(bet_amount) or _math_cbl.isinf(bet_amount) or bet_amount <= 0:
+        await update.message.reply_text(f"{pe('cross')} Invalid bet amount.")
+        return False
+
     limits = bot_settings.get('game_limits', {}).get(game_name, {})
     min_bet = limits.get('min', MIN_BALANCE)
-    max_bet = limits.get('max')
+
+    # Use dynamic max bet based on house balance (overrides static limits)
+    dynamic_max = get_dynamic_max_bet(game_category=None, game_type=game_name)
+    static_max = limits.get('max')
+    # Use the lower of static and dynamic limits (or just dynamic if no static)
+    max_bet = min(dynamic_max, static_max) if static_max is not None else dynamic_max
 
     if bet_amount < min_bet:
         min_formatted = format_currency(min_bet, user_currency)
         await update.message.reply_text(get_text("min_bet", user_lang, amount=min_formatted))
         return False
     if max_bet is not None and bet_amount > max_bet:
-        max_formatted = format_currency(max_bet, user_currency)
-        await update.message.reply_text(get_text("max_bet", user_lang, amount=max_formatted))
+        await update.message.reply_text(
+            f"{pe('cross')} Maximum bet for this game is ${max_bet:,.2f}\n"
+            f"Use /maxbet to see current limits.",
+            parse_mode=ParseMode.HTML
+        )
         return False
     return True
 
