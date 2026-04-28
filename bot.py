@@ -150,6 +150,13 @@ BOT_OWNER_ID = BOT_OWNER_IDS[0]  # Primary admin (backward compat for withdrawal
 def is_admin(user_id: int) -> bool:
     """Check if a user is a bot admin/owner."""
     return user_id in BOT_OWNER_IDS
+
+def get_privacy_display_name(user_id: int, original_name: str) -> str:
+    """Return 'Hidden User' if the user has privacy mode enabled, otherwise the original name."""
+    if user_stats.get(user_id, {}).get("privacy_mode", False):
+        return "Hidden User"
+    return original_name
+
 MIN_BALANCE = 0.1
 DEBUG_EMOJI_GAMES = False  # Set to True to enable detailed emoji game logging
 
@@ -9467,58 +9474,76 @@ async def generate_stats_image(user_id: int, context: ContextTypes.DEFAULT_TYPE,
 
 
 def _render_stats_sync(text_data, game_list, pvp_entries, profile_pic_data):
-    """Render stats template with compact horizontal layout."""
+    """Render stats template with premium casino theme."""
     try:
-        W, H = 800, 700
-        img = Image.new('RGBA', (W, H), (10, 15, 25))
+        W, H = 800, 720
+        img = Image.new('RGBA', (W, H), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
+
+        # Premium gradient background
+        for y_pos in range(H):
+            ratio = y_pos / H
+            r = int(6 + ratio * 8)
+            g = int(10 + ratio * 12)
+            b = int(22 + ratio * 18)
+            draw.line([(0, y_pos), (W, y_pos)], fill=(r, g, b))
+
+        # Subtle star particles
+        rng = random.Random(42)
+        for _ in range(90):
+            sx = rng.randint(0, W)
+            sy = rng.randint(0, H)
+            brightness = rng.randint(50, 180)
+            sr = rng.choice([1, 1, 1, 2])
+            draw.ellipse([sx - sr, sy - sr, sx + sr, sy + sr], fill=(brightness, brightness, brightness + 20))
+
+        # Border glow
+        draw.rounded_rectangle([2, 2, W - 3, H - 3], radius=16, outline=(80, 160, 255, 150), width=2)
+        draw.rounded_rectangle([5, 5, W - 6, H - 6], radius=14, outline=(60, 130, 220, 50), width=1)
 
         # Load fonts
         try:
             f_title = ImageFont.truetype("bold.ttf", 22)
-            f_stat_val = ImageFont.truetype("bold.ttf", 18)
-            f_stat_lbl = ImageFont.truetype("bold.ttf", 9)
-            f_detail = ImageFont.truetype("bold.ttf", 11)
+            f_stat_val = ImageFont.truetype("bold.ttf", 20)
+            f_stat_lbl = ImageFont.truetype("bold.ttf", 10)
+            f_detail = ImageFont.truetype("bold.ttf", 12)
             f_bonus = ImageFont.truetype("bold.ttf", 13)
-            f_game_name = ImageFont.truetype("bold.ttf", 11)
-            f_game_val = ImageFont.truetype("bold.ttf", 10)
+            f_game_name = ImageFont.truetype("bold.ttf", 12)
+            f_game_val = ImageFont.truetype("bold.ttf", 11)
             f_rank_big = ImageFont.truetype("bold.ttf", 24)
             f_level = ImageFont.truetype("bold.ttf", 12)
+            f_small = ImageFont.truetype("bold.ttf", 9)
         except Exception:
-            f_title = f_stat_val = f_stat_lbl = f_detail = f_bonus = f_game_name = f_game_val = f_rank_big = f_level = ImageFont.load_default()
+            f_title = f_stat_val = f_stat_lbl = f_detail = f_bonus = f_game_name = f_game_val = f_rank_big = f_level = f_small = ImageFont.load_default()
 
-        # --- Background stars ---
-        rng = random.Random(42)
-        for _ in range(80):
-            sx = rng.randint(0, W)
-            sy = rng.randint(0, H)
-            sr = rng.randint(1, 2)
-            draw.ellipse([sx - sr, sy - sr, sx + sr, sy + sr], fill=(255, 255, 255, rng.randint(80, 200)))
+        # --- Top bar with gradient ---
+        for ty in range(48):
+            alpha = int(255 * (1 - ty / 48))
+            draw.line([(0, ty), (W, ty)], fill=(10, 18, 35))
+        draw.line([(0, 48), (W, 48)], fill=(80, 160, 255, 60), width=1)
 
-        # --- Top bar with bot info ---
-        draw.rounded_rectangle([0, 0, W, 42], radius=0, fill=(12, 18, 32))
-        draw.line([(0, 42), (W, 42)], fill=(40, 60, 90), width=1)
-
-        # Bot username centered at top
+        # Bot username and branding (top center)
         bot_un = f"@{text_data['bot_username']}"
         bot_w = draw.textlength(bot_un, font=f_title)
-        draw.text((W / 2 - bot_w / 2, 4), bot_un, fill=(100, 200, 255), font=f_title)
-
-        # "Telegram casino" subtitle
+        draw.text((W / 2 - bot_w / 2, 6), bot_un, fill=(100, 180, 255), font=f_title)
         subtitle = "Telegram Casino"
-        sub_w = draw.textlength(subtitle, font=f_stat_lbl)
-        draw.text((W / 2 - sub_w / 2, 26), subtitle, fill=(120, 140, 170), font=f_stat_lbl)
+        sub_w = draw.textlength(subtitle, font=f_small)
+        draw.text((W / 2 - sub_w / 2, 30), subtitle, fill=(100, 130, 170), font=f_small)
 
-        # --- Member since ---
+        # Member since
         ms_text = f"Member since: {text_data['member_since']}"
-        ms_w = draw.textlength(ms_text, font=f_stat_lbl)
-        draw.text((W / 2 - ms_w / 2, 48), ms_text, fill=(120, 140, 170), font=f_stat_lbl)
+        ms_w = draw.textlength(ms_text, font=f_small)
+        draw.text((W / 2 - ms_w / 2, 54), ms_text, fill=(100, 120, 155), font=f_small)
 
-        # --- Profile section ---
-        avatar_x, avatar_y = 60, 82
-        avatar_r = 26
+        # --- Profile section with card-style background ---
+        profile_y = 70
+        draw.rounded_rectangle([18, profile_y, W - 18, profile_y + 58], radius=12,
+                                fill=(12, 22, 40), outline=(50, 80, 120), width=1)
 
-        # Draw profile picture with circular mask
+        avatar_x, avatar_y = 55, profile_y + 29
+        avatar_r = 22
+
+        # Profile picture
         if profile_pic_data and isinstance(profile_pic_data, Image.Image):
             try:
                 pic = profile_pic_data.convert("RGBA").resize((avatar_r * 2, avatar_r * 2), Image.Resampling.LANCZOS)
@@ -9529,120 +9554,117 @@ def _render_stats_sync(text_data, game_list, pvp_entries, profile_pic_data):
                 img.paste(circ, (avatar_x - avatar_r, avatar_y - avatar_r), circ)
             except Exception:
                 draw.ellipse([avatar_x - avatar_r, avatar_y - avatar_r, avatar_x + avatar_r, avatar_y + avatar_r],
-                             fill=(30, 50, 80), outline=(100, 200, 255), width=2)
+                             fill=(25, 45, 70), outline=(80, 160, 255), width=2)
         else:
             draw.ellipse([avatar_x - avatar_r, avatar_y - avatar_r, avatar_x + avatar_r, avatar_y + avatar_r],
-                         fill=(30, 50, 80), outline=(100, 200, 255), width=2)
+                         fill=(25, 45, 70), outline=(80, 160, 255), width=2)
 
-        # Name and username next to avatar
-        name_x = avatar_x + avatar_r + 12
-        name_y = avatar_y - 10
-        draw.text((name_x, name_y), text_data["first_name"], fill=(255, 255, 255), font=f_title)
-        draw.text((name_x, name_y + 22), text_data["username"], fill=(150, 180, 220), font=f_detail)
+        # Name + username
+        name_x = avatar_x + avatar_r + 14
+        draw.text((name_x, profile_y + 10), text_data["first_name"], fill=(255, 255, 255), font=f_title)
+        draw.text((name_x, profile_y + 32), f'{text_data["username"]}  [ {text_data["user_id"]} ]',
+                  fill=(130, 155, 195), font=f_detail)
 
-        # User ID below name
-        id_text = text_data['user_id']
-        draw.text((name_x, name_y + 36), f"[ {id_text} ]", fill=(120, 140, 170), font=f_stat_lbl)
-
-        # Rank badge (right side)
+        # Rank + Level badges (right side)
         rank_text = text_data["rank"]
         rank_w = draw.textlength(rank_text, font=f_rank_big)
-        rank_box = [W - 90, 56, W - 90 + rank_w + 16, 56 + 30]
-        draw.rounded_rectangle(rank_box, radius=6, fill=(25, 35, 55), outline=(255, 200, 50), width=2)
-        draw.text((W - 90 + 8, 56 + 3), rank_text, fill=(255, 200, 50), font=f_rank_big)
+        rx = W - 35 - rank_w - 16
+        draw.rounded_rectangle([rx, profile_y + 8, rx + rank_w + 16, profile_y + 34], radius=8,
+                                fill=(35, 30, 12), outline=(255, 200, 50), width=2)
+        draw.text((rx + 8, profile_y + 10), rank_text, fill=(255, 200, 50), font=f_rank_big)
 
-        # Level badge below rank
         lvl_text = text_data["level"]
         lvl_w = draw.textlength(lvl_text, font=f_level)
-        lvl_box = [W - 90, 92, W - 90 + lvl_w + 14, 92 + 20]
-        draw.rounded_rectangle(lvl_box, radius=5, fill=(40, 20, 60), outline=(180, 100, 255), width=1)
-        draw.text((W - 90 + 7, 92 + 2), lvl_text, fill=(180, 130, 255), font=f_level)
+        draw.rounded_rectangle([rx, profile_y + 38, rx + lvl_w + 14, profile_y + 54], radius=6,
+                                fill=(35, 18, 50), outline=(160, 100, 240), width=1)
+        draw.text((rx + 7, profile_y + 39), lvl_text, fill=(180, 130, 255), font=f_level)
 
-        # --- Stat boxes: 4 boxes in a row ---
-        box_w, box_h = 175, 60
+        # --- Stats cards row ---
+        y_stats = profile_y + 68
+        box_w, box_h = 180, 62
         gap = 8
-        start_x = 20
-        y_row1 = 120
+        start_x = 18
 
         pnl_val = text_data["total_pnl"]
-        pnl_color = (80, 220, 120) if pnl_val >= 0 else (255, 80, 80)
+        pnl_color = (80, 230, 120) if pnl_val >= 0 else (255, 80, 80)
         pnl_sign = "+" if pnl_val >= 0 else ""
 
-        stats_row1 = [
-            (f'{text_data["total_games"]}', 'GAMES PLAYED', (255, 255, 255)),
-            (format_compact_usd(text_data["total_wagered"]), 'TOTAL WAGERED', (100, 200, 255)),
-            (f'{text_data["win_rate"]:.1f}%', 'WIN RATE', (255, 200, 50)),
-            (f'{pnl_sign}{format_compact_usd(pnl_val)}', 'TOTAL P&L', pnl_color),
+        stats = [
+            (f'{text_data["total_games"]}', 'GAMES PLAYED', (255, 255, 255), (40, 60, 90)),
+            (format_compact_usd(text_data["total_wagered"]), 'TOTAL WAGERED', (100, 200, 255), (30, 55, 90)),
+            (f'{text_data["win_rate"]:.1f}%', 'WIN RATE', (255, 215, 0), (50, 48, 20)),
+            (f'{pnl_sign}{format_compact_usd(pnl_val)}', 'TOTAL P&L', pnl_color, (40, 55, 35) if pnl_val >= 0 else (55, 30, 30)),
         ]
-        for i, (val, lbl, color) in enumerate(stats_row1):
+        for i, (val, lbl, color, outline_c) in enumerate(stats):
             bx = start_x + i * (box_w + gap)
-            draw.rounded_rectangle([bx, y_row1, bx + box_w, y_row1 + box_h], radius=8, fill=(15, 22, 38), outline=(40, 60, 90), width=1)
+            draw.rounded_rectangle([bx, y_stats, bx + box_w, y_stats + box_h], radius=10,
+                                    fill=(12, 20, 35), outline=outline_c, width=1)
             val_w = draw.textlength(val, font=f_stat_val)
-            draw.text((bx + (box_w - val_w) / 2, y_row1 + 10), val, fill=color, font=f_stat_val)
+            draw.text((bx + (box_w - val_w) / 2, y_stats + 12), val, fill=color, font=f_stat_val)
             lbl_w = draw.textlength(lbl, font=f_stat_lbl)
-            draw.text((bx + (box_w - lbl_w) / 2, y_row1 + 38), lbl, fill=(120, 140, 170), font=f_stat_lbl)
+            draw.text((bx + (box_w - lbl_w) / 2, y_stats + 40), lbl, fill=(100, 120, 155), font=f_stat_lbl)
 
-        # --- Info row: Biggest Win, Favorite Game, Avg Bet ---
-        y_info = y_row1 + box_h + 10
-        draw.rounded_rectangle([20, y_info, W - 20, y_info + 35], radius=6, fill=(15, 22, 38), outline=(40, 60, 90), width=1)
+        # --- Info strip ---
+        y_info = y_stats + box_h + 10
+        draw.rounded_rectangle([18, y_info, W - 18, y_info + 38], radius=8,
+                                fill=(12, 20, 35), outline=(50, 80, 120), width=1)
 
-        # Biggest Win (left)
-        draw.text((30, y_info + 4), "BIGGEST WIN", fill=(100, 140, 170), font=f_stat_lbl)
+        draw.text((28, y_info + 5), "BIGGEST WIN", fill=(90, 120, 155), font=f_stat_lbl)
         biggest_win_val = f'+{format_compact_usd(text_data["biggest_win"])}'
-        draw.text((30, y_info + 16), biggest_win_val, fill=(255, 200, 50), font=f_detail)
-        if text_data["biggest_win_game"] and text_data["biggest_win_game"] not in ('N/A', ''):
-            draw.text((30, y_info + 27), f'in {get_display_name(text_data["biggest_win_game"])}', fill=(120, 140, 170), font=f_stat_lbl)
+        draw.text((28, y_info + 18), biggest_win_val, fill=(255, 215, 0), font=f_detail)
 
-        # Favorite Game (center)
         fav_game = get_display_name(text_data["fav_game"])
         fav_w = draw.textlength(f"Fav: {fav_game}", font=f_detail)
-        draw.text((W / 2 - fav_w / 2, y_info + 10), f"Fav: {fav_game}", fill=(255, 200, 50), font=f_detail)
+        draw.text((W / 2 - fav_w / 2, y_info + 12), f"Fav: {fav_game}", fill=(255, 200, 50), font=f_detail)
 
-        # Avg Bet (right)
         avg_bet_val = format_compact_usd(text_data["avg_bet"])
-        draw.text((W - 30, y_info + 4), "AVG BET", fill=(100, 140, 170), font=f_stat_lbl, anchor="ra")
-        draw.text((W - 30, y_info + 16), avg_bet_val, fill=(100, 200, 255), font=f_detail, anchor="ra")
+        draw.text((W - 28, y_info + 5), "AVG BET", fill=(90, 120, 155), font=f_stat_lbl, anchor="ra")
+        draw.text((W - 28, y_info + 18), avg_bet_val, fill=(100, 200, 255), font=f_detail, anchor="ra")
 
-        # --- Games Breakdown section ---
-        y_games = y_info + 45
-        draw.line([(20, y_games), (W - 20, y_games)], fill=(40, 60, 90), width=1)
-        draw.text((20, y_games + 3), "GAMES BREAKDOWN", fill=(100, 200, 255), font=f_stat_lbl)
+        # --- Games Breakdown ---
+        y_games = y_info + 48
+        draw.text((22, y_games), "GAMES BREAKDOWN", fill=(80, 160, 255), font=f_stat_lbl)
+        draw.line([(22, y_games + 14), (W - 22, y_games + 14)], fill=(40, 60, 90), width=1)
         y_games += 20
 
-        for g in game_list[:6]:  # Limit to 6 games to keep compact
+        for i, g in enumerate(game_list[:6]):
             gname = g["name"]
             ggames = g["games"]
             gwr = g["wr"]
             gpnl = g["pnl"]
             gpnl_pos = g["pnl_positive"]
-            gpnl_color = (80, 220, 120) if gpnl_pos else (255, 80, 80)
+            gpnl_color = (80, 230, 120) if gpnl_pos else (255, 80, 80)
 
-            row_h = 24
-            draw.rounded_rectangle([20, y_games, W - 20, y_games + row_h], radius=4, fill=(15, 22, 38))
+            row_h = 26
+            bg = (12, 20, 35) if i % 2 == 0 else (10, 18, 30)
+            draw.rounded_rectangle([18, y_games, W - 18, y_games + row_h], radius=6, fill=bg)
 
-            draw.text((30, y_games + 5), gname, fill=(255, 255, 255), font=f_game_name)
-            draw.text((200, y_games + 5), f"{ggames} games", fill=(120, 140, 170), font=f_game_val)
-            draw.text((320, y_games + 5), f"{gwr:.1f}% WR", fill=(255, 200, 50), font=f_game_val)
+            draw.text((28, y_games + 6), gname, fill=(230, 235, 245), font=f_game_name)
+            draw.text((210, y_games + 7), f"{ggames} games", fill=(100, 120, 155), font=f_game_val)
+            draw.text((340, y_games + 7), f"{gwr:.1f}% WR", fill=(255, 215, 0), font=f_game_val)
             gpnl_display = f"+{format_compact_usd(gpnl)}" if gpnl_pos else format_compact_usd(gpnl)
-            draw.text((W - 30, y_games + 5), gpnl_display, fill=gpnl_color, font=f_game_val, anchor="ra")
+            draw.text((W - 28, y_games + 7), gpnl_display, fill=gpnl_color, font=f_game_val, anchor="ra")
 
             y_games += row_h + 3
 
-        # --- Total Bonuses Received ---
+        # --- Bonuses ---
         bonus_val = text_data["total_bonuses"]
-        y_bonus = y_games + 10
-        bonus_text = f"[ Total Bonuses Received: {format_compact_usd(bonus_val)} ]"
+        y_bonus = y_games + 12
+        bonus_text = f"Total Bonuses Received: {format_compact_usd(bonus_val)}"
         bonus_w = draw.textlength(bonus_text, font=f_bonus)
+        draw.rounded_rectangle([(W - bonus_w) / 2 - 15, y_bonus - 2, (W + bonus_w) / 2 + 15, y_bonus + 18],
+                                radius=10, fill=(30, 18, 45), outline=(160, 100, 240, 80), width=1)
         draw.text(((W - bonus_w) / 2, y_bonus), bonus_text, fill=(180, 130, 255), font=f_bonus)
 
-        # --- Play responsibly footer ---
-        y_footer = H - 25
-        draw.text((W / 2, y_footer), "Play responsibly", fill=(100, 120, 150), font=f_stat_lbl, anchor="ma")
+        # --- Footer ---
+        y_footer = H - 22
+        draw.text((W / 2, y_footer), "Play responsibly", fill=(60, 75, 100), font=f_small, anchor="ma")
 
         # Save
         from io import BytesIO
         buf = BytesIO()
-        img.save(buf, format='PNG')
+        img = img.convert("RGB")
+        img.save(buf, format='PNG', optimize=True)
         buf.seek(0)
         return buf
     except Exception as e:
@@ -9678,10 +9700,10 @@ async def generate_leaderboard_image(context, period='all_time', viewing_user_id
         entries = []
         if data_key == 'highest_wins':
             for i, (uid, uname, wamt, gtype, ts) in enumerate(data[:10]):
-                entries.append({"rank": i + 1, "username": uname, "value": wamt})
+                entries.append({"rank": i + 1, "username": get_privacy_display_name(uid, uname), "value": wamt})
         else:
             for i, (uid, uname, wagered) in enumerate(data[:10]):
-                entries.append({"rank": i + 1, "username": uname, "value": wagered})
+                entries.append({"rank": i + 1, "username": get_privacy_display_name(uid, uname), "value": wagered})
 
         # Calculate viewing user's rank and wagered amount
         user_rank = None
@@ -9730,160 +9752,174 @@ async def generate_leaderboard_image(context, period='all_time', viewing_user_id
 
 
 def _render_leaderboard_sync(entries, bot_username, section_title, user_rank=None, user_wagered=0.0):
-    """Render leaderboard template - 1:1 copy of example design."""
+    """Render leaderboard template - redesigned with premium casino theme."""
     try:
-        W, H = 700, 1050
-        # Background: dark blue with stars
-        img = Image.new("RGB", (W, H), (10, 28, 45))
+        W, H = 720, 1080
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
-        import random
-        rng = random.Random(42)
-        for _ in range(60):
+        # Premium gradient background
+        for y_pos in range(H):
+            ratio = y_pos / H
+            r = int(6 + ratio * 10)
+            g = int(10 + ratio * 14)
+            b = int(28 + ratio * 20)
+            draw.line([(0, y_pos), (W, y_pos)], fill=(r, g, b))
+
+        # Subtle star particles
+        import random as _lb_rng
+        rng = _lb_rng.Random(42)
+        for _ in range(80):
             sx = rng.randint(0, W)
             sy = rng.randint(0, H)
-            sr = rng.randint(1, 2)
-            draw.ellipse([sx - sr, sy - sr, sx + sr, sy + sr], fill=(255, 255, 255, 150))
+            brightness = rng.randint(60, 200)
+            sr = rng.choice([1, 1, 1, 2])
+            draw.ellipse([sx - sr, sy - sr, sx + sr, sy + sr], fill=(brightness, brightness, brightness + 30))
+
+        # Outer border with gold glow
+        draw.rounded_rectangle([2, 2, W - 3, H - 3], radius=20, outline=(255, 200, 50, 180), width=3)
+        draw.rounded_rectangle([6, 6, W - 7, H - 7], radius=18, outline=(255, 215, 0, 60), width=1)
 
         try:
-            f_title = ImageFont.truetype("bold.ttf", 26)
+            f_title = ImageFont.truetype("bold.ttf", 30)
             f_med = ImageFont.truetype("bold.ttf", 22)
             f_reg = ImageFont.truetype("bold.ttf", 18)
             f_small = ImageFont.truetype("bold.ttf", 15)
             f_xsmall = ImageFont.truetype("bold.ttf", 12)
             f_val = ImageFont.truetype("bold.ttf", 20)
-            f_rank = ImageFont.truetype("bold.ttf", 28)
             f_section = ImageFont.truetype("bold.ttf", 18)
             f_col_header = ImageFont.truetype("bold.ttf", 11)
-            f_big_rank = ImageFont.truetype("bold.ttf", 32)
+            f_big_rank = ImageFont.truetype("bold.ttf", 30)
+            f_crown = ImageFont.truetype("bold.ttf", 36)
         except Exception:
-            f_title = f_med = f_reg = f_small = f_xsmall = f_val = f_rank = f_section = f_col_header = f_big_rank = ImageFont.load_default()
+            f_title = f_med = f_reg = f_small = f_xsmall = f_val = f_section = f_col_header = f_big_rank = f_crown = ImageFont.load_default()
 
-        y = 18
+        y = 20
 
-        # Trophy icon - use text-based trophy since bold.ttf doesn't support emoji
-        trophy = "\U0001F3C6"
-        try:
-            trophy_font = ImageFont.truetype("NotoColorEmoji.ttf", 28)
-            tw2 = draw.textlength(trophy, font=trophy_font)
-            draw.text(((W - tw2) // 2, y), trophy, fill=(255, 200, 100), font=trophy_font)
-        except Exception:
-            # Fallback: draw a simple trophy shape
-            trophy_cx = W // 2
-            trophy_cy = y + 14
-            # Cup body
-            draw.ellipse([trophy_cx - 14, trophy_cy - 10, trophy_cx + 14, trophy_cy + 10], fill=(255, 200, 100))
-            draw.rectangle([trophy_cx - 3, trophy_cy + 8, trophy_cx + 3, trophy_cy + 18], fill=(255, 200, 100))
-            draw.rectangle([trophy_cx - 10, trophy_cy + 16, trophy_cx + 10, trophy_cy + 18], fill=(255, 200, 100))
-        y += 30
-
-        # Bot username top right (no tagline below)
+        # Top section: Bot branding
         bot_un = f"@{bot_username}"
-        bw = draw.textlength(bot_un, font=f_med)
-        draw.text((W - 15 - bw, y), bot_un, fill=(255, 200, 50), font=f_med)
-        y += 30
+        bw = draw.textlength(bot_un, font=f_small)
+        draw.text((W - bw - 20, y), bot_un, fill=(150, 180, 255), font=f_small)
+        draw.text((W - bw - 20, y + 18), "Telegram Casino", fill=(100, 130, 180), font=f_xsmall)
 
-        # Title: "PlayCasino Leaderboard" with decorative lines
-        full_title = "PlayCasino Leaderboard"
-        ftw = draw.textlength(full_title, font=f_title)
-        title_x = (W - ftw) // 2
-        # Left decorative line
-        draw.line([(title_x - 60, y + 12), (title_x - 15, y + 12)], fill=(100, 200, 255), width=2)
-        draw.text((title_x, y), full_title, fill=(255, 255, 255), font=f_title)
-        # Right decorative line
-        draw.line([(title_x + ftw + 15, y + 12), (title_x + ftw + 60, y + 12)], fill=(100, 200, 255), width=2)
+        # Crown/trophy decoration
+        crown_text = "LEADERBOARD"
+        ctw = draw.textlength(crown_text, font=f_crown)
+        # Gold crown accent line
+        draw.line([(40, y + 18), (W // 2 - ctw // 2 - 15, y + 18)], fill=(255, 200, 50, 120), width=2)
+        y += 35
+
+        # Main title
+        title_text = "LEADERBOARD"
+        ttw = draw.textlength(title_text, font=f_title)
+        # Title with gold gradient effect
+        draw.text(((W - ttw) / 2 + 1, y + 1), title_text, fill=(180, 140, 20), font=f_title)
+        draw.text(((W - ttw) / 2, y), title_text, fill=(255, 215, 0), font=f_title)
         y += 42
 
-        # Section title box: "💰 All-Time Top Wagered"
-        draw.rounded_rectangle([20, y, W - 20, y + 34], radius=8, outline=(100, 200, 255), width=2, fill=(15, 40, 60))
-        draw.text((40, y + 6), f"💰 {section_title}", fill=(100, 200, 255), font=f_section)
-        y += 44
+        # Decorative separator
+        sep_w = 300
+        sep_x = (W - sep_w) // 2
+        draw.line([(sep_x, y), (sep_x + sep_w, y)], fill=(255, 200, 50, 120), width=2)
+        draw.ellipse([(W // 2 - 4, y - 3), (W // 2 + 4, y + 3)], fill=(255, 215, 0))
+        y += 14
 
-        # Column headers
-        draw.text((50, y), "RANK", fill=(150, 150, 150), font=f_col_header)
-        draw.text((110, y), "PLAYER", fill=(150, 150, 150), font=f_col_header)
-        draw.text((W - 30, y), "WAGERED", fill=(150, 150, 150), font=f_col_header, anchor="ra")
-        y += 20
+        # Section title pill
+        section_w = draw.textlength(section_title, font=f_section) + 50
+        section_x = (W - section_w) // 2
+        draw.rounded_rectangle([section_x, y, section_x + section_w, y + 36], radius=18,
+                                fill=(20, 40, 65), outline=(80, 160, 255), width=2)
+        draw.text(((W - draw.textlength(section_title, font=f_section)) / 2, y + 7),
+                  section_title, fill=(120, 200, 255), font=f_section)
+        y += 50
 
-        # Entry rows
-        medals = ["\U0001F947", "\U0001F948", "\U0001F949"]
-        medal_colors = [(255, 200, 50), (180, 180, 180), (205, 127, 50)]
-        medal_nums = ["1", "2", "3"]
+        # Column headers with underline
+        draw.text((55, y), "RANK", fill=(120, 130, 150), font=f_col_header)
+        draw.text((120, y), "PLAYER", fill=(120, 130, 150), font=f_col_header)
+        draw.text((W - 35, y), "WAGERED", fill=(120, 130, 150), font=f_col_header, anchor="ra")
+        y += 16
+        draw.line([(30, y), (W - 30, y)], fill=(50, 70, 100), width=1)
+        y += 8
+
+        # Medal colors for top 3
+        medal_colors = [(255, 200, 50), (192, 192, 210), (205, 140, 70)]
+        medal_bg = [(50, 45, 15), (35, 38, 45), (45, 35, 20)]
 
         for i, entry in enumerate(entries):
-            row_h = 42
+            row_h = 48
             rank = entry["rank"]
             uname = entry["username"]
-            if len(uname) > 20:
-                uname = uname[:17] + "..."
+            if len(uname) > 22:
+                uname = uname[:19] + "..."
             val = entry["value"]
 
-            # Row background
-            if rank == 1:
-                row_color = (40, 55, 25)
-                draw.rounded_rectangle([20, y, W - 20, y + row_h], radius=10, outline=(255, 200, 50), width=2, fill=row_color)
-            elif rank == 2:
-                row_color = (25, 40, 55)
-                draw.rounded_rectangle([20, y, W - 20, y + row_h], radius=10, fill=row_color)
-            elif rank == 3:
-                row_color = (35, 30, 40)
-                draw.rounded_rectangle([20, y, W - 20, y + row_h], radius=10, fill=row_color)
-            else:
-                row_color = (20, 35, 50) if i % 2 == 0 else (18, 32, 45)
-                draw.rounded_rectangle([20, y, W - 20, y + row_h], radius=8, fill=row_color)
-
-            # Rank/Medal
+            # Row styling based on rank
             if rank <= 3:
-                # Medal emoji using NotoColorEmoji font for proper rendering
-                try:
-                    emoji_font = ImageFont.truetype("NotoColorEmoji.ttf", 24)
-                    draw.text((35, y + 8), medals[rank - 1], fill=(255, 255, 255), font=emoji_font)
-                except Exception:
-                    # Fallback to regular font with colored text
-                    draw.text((38, y + 8), f"#{rank}", fill=medal_colors[rank - 1], font=f_reg)
+                # Premium row for top 3
+                draw.rounded_rectangle([22, y, W - 22, y + row_h], radius=12,
+                                        fill=medal_bg[rank - 1],
+                                        outline=medal_colors[rank - 1], width=2)
+                # Rank circle
+                cx, cy = 52, y + row_h // 2
+                draw.ellipse([cx - 14, cy - 14, cx + 14, cy + 14], fill=medal_colors[rank - 1])
+                rank_str = str(rank)
+                rw = draw.textlength(rank_str, font=f_reg)
+                draw.text((cx - rw / 2, cy - 10), rank_str, fill=(20, 20, 30), font=f_reg)
+                # Username with glow
+                draw.text((82, y + 13), uname, fill=(255, 255, 255), font=f_reg)
             else:
-                draw.text((38, y + 8), f"#{rank}", fill=(150, 150, 150), font=f_reg)
+                # Standard row with alternating subtle backgrounds
+                bg = (18, 30, 48) if i % 2 == 0 else (15, 26, 42)
+                draw.rounded_rectangle([22, y, W - 22, y + row_h], radius=10, fill=bg)
+                # Rank number
+                draw.text((42, y + 13), f"#{rank}", fill=(100, 110, 130), font=f_reg)
+                # Username
+                draw.text((100, y + 13), uname, fill=(200, 210, 230), font=f_reg)
 
-            # Username
-            draw.text((110, y + 10), uname, fill=(255, 255, 255), font=f_reg)
-
-            # Value with $ symbol
+            # Value with green money color
             val_str = f"${val:,.2f}"
-            vw = draw.textlength(val_str, font=f_val)
-            draw.text((W - 30, y + 10), val_str, fill=(100, 255, 100), font=f_val, anchor="ra")
+            draw.text((W - 35, y + 13), val_str, fill=(80, 230, 100), font=f_val, anchor="ra")
 
-            y += row_h + 4
+            y += row_h + 5
 
-        # If no entries
+        # Empty state
         if not entries:
-            draw.text((W // 2 - 60, y), "No data yet", fill=(150, 150, 150), font=f_reg)
-            y += 30
+            draw.text((W // 2 - 60, y + 10), "No data yet", fill=(100, 110, 130), font=f_reg)
+            y += 50
 
-        # === Your Rank box ===
-        y += 10
-        draw.rounded_rectangle([20, y, W - 20, y + 55], radius=12, outline=(100, 200, 255), width=2, fill=(15, 40, 60))
+        # Your Rank section
+        y += 15
+        draw.rounded_rectangle([22, y, W - 22, y + 70], radius=14,
+                                fill=(15, 35, 55), outline=(80, 160, 255), width=2)
 
-        # Calculate rank display
+        # Rank badge
         if user_rank is not None and isinstance(user_rank, int):
             rank_text = f"#{user_rank}"
         else:
             rank_text = "#---"
 
+        draw.rounded_rectangle([38, y + 12, 120, y + 56], radius=10,
+                                fill=(40, 35, 15), outline=(255, 200, 50), width=2)
+        rtw = draw.textlength(rank_text, font=f_big_rank)
+        draw.text(((38 + 120 - rtw) / 2, y + 16), rank_text, fill=(255, 200, 50), font=f_big_rank)
+
+        # Your rank label and wager
+        draw.text((135, y + 14), "YOUR RANK", fill=(120, 160, 200), font=f_xsmall)
         wagered_text = f"${user_wagered:,.2f} wagered" if user_wagered > 0 else "No wager yet"
+        draw.text((135, y + 32), wagered_text, fill=(80, 230, 100), font=f_small)
 
-        # Rank number box (gold)
-        draw.rounded_rectangle([35, y + 10, 110, y + 45], radius=8, fill=(50, 45, 20), outline=(255, 200, 50), width=2)
-        draw.text((42, y + 13), rank_text, fill=(255, 200, 50), font=f_big_rank)
-
-        draw.text((125, y + 10), "Your Rank", fill=(150, 200, 150), font=f_xsmall)
-        draw.text((125, y + 28), wagered_text, fill=(100, 255, 100), font=f_small)
-
-        y += 70
-        # Play responsibly
-        draw.text(((W - 110) // 2, y), "Play responsibly", fill=(100, 100, 100), font=f_xsmall)
+        # Bottom section
+        y += 85
+        # Decorative separator
+        draw.line([(60, y), (W - 60, y)], fill=(40, 55, 80), width=1)
+        y += 12
+        footer = "Play responsibly"
+        fw = draw.textlength(footer, font=f_xsmall)
+        draw.text(((W - fw) / 2, y), footer, fill=(70, 80, 100), font=f_xsmall)
 
         output = BytesIO()
-        img.save(output, format='JPEG', quality=92)
+        img = img.convert("RGB")
+        img.save(output, format='JPEG', quality=95)
         output.seek(0)
         return output
     except Exception as e:
@@ -12346,11 +12382,9 @@ async def games_category_callback(update: Update, context: ContextTypes.DEFAULT_
                 [apply_button_style(InlineKeyboardButton("Predict", callback_data="game_predict"), 'success', peb('crystal')),  # GREEN
                  apply_button_style(InlineKeyboardButton("Roulette", callback_data="game_roulette"), 'success', peb('darts'))],  # GREEN
                 [apply_button_style(InlineKeyboardButton("Slots", callback_data="game_slots"), 'success', peb('casino')),  # GREEN
-                 apply_button_style(InlineKeyboardButton("Tower", callback_data="game_tower_start"), 'success', peb('tower')),  # GREEN
-                 apply_button_style(InlineKeyboardButton("How?", callback_data="tower_help"), 'primary', peb('info'))],  # BLUE
+                 apply_button_style(InlineKeyboardButton("Tower", callback_data="game_tower_start"), 'success', peb('tower'))],  # GREEN
                 [apply_button_style(InlineKeyboardButton("Mines", callback_data="game_mines_start"), 'success', peb('bomb')),  # GREEN
-                 apply_button_style(InlineKeyboardButton("Keno", callback_data="game_keno"), 'success', peb('darts')),  # GREEN
-                 apply_button_style(InlineKeyboardButton("How?", callback_data="mines_help"), 'primary', peb('info'))],  # BLUE
+                 apply_button_style(InlineKeyboardButton("Keno", callback_data="game_keno"), 'success', peb('darts'))],  # GREEN
                 [apply_button_style(InlineKeyboardButton("Coin Flip", callback_data="game_coin_flip"), 'success', peb('coin')),  # GREEN
                  apply_button_style(InlineKeyboardButton("High-Low", callback_data="game_highlow"), 'success', peb('hilow'))],  # GREEN
                 [apply_button_style(InlineKeyboardButton("Back to Categories", callback_data="main_games"), 'danger', peb('back'))]  # RED
@@ -12853,7 +12887,6 @@ async def bjsplit_test_command(update: Update, context: ContextTypes.DEFAULT_TYP
     """Owner-only test command: deal a split-able blackjack hand for testing the split feature."""
     user = update.effective_user
     if not is_admin(user.id):
-        await update.message.reply_text(f"{pe('cross')} This command is for admin only.")
         return
 
     await ensure_user_in_wallets(user.id, user.username, context=context)
@@ -18506,11 +18539,6 @@ async def create_reply_pvp_challenge(update: Update, context: ContextTypes.DEFAU
         InlineKeyboardButton(f"Confirm", callback_data=f"rpvp_confirm_{match_id}"),
         'success', peb('confirm')
     )
-    # Blue Play with Bot button - only challenger can tap
-    playbot_btn = apply_button_style(
-        InlineKeyboardButton(f"Play with Bot", callback_data=f"rpvp_playbot_{match_id}"),
-        'primary', peb('robot')
-    )
     # Red Cancel button - only challenger can tap
     cancel_btn = apply_button_style(
         InlineKeyboardButton(f"Cancel", callback_data=f"rpvp_cancel_{match_id}"),
@@ -18519,7 +18547,7 @@ async def create_reply_pvp_challenge(update: Update, context: ContextTypes.DEFAU
 
     keyboard = create_styled_keyboard([
         [confirm_btn],
-        [playbot_btn, cancel_btn]
+        [cancel_btn]
     ])
 
     sent_message = await update.message.reply_text(
@@ -18529,12 +18557,132 @@ async def create_reply_pvp_challenge(update: Update, context: ContextTypes.DEFAU
         f"{pe('money')} <b>Bet:</b> {currency_symbol}{bet_amount_currency:.2f}\n"
         f"\U0001f194 Match ID: <code>{match_id}</code>\n\n"
         f"{target_user.mention_html()}, tap {pe('confirm')} <b>Confirm</b> to accept this challenge!\n"
-        f"Or {user.mention_html()} can {pe('robot')} <b>Play with Bot</b> or {pe('cross')} <b>Cancel</b>.",
+        f"Or {user.mention_html()} can {pe('cross')} <b>Cancel</b>.",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard
     )
 
     # Try to pin
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=update.effective_chat.id,
+            message_id=sent_message.message_id,
+            disable_notification=True
+        )
+        game_sessions[match_id]['pinned_message_id'] = sent_message.message_id
+    except Exception as e:
+        logging.warning(f"Could not pin reply challenge message: {e}")
+
+
+async def create_reply_pvp_challenge_xdxw(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str):
+    """Create a PvP challenge by replying to another player's message with XdX'w format.
+    Rolls and target are pre-set from the format; host picks mode after opponent confirms."""
+    user = update.effective_user
+    replied_msg = update.message.reply_to_message
+    target_user = replied_msg.from_user
+
+    if target_user.id == user.id:
+        await update.message.reply_text(f"{pe('cross')} You cannot challenge yourself!", parse_mode=ParseMode.HTML)
+        return
+    if target_user.is_bot:
+        await update.message.reply_text(f"{pe('cross')} You cannot challenge a bot user.", parse_mode=ParseMode.HTML)
+        return
+
+    parsed = parse_xdxw_format(update.message.text)
+    if not parsed:
+        await update.message.reply_text(f"{pe('cross')} Invalid XdX'w format.", parse_mode=ParseMode.HTML)
+        return
+
+    bet_str, rolls, target = parsed
+    try:
+        bet_amount_usd, bet_amount_currency, currency = parse_bet_amount(bet_str, user.id)
+    except (ValueError, IndexError):
+        await update.message.reply_text(f"{pe('cross')} Invalid bet amount.", parse_mode=ParseMode.HTML)
+        return
+
+    if get_active_balance_usd(user.id) < bet_amount_usd:
+        await send_insufficient_balance_message(update)
+        return
+    if not await check_bet_limits(update, bet_amount_usd, f'pvp_{game_type}'):
+        return
+
+    await ensure_user_in_wallets(target_user.id, target_user.username, context=context)
+    if get_active_balance_usd(target_user.id) < bet_amount_usd:
+        await update.message.reply_text(
+            f"{pe('cross')} {target_user.mention_html()} does not have enough balance for this challenge.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    ongoing_game_id, ongoing_game_type = get_user_active_emoji_game(target_user.id)
+    if ongoing_game_id:
+        game_name = extract_game_name(ongoing_game_type)
+        await update.message.reply_text(
+            f"{pe('warning')} {target_user.mention_html()} already has an ongoing <b>{game_name}</b> match.\n"
+            f"They need to complete it first!", parse_mode=ParseMode.HTML)
+        return
+
+    match_id = generate_unique_id("RPV")
+    currency_symbol = CURRENCY_SYMBOLS.get(currency, "$")
+
+    game_sessions[match_id] = {
+        "id": match_id,
+        "game_type": f"pvp_{game_type}",
+        "chat_id": update.effective_chat.id,
+        "host_id": user.id,
+        "host_username": normalize_username(user.username) or f"User_{user.id}",
+        "opponent_id": target_user.id,
+        "opponent_username": normalize_username(target_user.username) or f"User_{target_user.id}",
+        "bet_amount_usd": bet_amount_usd,
+        "bet_amount": bet_amount_usd,
+        "bet_amount_currency": bet_amount_currency,
+        "currency": currency,
+        "mode": None,
+        "game_rolls": rolls,
+        "target_score": target,
+        "status": "pending_reply_challenge",
+        "timestamp": str(datetime.now(timezone.utc)),
+        "round_timeout": default_round_timeout,
+        "command_message_id": update.message.message_id,
+        "players": [user.id, target_user.id],
+        "usernames": {
+            user.id: normalize_username(user.username) or f"ID{user.id}",
+            target_user.id: normalize_username(target_user.username) or f"ID{target_user.id}"
+        },
+        "xdxw_preset": True,
+    }
+
+    _index_user_game(user.id, match_id)
+    _index_user_game(target_user.id, match_id)
+
+    if 'game_sessions' not in user_stats.get(user.id, {}):
+        user_stats.setdefault(user.id, {})['game_sessions'] = []
+    user_stats[user.id]['game_sessions'].append(match_id)
+    save_user_data(user.id)
+
+    confirm_btn = apply_button_style(
+        InlineKeyboardButton(f"Confirm", callback_data=f"rpvp_confirm_{match_id}"),
+        'success', peb('confirm')
+    )
+    cancel_btn = apply_button_style(
+        InlineKeyboardButton(f"Cancel", callback_data=f"rpvp_cancel_{match_id}"),
+        'danger', peb('cross')
+    )
+    keyboard = create_styled_keyboard([[confirm_btn], [cancel_btn]])
+
+    sent_message = await update.message.reply_text(
+        f"{pe(game_type)} <b>{game_type.upper()} PVP CHALLENGE!</b> {pe(game_type)}\n\n"
+        f"{pe('lightning')} <b>Challenger:</b> {user.mention_html()}\n"
+        f"{pe('target')} <b>Challenged:</b> {target_user.mention_html()}\n"
+        f"{pe('money')} <b>Bet:</b> {currency_symbol}{bet_amount_currency:.2f}\n"
+        f"{pe('rolls')} <b>Rolls:</b> {rolls} per round\n"
+        f"{pe('trophy')} <b>First to:</b> {target}\n"
+        f"\U0001f194 Match ID: <code>{match_id}</code>\n\n"
+        f"{target_user.mention_html()}, tap {pe('confirm')} <b>Confirm</b> to accept this challenge!\n"
+        f"Or {user.mention_html()} can {pe('cross')} <b>Cancel</b>.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard
+    )
+
     try:
         await context.bot.pin_chat_message(
             chat_id=update.effective_chat.id,
@@ -18613,6 +18761,65 @@ async def rpvp_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     match["mode"] = mode
     match["game_mode"] = mode
+
+    # If rolls and target are pre-set from XdX'w format, skip rolls/target selection
+    if match.get("xdxw_preset"):
+        host_id = match["host_id"]
+        opponent_id = match["opponent_id"]
+        target = match["target_score"]
+
+        try:
+            host_deducted, host_coin = await deduct_wallet_safe(host_id, match["bet_amount_usd"])
+        except ValueError:
+            await query.edit_message_text(f"{pe('cross')} Challenger has insufficient balance. Challenge cancelled.")
+            match["status"] = "cancelled"
+            return
+
+        try:
+            opp_deducted, opp_coin = await deduct_wallet_safe(opponent_id, match["bet_amount_usd"])
+        except ValueError:
+            credit_wallet_safe(host_id, match["bet_amount_usd"])
+            await query.edit_message_text(f"{pe('cross')} Opponent has insufficient balance. Challenge cancelled.")
+            match["status"] = "cancelled"
+            return
+
+        save_user_data(host_id)
+        save_user_data(opponent_id)
+
+        match["target_points"] = target
+        match["status"] = "active"
+        match["points"] = {host_id: 0, opponent_id: 0}
+        match["player_rolls"] = {host_id: [], opponent_id: []}
+        match["last_roller"] = None
+
+        for pid in [host_id, opponent_id]:
+            await ensure_user_in_wallets(pid, context=context)
+            if 'game_sessions' not in user_stats.get(pid, {}):
+                user_stats.setdefault(pid, {})['game_sessions'] = []
+            if match_id not in user_stats[pid].get('game_sessions', []):
+                user_stats[pid]['game_sessions'].append(match_id)
+            save_user_data(pid)
+
+        game_type = match["game_type"].replace("pvp_", "")
+        emoji_map = {"dice": "\U0001f3b2", "darts": "\U0001f3af", "goal": "\u26bd", "bowl": "\U0001f3b3"}
+        emoji = emoji_map.get(game_type, "\U0001f3b2")
+        currency_symbol = CURRENCY_SYMBOLS.get(match.get("currency", "USDT"), "$")
+        mode_desc = "Highest wins" if mode == "normal" else "Lowest wins"
+
+        host_uname = match["usernames"].get(host_id, f"Player {host_id}")
+        opp_uname = match["usernames"].get(opponent_id, f"Player {opponent_id}")
+
+        await query.edit_message_text(
+            f"{pe('game')} <b>{game_type.upper()} MATCH STARTED!</b> {pe('game')}\n\n"
+            f"{pe('lightning')} {display_at(host_uname)} vs {display_at(opp_uname)}\n"
+            f"{pe('money')} Prize Pool: {currency_symbol}{match.get('bet_amount_currency', match['bet_amount_usd']) * 2:.2f}\n"
+            f"{pe('target')} Mode: {mode.title()} ({mode_desc})\n"
+            f"{pe('rolls')} Rolls: {match['game_rolls']}\n"
+            f"{pe('trophy')} Target: First to {target}\n\n"
+            f"{display_at(host_uname)}, you roll first! Send {match['game_rolls']} {emoji} emoji{'s' if match['game_rolls'] > 1 else ''}.",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
     # Show rolls selection with styled buttons
     rolls_btns = []
@@ -19029,10 +19236,14 @@ async def dice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # NEW: Reply-to-message PvP challenge
-    if update.message.reply_to_message and len(message_text) == 2 and update.message.reply_to_message.from_user:
-        await create_reply_pvp_challenge(update, context, "dice")
-        return
+    # NEW: Reply-to-message PvP challenge (also supports XdX'w format when replying)
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        if len(message_text) == 2:
+            await create_reply_pvp_challenge(update, context, "dice")
+            return
+        if len(message_text) == 3 and parse_xdxw_format(update.message.text):
+            await create_reply_pvp_challenge_xdxw(update, context, "dice")
+            return
 
     # Check for XdX'w format: /dice amount XdX'w
     if len(message_text) == 3:
@@ -19087,10 +19298,14 @@ async def darts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # NEW: Reply-to-message PvP challenge
-    if update.message.reply_to_message and len(message_text) == 2 and update.message.reply_to_message.from_user:
-        await create_reply_pvp_challenge(update, context, "darts")
-        return
+    # NEW: Reply-to-message PvP challenge (also supports XdX'w format when replying)
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        if len(message_text) == 2:
+            await create_reply_pvp_challenge(update, context, "darts")
+            return
+        if len(message_text) == 3 and parse_xdxw_format(update.message.text):
+            await create_reply_pvp_challenge_xdxw(update, context, "darts")
+            return
 
     # Check for XdX'w format: /darts amount XdX'w
     if len(message_text) == 3:
@@ -19145,10 +19360,14 @@ async def football_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # NEW: Reply-to-message PvP challenge
-    if update.message.reply_to_message and len(message_text) == 2 and update.message.reply_to_message.from_user:
-        await create_reply_pvp_challenge(update, context, "goal")
-        return
+    # NEW: Reply-to-message PvP challenge (also supports XdX'w format when replying)
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        if len(message_text) == 2:
+            await create_reply_pvp_challenge(update, context, "goal")
+            return
+        if len(message_text) == 3 and parse_xdxw_format(update.message.text):
+            await create_reply_pvp_challenge_xdxw(update, context, "goal")
+            return
 
     # Check for XdX'w format: /goal amount XdX'w
     if len(message_text) == 3:
@@ -19203,10 +19422,14 @@ async def bowling_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # NEW: Reply-to-message PvP challenge
-    if update.message.reply_to_message and len(message_text) == 2 and update.message.reply_to_message.from_user:
-        await create_reply_pvp_challenge(update, context, "bowl")
-        return
+    # NEW: Reply-to-message PvP challenge (also supports XdX'w format when replying)
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        if len(message_text) == 2:
+            await create_reply_pvp_challenge(update, context, "bowl")
+            return
+        if len(message_text) == 3 and parse_xdxw_format(update.message.text):
+            await create_reply_pvp_challenge_xdxw(update, context, "bowl")
+            return
 
     # Check for XdX'w format: /bowl amount XdX'w
     if len(message_text) == 3:
@@ -22828,8 +23051,7 @@ async def mines_rebet_double_callback(update: Update, context: ContextTypes.DEFA
 async def cancel_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_admin(user.id):
-        await update.message.reply_text("Only the owner can use this command.")
-        return
+        return  # Silently ignore non-admin users
     await ensure_user_in_wallets(user.id, user.username, context=context)
     cancelled = 0
     for game_id, game in list(game_sessions.items()):
@@ -22853,8 +23075,7 @@ async def cancel_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_admin(user.id):
-        await update.message.reply_text("Only the owner can use this command.")
-        return
+        return  # Silently ignore non-admin users
     await ensure_user_in_wallets(user.id, user.username, context=context)
     ongoing_matches = [m for m in game_sessions.values() if m.get("status") == 'active' and 'players' in m]
     if ongoing_matches:
@@ -22883,8 +23104,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_stopped
     user = update.effective_user
     if not is_admin(user.id):
-        await update.message.reply_text("Only the owner can use this command.")
-        return
+        return  # Silently ignore non-admin users
     await ensure_user_in_wallets(user.id, user.username, context=context)
     bot_stopped = False
     await update.message.reply_text(f"{pe('check')} Bot is resumed. New matches can be started.")
@@ -23775,8 +23995,7 @@ async def limits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_admin(user.id):
-        await update.message.reply_text("Only the owner can use this command.")
-        return
+        return  # Silently ignore non-admin users
     await ensure_user_in_wallets(user.id, user.username, context=context)
 
     if not user_stats:
@@ -24895,6 +25114,17 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if game.get('multiplier'):
              msg += f"<b>Multiplier:</b> {game['multiplier']}x\n"
 
+        # Sidebet-specific details
+        if game.get('game_type', '').startswith('sidebet_'):
+            msg += f"<b>Match ID:</b> <code>{game.get('match_id', 'N/A')}</code>\n"
+            msg += f"<b>Bettor:</b> {game.get('bettor_username', 'N/A')}\n"
+            msg += f"<b>Target:</b> {game.get('target_username', 'N/A')}\n"
+            msg += f"<b>Bet Type:</b> {game['game_type'].replace('sidebet_', '').upper()}\n"
+            if game.get('result'):
+                msg += f"<b>Outcome:</b> {game['result'].upper()}\n"
+            if game.get('payout') is not None:
+                msg += f"<b>Payout:</b> ${game['payout']:.2f}\n"
+
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
 
@@ -25706,8 +25936,7 @@ async def timeout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global default_round_timeout
     user = update.effective_user
     if not is_admin(user.id):
-        await update.message.reply_text("Only the bot owner can use this command.")
-        return
+        return  # Silently ignore non-admin users
 
     args = context.args
     if not args:
@@ -25745,8 +25974,7 @@ async def timeout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_admin(user.id):
-        await update.message.reply_text("Only the bot owner can use this command.")
-        return
+        return  # Silently ignore non-admin users
     await ensure_user_in_wallets(user.id, user.username, context=context)
     keyboard = [[InlineKeyboardButton("Yes, clear all funds", callback_data="clear_confirm_yes"), InlineKeyboardButton("No, cancel", callback_data="clear_confirm_no")]]
     await update.message.reply_text(f"{pe('warning')} WARNING: This will reset all user balances to zero!\n\nAre you absolutely sure?", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -25754,8 +25982,7 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_admin(user.id):
-        await update.message.reply_text("Only the bot owner can use this command.")
-        return
+        return  # Silently ignore non-admin users
     await ensure_user_in_wallets(user.id, user.username, context=context)
     keyboard = [[InlineKeyboardButton("Yes, erase ALL data", callback_data="clearall_confirm_yes"), InlineKeyboardButton("No, cancel", callback_data="clearall_confirm_no")]]
     await update.message.reply_text(f"{pe('warning')} EXTREME WARNING ⚠️\n\nThis will completely erase ALL user data, including all settings. This action is IRREVERSIBLE!\n\nAre you absolutely sure?", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -26145,8 +26372,7 @@ async def cashout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Only the bot owner can use this command.")
-        return
+        return  # Silently ignore non-admin users
     await ensure_user_in_wallets(update.effective_user.id, update.effective_user.username, context=context)
     message_text = update.message.text.strip().split()
     if len(message_text) != 2:
@@ -27381,7 +27607,8 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         if data:
             for i, (uid, username, wagered) in enumerate(data):
                 rank_sym = ["🥇", "🥈", "🥉"][i] if i < 3 else f"#{i+1}"
-                msg += f"{rank_sym} {username} - <b>${wagered:,.2f}</b>\n"
+                display_name = get_privacy_display_name(uid, username)
+                msg += f"{rank_sym} {display_name} - <b>${wagered:,.2f}</b>\n"
         else:
             msg += "No data available yet.\n"
     elif view == 'weekly':
@@ -27391,7 +27618,8 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         if data:
             for i, (uid, username, wagered) in enumerate(data):
                 rank_sym = ["🥇", "🥈", "🥉"][i] if i < 3 else f"#{i+1}"
-                msg += f"{rank_sym} {username} - <b>${wagered:,.2f}</b>\n"
+                display_name = get_privacy_display_name(uid, username)
+                msg += f"{rank_sym} {display_name} - <b>${wagered:,.2f}</b>\n"
         else:
             msg += "No data available yet.\n"
     elif view == 'monthly':
@@ -27401,7 +27629,8 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         if data:
             for i, (uid, username, wagered) in enumerate(data):
                 rank_sym = ["🥇", "🥈", "🥉"][i] if i < 3 else f"#{i+1}"
-                msg += f"{rank_sym} {username} - <b>${wagered:,.2f}</b>\n"
+                display_name = get_privacy_display_name(uid, username)
+                msg += f"{rank_sym} {display_name} - <b>${wagered:,.2f}</b>\n"
         else:
             msg += "No data available yet.\n"
     elif view == 'highest_wins':
@@ -27411,8 +27640,9 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         if data:
             for i, (uid, username, win_amount, game_type, timestamp) in enumerate(data):
                 rank_sym = ["🥇", "🥈", "🥉"][i] if i < 3 else f"#{i+1}"
+                display_name = get_privacy_display_name(uid, username)
                 date_str = timestamp.strftime("%Y-%m-%d") if isinstance(timestamp, datetime) else str(timestamp)[:10]
-                msg += f"{rank_sym} {username} - <b>${win_amount:,.2f}</b>\n   Game: {game_type.upper()} | Date: {date_str}\n\n"
+                msg += f"{rank_sym} {display_name} - <b>${win_amount:,.2f}</b>\n   Game: {game_type.upper()} | Date: {date_str}\n\n"
         else:
             msg += "No wins recorded yet.\n"
 
@@ -28850,6 +29080,445 @@ async def currency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.answer("Invalid currency code.", show_alert=True)
 
+## NEW FEATURE - Surprise Code Drop System ##
+surprise_drops = {}  # {code: {amount, wager_requirement, claimed_by, claimed_by_username, timestamp, chat_id, message_id, status}}
+surprise_drops_enabled = True  # Admin toggle
+
+def generate_surprise_code():
+    """Generate a random surprise code like 'GIFT-XXXX'."""
+    chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    code = "GIFT-" + "".join(random.choice(chars) for _ in range(6))
+    return code
+
+
+def generate_surprise_drop_image(code: str, amount: float, wager_req: float, bot_username: str, claimed_by: str = None) -> BytesIO:
+    """Generate a beautiful PIL image for surprise code drop."""
+    W, H = 700, 460
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # Background gradient effect (dark theme)
+    for y_pos in range(H):
+        ratio = y_pos / H
+        r = int(8 + ratio * 12)
+        g = int(12 + ratio * 8)
+        b = int(30 + ratio * 15)
+        draw.line([(0, y_pos), (W, y_pos)], fill=(r, g, b))
+
+    # Border glow effect
+    draw.rounded_rectangle([2, 2, W - 3, H - 3], radius=18, outline=(255, 200, 50, 200), width=3)
+    draw.rounded_rectangle([6, 6, W - 7, H - 7], radius=16, outline=(255, 215, 0, 100), width=1)
+
+    try:
+        f_title = ImageFont.truetype(DASHBOARD_FONT_PATH, 32)
+        f_subtitle = ImageFont.truetype(DASHBOARD_FONT_PATH, 18)
+        f_code = ImageFont.truetype(DASHBOARD_FONT_PATH, 42)
+        f_amount = ImageFont.truetype(DASHBOARD_FONT_PATH, 28)
+        f_info = ImageFont.truetype(DASHBOARD_FONT_PATH, 16)
+        f_small = ImageFont.truetype(DASHBOARD_FONT_PATH, 14)
+        f_bot = ImageFont.truetype(DASHBOARD_FONT_PATH, 13)
+    except Exception:
+        f_title = f_subtitle = f_code = f_amount = f_info = f_small = f_bot = ImageFont.load_default()
+
+    # Top right - bot username
+    bot_text = f"@{bot_username}"
+    bw = draw.textlength(bot_text, font=f_bot)
+    draw.text((W - bw - 18, 14), bot_text, fill=(150, 180, 255), font=f_bot)
+
+    # "Telegram Casino" below bot username
+    casino_text = "Telegram Casino"
+    cw = draw.textlength(casino_text, font=f_small)
+    draw.text((W - cw - 18, 32), casino_text, fill=(120, 150, 200), font=f_small)
+
+    # Star/gift decoration
+    draw.text((25, 18), "\u2b50", fill=(255, 215, 0), font=f_title)
+
+    # Title
+    title = "SURPRISE CODE DROP!"
+    tw = draw.textlength(title, font=f_title)
+    draw.text(((W - tw) / 2, 65), title, fill=(255, 215, 0), font=f_title)
+
+    # Decorative line
+    draw.line([(50, 108), (W - 50, 108)], fill=(255, 200, 50, 120), width=2)
+
+    # Amount display
+    amount_text = f"${amount:.2f} BONUS"
+    aw = draw.textlength(amount_text, font=f_amount)
+    draw.text(((W - aw) / 2, 122), amount_text, fill=(100, 255, 100), font=f_amount)
+
+    # Instruction text
+    instr = "Type the command below to claim:"
+    iw = draw.textlength(instr, font=f_info)
+    draw.text(((W - iw) / 2, 165), instr, fill=(200, 200, 220), font=f_info)
+
+    # Code box background
+    code_text = f"/claim {code}"
+    code_w = draw.textlength(code_text, font=f_code)
+    box_padding = 30
+    box_x1 = (W - code_w) / 2 - box_padding
+    box_x2 = (W + code_w) / 2 + box_padding
+    draw.rounded_rectangle([box_x1, 195, box_x2, 260], radius=12, fill=(20, 30, 50), outline=(255, 200, 50), width=2)
+
+    # Code text (big, centered)
+    draw.text(((W - code_w) / 2, 200), code_text, fill=(255, 255, 255), font=f_code)
+
+    # Wager requirement info
+    wager_text = f"Wager Requirement: ${wager_req:.2f} in last 30 days"
+    ww = draw.textlength(wager_text, font=f_info)
+    draw.text(((W - ww) / 2, 280), wager_text, fill=(255, 180, 80), font=f_info)
+
+    # 2x wager note
+    note_text = "Amount has 2x wager requirement before withdrawal"
+    nw = draw.textlength(note_text, font=f_small)
+    draw.text(((W - nw) / 2, 310), note_text, fill=(180, 180, 200), font=f_small)
+
+    # Status section
+    if claimed_by:
+        status_text = f"CLAIMED by @{claimed_by}"
+        status_color = (255, 80, 80)
+        # Strike-through effect on code
+        draw.line([(box_x1 + 10, 228), (box_x2 - 10, 228)], fill=(255, 80, 80), width=3)
+    else:
+        status_text = "UNCLAIMED - Be the first!"
+        status_color = (100, 255, 100)
+
+    # Status box
+    sw = draw.textlength(status_text, font=f_subtitle)
+    status_box_x1 = (W - sw) / 2 - 20
+    status_box_x2 = (W + sw) / 2 + 20
+    status_fill = (40, 15, 15) if claimed_by else (15, 40, 15)
+    draw.rounded_rectangle([status_box_x1, 345, status_box_x2, 380], radius=10, fill=status_fill, outline=status_color, width=2)
+    draw.text(((W - sw) / 2, 349), status_text, fill=status_color, font=f_subtitle)
+
+    # Bottom decorative line
+    draw.line([(50, 400), (W - 50, 400)], fill=(255, 200, 50, 80), width=1)
+
+    # Footer text
+    footer = "Only ONE user can claim per code \u2022 First come, first served"
+    fw = draw.textlength(footer, font=f_small)
+    draw.text(((W - fw) / 2, 415), footer, fill=(120, 130, 160), font=f_small)
+
+    # Bottom decorative stars
+    draw.text((25, H - 35), "\u2728", fill=(255, 215, 0), font=f_info)
+    draw.text((W - 40, H - 35), "\u2728", fill=(255, 215, 0), font=f_info)
+
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+@check_banned
+@check_maintenance
+async def surprisedrop_toggle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: /surprisedrop on or /surprisedrop off."""
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    global surprise_drops_enabled
+    args = context.args
+    if not args or args[0].lower() not in ("on", "off"):
+        await update.message.reply_text(
+            f"Usage: <code>/surprisedrop on</code> or <code>/surprisedrop off</code>\n"
+            f"Current status: {'ON' if surprise_drops_enabled else 'OFF'}",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if args[0].lower() == "on":
+        surprise_drops_enabled = True
+        await update.message.reply_text(f"{pe('check')} Surprise code drops are now <b>ENABLED</b>.", parse_mode=ParseMode.HTML)
+    else:
+        surprise_drops_enabled = False
+        await update.message.reply_text(f"{pe('cross')} Surprise code drops are now <b>DISABLED</b>.", parse_mode=ParseMode.HTML)
+
+
+@check_banned
+@check_maintenance
+async def surprisedrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: /surprisedrop_now [amount] [wager_req] - Drop a surprise code immediately."""
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    if not surprise_drops_enabled:
+        await update.message.reply_text(f"{pe('cross')} Surprise drops are currently disabled.")
+        return
+
+    args = context.args
+    # Optional: /surprisedrop_now amount wager_req
+    if args and len(args) >= 1:
+        try:
+            amount = float(args[0])
+        except ValueError:
+            amount = round(random.uniform(1, 10), 2)
+    else:
+        amount = round(random.uniform(1, 10), 2)
+
+    if args and len(args) >= 2:
+        try:
+            wager_req = float(args[1])
+        except ValueError:
+            wager_req = round(random.uniform(10, 200), 2)
+    else:
+        wager_req = round(random.uniform(10, 200), 2)
+
+    code = generate_surprise_code()
+    bot_username = await get_bot_username(context)
+
+    surprise_drops[code] = {
+        "code": code,
+        "amount": amount,
+        "wager_requirement": wager_req,
+        "claimed_by": None,
+        "claimed_by_username": None,
+        "timestamp": str(datetime.now(timezone.utc)),
+        "chat_id": update.effective_chat.id,
+        "message_id": None,
+        "status": "active",
+    }
+
+    img_buf = generate_surprise_drop_image(code, amount, wager_req, bot_username)
+
+    sent_msg = await update.effective_chat.send_photo(
+        photo=img_buf,
+        caption=(
+            f"\U0001f381 <b>SURPRISE CODE DROP!</b> \U0001f381\n\n"
+            f"A surprise bonus of <b>${amount:.2f}</b> has been dropped!\n"
+            f"Type <code>/claim {code}</code> to claim it!\n\n"
+            f"\u26a0\ufe0f <b>Requirements:</b>\n"
+            f"- Must have wagered at least <b>${wager_req:.2f}</b> in the last 30 days\n"
+            f"- Only <b>ONE</b> user can claim per code\n"
+            f"- Amount has <b>2x</b> wager requirement before withdrawal"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+    surprise_drops[code]["message_id"] = sent_msg.message_id
+
+    # Pin the message
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=update.effective_chat.id,
+            message_id=sent_msg.message_id,
+            disable_notification=False
+        )
+    except Exception as e:
+        logging.warning(f"Could not pin surprise drop message: {e}")
+
+
+@check_banned
+@check_maintenance
+async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /claim <code> command - claim a surprise code drop."""
+    user = update.effective_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text(
+            f"Usage: <code>/claim CODE</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    code = context.args[0].upper()
+
+    if code not in surprise_drops:
+        await update.message.reply_text(f"{pe('cross')} Invalid code. This code does not exist.")
+        return
+
+    drop = surprise_drops[code]
+
+    if drop.get("status") != "active" or drop.get("claimed_by") is not None:
+        await update.message.reply_text(f"{pe('cross')} This code has already been claimed!")
+        return
+
+    # Check wager requirement
+    user_monthly = user_stats.get(user.id, {}).get("monthly_stats", {}).get("weighted_wager", 0.0)
+    if user_monthly < drop["wager_requirement"]:
+        await update.message.reply_text(
+            f"{pe('cross')} <b>Wager requirement not met!</b>\n\n"
+            f"You need <b>${drop['wager_requirement']:.2f}</b> wagered in the last 30 days.\n"
+            f"Your current 30-day wager: <b>${user_monthly:.2f}</b>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    # Claim the code
+    drop["claimed_by"] = user.id
+    drop["claimed_by_username"] = normalize_username(user.username) or f"User_{user.id}"
+    drop["status"] = "claimed"
+
+    # Credit the user with the amount (marked as deposit for 2x wager requirement)
+    credit_wallet(user.id, drop["amount"])
+    user_stats.setdefault(user.id, {})["unwagered_deposit"] = user_stats.get(user.id, {}).get("unwagered_deposit", 0.0) + drop["amount"]
+    save_user_data(user.id)
+
+    claimer_display = get_privacy_display_name(user.id, drop["claimed_by_username"])
+
+    await update.message.reply_text(
+        f"\U0001f389 <b>Code Claimed!</b>\n\n"
+        f"You claimed <b>${drop['amount']:.2f}</b> from surprise code <code>{code}</code>!\n"
+        f"\u26a0\ufe0f This amount has a <b>2x</b> wager requirement before withdrawal.",
+        parse_mode=ParseMode.HTML
+    )
+
+    # Update the original message with claimed status
+    try:
+        bot_username = await get_bot_username(context)
+        new_img = generate_surprise_drop_image(code, drop["amount"], drop["wager_requirement"], bot_username, claimed_by=claimer_display)
+
+        await context.bot.edit_message_media(
+            chat_id=drop["chat_id"],
+            message_id=drop["message_id"],
+            media=InputMediaPhoto(
+                media=new_img,
+                caption=(
+                    f"\U0001f381 <b>SURPRISE CODE DROP!</b> \U0001f381\n\n"
+                    f"A surprise bonus of <b>${drop['amount']:.2f}</b> was dropped!\n"
+                    f"<b>CLAIMED</b> by @{claimer_display}!\n\n"
+                    f"Code: <code>{code}</code>\n"
+                    f"\u26a0\ufe0f Better luck next time!"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        )
+    except Exception as e:
+        logging.warning(f"Could not update surprise drop message: {e}")
+
+
+## NEW FEATURE - /gameshistory (admin only) - paginated recent game results ##
+GAMES_HISTORY_PER_PAGE = 10
+
+@check_banned
+@check_maintenance
+async def games_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show recent game results (admin only, paginated)."""
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    await _show_games_history_page(update, context, page=0)
+
+
+async def _show_games_history_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    """Render a paginated page of recent game history for admin."""
+    completed_games = []
+    for gid, gdata in game_sessions.items():
+        status = gdata.get("status", "")
+        if status in ("completed", "finished", "ended", "resolved"):
+            completed_games.append((gid, gdata))
+
+    completed_games.sort(key=lambda x: x[1].get("timestamp", ""), reverse=True)
+    total = len(completed_games)
+    total_pages = max(1, (total + GAMES_HISTORY_PER_PAGE - 1) // GAMES_HISTORY_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * GAMES_HISTORY_PER_PAGE
+    page_games = completed_games[start:start + GAMES_HISTORY_PER_PAGE]
+
+    msg = f"\U0001f4dc <b>Recent Games History</b> (Page {page + 1}/{total_pages})\n\n"
+
+    if not page_games:
+        msg += "No completed games found.\n"
+    else:
+        for gid, gdata in page_games:
+            game_type = gdata.get("game_type", "unknown").replace("pvp_", "PvP ").replace("_", " ").title()
+            bet = gdata.get("bet_amount", gdata.get("bet_amount_usd", 0))
+            winner_id = gdata.get("winner_id", None)
+            winner_name = gdata.get("winner_username", "N/A")
+            if winner_id:
+                winner_name = gdata.get("usernames", {}).get(winner_id, winner_name)
+            ts = gdata.get("timestamp", "N/A")
+            if isinstance(ts, str) and len(ts) > 19:
+                ts = ts[:19]
+            msg += (
+                f"\U0001f3b2 <b>{game_type}</b>\n"
+                f"   ID: <code>{gid}</code>\n"
+                f"   Bet: ${bet:.2f}\n"
+                f"   Winner: {winner_name}\n"
+                f"   Time: {ts}\n\n"
+            )
+
+    buttons = []
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("\u25c0 Back", callback_data=f"admin_ghist_page_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next \u25b6", callback_data=f"admin_ghist_page_{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton("Close", callback_data="close")])
+
+    if update.callback_query:
+        await safe_edit_message(
+            update.callback_query, msg,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    else:
+        await update.message.reply_text(
+            msg, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+
+async def games_history_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle pagination for /gameshistory."""
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    await query.answer()
+    page = int(query.data.replace("admin_ghist_page_", ""))
+    await _show_games_history_page(update, context, page=page)
+
+
+## NEW FEATURE - /admincommands (admin only) - list all admin commands ##
+@check_banned
+@check_maintenance
+async def admin_commands_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all admin-only commands."""
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    commands_list = [
+        ("/admin", "Open admin dashboard"),
+        ("/admincommands", "Show this list of admin commands"),
+        ("/gameshistory", "View recent game results (paginated)"),
+        ("/setbal", "Set a user's balance"),
+        ("/withdrawinfo", "View withdrawal info"),
+        ("/resetleaderboard", "Reset leaderboard data"),
+        ("/setdaily", "Set daily bonus amount"),
+        ("/dailyoff", "Disable daily bonus"),
+        ("/dailyon", "Enable daily bonus"),
+        ("/cancelall", "Cancel all active matches"),
+        ("/stopall", "Stop all active games"),
+        ("/settimeout", "Set round timeout for games"),
+        ("/clear", "Clear a user's funds"),
+        ("/clearall", "Clear all user funds"),
+        ("/gamestatus", "Show game on/off statuses"),
+        ("/export", "Export bot data"),
+        ("/surprisedrop on/off", "Toggle surprise code drops"),
+        ("/mute", "Mute a user in group"),
+        ("/lockall", "Lock the group chat"),
+        ("/unlockall", "Unlock the group chat"),
+    ]
+
+    # Add game toggle commands
+    for gk in sorted(GAME_STATUS_MAP.keys()):
+        commands_list.append((f"/{gk}on / /{gk}off", f"Enable/disable {gk} game"))
+
+    msg = "\U0001f6e0 <b>Admin Commands</b>\n\n"
+    for cmd, desc in commands_list:
+        msg += f"<code>{cmd}</code> — {desc}\n"
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
+
 ## NEW FEATURE - Admin Dashboard & Group Settings ##
 async def admin_dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -29978,10 +30647,15 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_in_wallets(user.id, user.username, context=context)
     user_lang = get_user_lang(user.id)
 
+    privacy_on = user_stats.get(user.id, {}).get("privacy_mode", False)
+    privacy_style = 'success' if privacy_on else 'danger'
+    privacy_label = "Privacy Mode: ON" if privacy_on else "Privacy Mode: OFF"
+
     keyboard = [
         [apply_button_style(InlineKeyboardButton("Active Currency", callback_data="settings_currency"), 'primary', peb('diamond'))],
         [apply_button_style(InlineKeyboardButton(get_text("language", user_lang), callback_data="settings_language"), 'primary', peb('globe'))],
         [apply_button_style(InlineKeyboardButton(get_text("withdrawal_address", user_lang), callback_data="settings_withdrawal"), 'primary', peb('wallet'))],
+        [apply_button_style(InlineKeyboardButton(privacy_label, callback_data="settings_privacy_toggle"), privacy_style, peb('lock'))],
         [apply_button_style(InlineKeyboardButton(get_text("back", user_lang), callback_data="back_to_main"), 'danger', peb('back'))]
     ]
 
@@ -29991,13 +30665,15 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     language_name = LANGUAGES.get(user_language, {}).get("language_name", "English")
     withdrawal_address = user_stats[user.id].get("withdrawal_address")
     withdrawal_status = f"<b>{get_text('withdrawal_address', user_lang)}:</b> {pe('check')} Set" if withdrawal_address else f"<b>{get_text('withdrawal_address', user_lang)}:</b> {pe('cross')} Not Set"
+    privacy_status = f"{pe('lock')} <b>Privacy Mode:</b> {'ON' if privacy_on else 'OFF'}"
 
     await safe_edit_message(
         query,
         get_text("settings_menu", user_lang) + f"\n\n"
         f"<b>Active Currency:</b> {coin_pe} {active_coin}\n"
         f"<b>Current Language:</b> {language_name}\n"
-        f"{withdrawal_status}",
+        f"{withdrawal_status}\n"
+        f"{privacy_status}",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -30055,6 +30731,14 @@ async def settings_callback_handler(update: Update, context: ContextTypes.DEFAUL
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        return
+
+    if action == "privacy":
+        await ensure_user_in_wallets(user.id, user.username, context=context)
+        current = user_stats.get(user.id, {}).get("privacy_mode", False)
+        user_stats[user.id]["privacy_mode"] = not current
+        save_user_data(user.id)
+        await settings_command(update, context)
         return
 
     if action == "withdrawal":
@@ -30386,14 +31070,16 @@ async def withdrawal_txid_step(update: Update, context: ContextTypes.DEFAULT_TYP
     withdrawal["approved_at"] = str(datetime.now(timezone.utc))
 
     # Notify user
-    currency_symbol = CURRENCY_SYMBOLS.get(withdrawal["currency"], "$")
+    coin = withdrawal.get("coin", "USDT")
+    currency_symbol = CURRENCY_SYMBOLS.get(coin, "$")
+    crypto_amount = withdrawal.get("crypto_amount", withdrawal.get("amount_usd", 0))
     try:
         await context.bot.send_message(
             chat_id=withdrawal["user_id"],
             text=(
                 f"{pe('check')} <b>Withdrawal Approved</b>\n\n"
                 f"<b>Request ID:</b> <code>{withdrawal_id}</code>\n"
-                f"<b>Amount:</b> {currency_symbol}{withdrawal['amount_currency']:.2f}\n"
+                f"<b>Amount:</b> ${withdrawal['amount_usd']:.2f} ({format_crypto_amount(crypto_amount, coin)} {coin})\n"
                 f"<b>Transaction Hash:</b> <code>{txid}</code>\n\n"
                 f"Your withdrawal has been processed successfully!"
             ),
@@ -30442,14 +31128,16 @@ async def withdrawal_cancel_callback(update: Update, context: ContextTypes.DEFAU
     withdrawal["cancelled_at"] = str(datetime.now(timezone.utc))
 
     # Notify user
-    currency_symbol = CURRENCY_SYMBOLS.get(withdrawal["currency"], "$")
+    coin = withdrawal.get("coin", "USDT")
+    currency_symbol = CURRENCY_SYMBOLS.get(coin, "$")
+    crypto_amount = withdrawal.get("crypto_amount", withdrawal.get("amount_usd", 0))
     try:
         await context.bot.send_message(
             chat_id=user_id,
             text=(
                 f"{pe('cross')} <b>Withdrawal Cancelled</b>\n\n"
                 f"<b>Request ID:</b> <code>{withdrawal_id}</code>\n"
-                f"<b>Amount:</b> {currency_symbol}{withdrawal['amount_currency']:.2f}\n\n"
+                f"<b>Amount:</b> ${withdrawal['amount_usd']:.2f} ({format_crypto_amount(crypto_amount, coin)} {coin})\n\n"
                 f"Your withdrawal request has been cancelled by the administrator.\n"
                 f"The funds have been returned to your balance.\n\n"
                 f"For more information, please contact support @jashanxjagy."
@@ -30480,8 +31168,7 @@ async def withdrawinfo_command(update: Update, context: ContextTypes.DEFAULT_TYP
     """Admin-only: Show withdrawal details and re-present approve/decline buttons.
     If already processed, show the status and TXID."""
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Only the bot owner can use this command.")
-        return
+        return  # Silently ignore non-admin users
 
     args = update.message.text.strip().split()
     if len(args) != 2:
@@ -32337,6 +33024,26 @@ async def win_bet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         match_sidebets[match_id] = []
     match_sidebets[match_id].append(sidebet_id)
 
+    # Store sidebet in game_sessions for /info command and user game history
+    game_sessions[sidebet_id] = {
+        "id": sidebet_id,
+        "game_type": "sidebet_win",
+        "bet_amount": bet_amount_usd,
+        "bet_amount_usd": bet_amount_usd,
+        "user_id": user.id,
+        "match_id": match_id,
+        "multiplier": bet_multiplier,
+        "status": "active",
+        "timestamp": str(datetime.now(timezone.utc)),
+        "target_player_id": target_user.id,
+        "target_username": normalize_username(target_user.username) or f"User_{target_user.id}",
+        "bettor_username": normalize_username(user.username) or f"User_{user.id}",
+    }
+    if 'game_sessions' not in user_stats.get(user.id, {}):
+        user_stats.setdefault(user.id, {})['game_sessions'] = []
+    user_stats[user.id]['game_sessions'].append(sidebet_id)
+    save_user_data(user.id)
+
     target_name = normalize_username(target_user.username) or f"Player {target_user.id}"
     await update.message.reply_text(
         f"{pe('sidebet')} <b>Side Bet Placed!</b>\n\n"
@@ -32461,6 +33168,26 @@ async def lose_bet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         match_sidebets[match_id] = []
     match_sidebets[match_id].append(sidebet_id)
 
+    # Store sidebet in game_sessions for /info command and user game history
+    game_sessions[sidebet_id] = {
+        "id": sidebet_id,
+        "game_type": "sidebet_lose",
+        "bet_amount": bet_amount_usd,
+        "bet_amount_usd": bet_amount_usd,
+        "user_id": user.id,
+        "match_id": match_id,
+        "multiplier": bet_multiplier,
+        "status": "active",
+        "timestamp": str(datetime.now(timezone.utc)),
+        "target_player_id": target_user.id,
+        "target_username": normalize_username(target_user.username) or f"User_{target_user.id}",
+        "bettor_username": normalize_username(user.username) or f"User_{user.id}",
+    }
+    if 'game_sessions' not in user_stats.get(user.id, {}):
+        user_stats.setdefault(user.id, {})['game_sessions'] = []
+    user_stats[user.id]['game_sessions'].append(sidebet_id)
+    save_user_data(user.id)
+
     target_name = normalize_username(target_user.username) or f"Player {target_user.id}"
     await update.message.reply_text(
         f"{pe('sidebet')} <b>Side Bet Placed!</b>\n\n"
@@ -32528,6 +33255,12 @@ async def resolve_sidebets_for_match(match_id: str, winner_player_index: str, co
                 f"Your pick: <b>{bet_on_label}</b>\n"
                 f"Stake lost: <b>${bet_amount:.2f}</b>"
             )
+
+        # Update sidebet in game_sessions for history tracking
+        if sb_id in game_sessions:
+            game_sessions[sb_id]["status"] = "completed"
+            game_sessions[sb_id]["result"] = sb["status"]
+            game_sessions[sb_id]["payout"] = sb.get("payout", 0)
 
         dm_tasks.append(safe_send_message(
             context.bot, bettor_id, text, parse_mode=ParseMode.HTML
@@ -33326,6 +34059,12 @@ def main():
     app.add_handler(CommandHandler(["currency", "cur"], currency_command, block=False))
     app.add_handler(CommandHandler(["maxbet", "limits"], maxbet_command, block=False))
     app.add_handler(CommandHandler("admin", admin_dashboard_command, block=False))
+    app.add_handler(CommandHandler("gameshistory", games_history_command, block=False))
+    app.add_handler(CommandHandler("admincommands", admin_commands_list, block=False))
+    app.add_handler(CommandHandler("surprisedrop", surprisedrop_toggle_command, block=False))
+    app.add_handler(CommandHandler("surprisedrop_now", surprisedrop_command, block=False))
+    app.add_handler(CommandHandler("claim", claim_command, block=False))
+    app.add_handler(CallbackQueryHandler(games_history_page_callback, pattern=r"^admin_ghist_page_", block=False))
     app.add_handler(CommandHandler("setbal", setbal_command, block=False))
     app.add_handler(CommandHandler("withdrawinfo", withdrawinfo_command, block=False))
     app.add_handler(CommandHandler("resetleaderboard", resetleaderboard_command, block=False))
@@ -33381,11 +34120,22 @@ def main():
     app.add_handler(CommandHandler(["cr", "chickenroad"], chicken_road_command, block=False))
     app.add_handler(CommandHandler("chicken", chicken_command, block=False))
 
+    # /dart alias for /darts
+    async def _dart_alias(update, context):
+        if not is_game_enabled("darts"):
+            await update.message.reply_text(
+                f"\U0001f527 <b>Darts</b> game is currently under maintenance. Please try again later.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        await darts_command(update, context)
+    app.add_handler(CommandHandler("dart", _dart_alias, block=False))
+
     # 7Up7Down game handler
     app.add_handler(CommandHandler(["7up", "7updown", "7ud"], seven_up_command, block=False))
 
     # Side Bets handlers
-    app.add_handler(CommandHandler("sidebets", sidebets_command, block=False))
+    app.add_handler(CommandHandler(["sidebets", "sides"], sidebets_command, block=False))
     app.add_handler(CommandHandler("win", win_bet_command, block=False))
     app.add_handler(CommandHandler("lose", lose_bet_command, block=False))
 
