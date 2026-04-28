@@ -18771,7 +18771,6 @@ async def rpvp_pvb_target_callback(update: Update, context: ContextTypes.DEFAULT
     _co_round = match.get("current_round", 1)
     _co_mult = calculate_cashout_multiplier(match, user_id=user.id)
     _co_kb = _build_pvb_cashout_keyboard(match_id, _co_round, _co_mult)
-    _register_cashout_button(match_id, user.id, match["chat_id"], _co_round)
 
     await query.edit_message_text(
         f"{pe('game')} {game_type.capitalize()} vs Bot started! (ID: <code>{match_id}</code>)\n"
@@ -18783,6 +18782,8 @@ async def rpvp_pvb_target_callback(update: Update, context: ContextTypes.DEFAULT
         parse_mode=ParseMode.HTML,
         reply_markup=_co_kb
     )
+    _register_cashout_button(match_id, user.id, match["chat_id"], _co_round,
+                             message_id=query.message.message_id)
 
     # Schedule timeout
     if context.job_queue:
@@ -19429,7 +19430,6 @@ async def xdxw_playbot_callback(update: Update, context: ContextTypes.DEFAULT_TY
     _co_round = match.get("current_round", 1)
     _co_mult = calculate_cashout_multiplier(match, user_id=user.id)
     keyboard = _build_pvb_cashout_keyboard(match_id, _co_round, _co_mult, extra_top_row=[bot_first_btn])
-    _register_cashout_button(match_id, user.id, query.message.chat_id, _co_round)
 
     await query.edit_message_text(
         f"{pe('robot')} <b>PLAYING WITH BOT!</b>\n\n"
@@ -19438,6 +19438,8 @@ async def xdxw_playbot_callback(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard
     )
+    _register_cashout_button(match_id, user.id, query.message.chat_id, _co_round,
+                             message_id=query.message.message_id)
 
 # Callback for "Bot Rolls First" in XdX'w PvB mode
 @check_banned
@@ -19521,9 +19523,8 @@ async def xdxw_bot_first_callback(update: Update, context: ContextTypes.DEFAULT_
     _co_round = match.get("current_round", 1)
     _co_mult = calculate_cashout_multiplier(match, user_id=user_id)
     _co_kb = _build_pvb_cashout_keyboard(match_id, _co_round, _co_mult)
-    _register_cashout_button(match_id, user_id, chat_id, _co_round)
 
-    await context.bot.send_message(
+    _co_sent = await context.bot.send_message(
         chat_id=chat_id,
         text=f"{pe('robot')} Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n"
              f"{user_mention}, <b>Your turn!</b> Send {game_rolls} {emoji} to respond.\n"
@@ -19531,6 +19532,8 @@ async def xdxw_bot_first_callback(update: Update, context: ContextTypes.DEFAULT_
         parse_mode=ParseMode.HTML,
         reply_markup=_co_kb
     )
+    _register_cashout_button(match_id, user_id, chat_id, _co_round,
+                             message_id=getattr(_co_sent, 'message_id', None))
 
     # Schedule PvB timeout
     if context.job_queue:
@@ -20137,7 +20140,6 @@ async def group_challenge_playbot_callback(update: Update, context: ContextTypes
     _co_round = match.get("current_round", 1)
     _co_mult = calculate_cashout_multiplier(match, user_id=user.id)
     keyboard = _build_pvb_cashout_keyboard(match_id, _co_round, _co_mult, extra_top_row=[bot_first_btn])
-    _register_cashout_button(match_id, user.id, query.message.chat_id, _co_round)
 
     await query.edit_message_text(
         f"{pe('robot')} <b>PLAYING WITH BOT!</b>\n\n"
@@ -20146,6 +20148,8 @@ async def group_challenge_playbot_callback(update: Update, context: ContextTypes
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard
     )
+    _register_cashout_button(match_id, user.id, query.message.chat_id, _co_round,
+                             message_id=query.message.message_id)
 
 # Callback for "Bot Rolls First" in group challenge PvB mode
 @check_banned
@@ -20202,7 +20206,6 @@ async def group_challenge_botfirst_callback(update: Update, context: ContextType
     _co_round = match.get("current_round", 1)
     _co_mult = calculate_cashout_multiplier(match, user_id=user.id)
     _co_kb = _build_pvb_cashout_keyboard(match_id, _co_round, _co_mult)
-    _register_cashout_button(match_id, user.id, query.message.chat_id, _co_round)
 
     await query.edit_message_text(
         f"{pe('robot')} <b>BOT ROLLED FIRST!</b>\n\n"
@@ -20212,6 +20215,8 @@ async def group_challenge_botfirst_callback(update: Update, context: ContextType
         parse_mode=ParseMode.HTML,
         reply_markup=_co_kb
     )
+    _register_cashout_button(match_id, user.id, query.message.chat_id, _co_round,
+                             message_id=query.message.message_id)
 
     # Schedule PvB timeout
     if context.job_queue:
@@ -20380,15 +20385,16 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
         _co_round = game_sessions[game_id].get("current_round", 1)
         _co_mult = calculate_cashout_multiplier(game_sessions[game_id], user_id=user.id)
         _co_kb = _build_pvb_cashout_keyboard(game_id, _co_round, _co_mult)
-        _register_cashout_button(game_id, user.id, chat_id, _co_round)
 
-        await update.message.reply_text(
+        _co_sent = await update.message.reply_text(
             f"{pe('robot')} Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n"
             f"{user.mention_html()}, <b>Your turn!</b> Send {game_rolls} {emoji} emoji{'s' if game_rolls > 1 else ''} to respond.\n"
             f"Or tap Cashout to collect <b>${bet_amount * _co_mult:.2f}</b>:",
             parse_mode=ParseMode.HTML,
             reply_markup=_co_kb
         )
+        _register_cashout_button(game_id, user.id, chat_id, _co_round,
+                                 message_id=getattr(_co_sent, 'message_id', None))
 
         # Schedule PvB timeout
         if context.job_queue:
@@ -20412,9 +20418,8 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
         _co_round = game_sessions[game_id].get("current_round", 1)
         _co_mult = calculate_cashout_multiplier(game_sessions[game_id], user_id=user.id)
         _co_kb = _build_pvb_cashout_keyboard(game_id, _co_round, _co_mult)
-        _register_cashout_button(game_id, user.id, chat_id, _co_round)
 
-        await update.message.reply_text(
+        _co_sent = await update.message.reply_text(
             f"{pe('game')} {game_type.capitalize()} vs Bot started! (ID: <code>{game_id}</code>)\n"
             f"<b>Mode:</b> {game_mode.capitalize()} ({mode_text})\n"
             f"<b>Rolls per round:</b> {game_rolls}\n"
@@ -20424,6 +20429,8 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
             parse_mode=ParseMode.HTML,
             reply_markup=_co_kb
         )
+        _register_cashout_button(game_id, user.id, chat_id, _co_round,
+                                 message_id=getattr(_co_sent, 'message_id', None))
 
         # Schedule PvB timeout
         if context.job_queue:
@@ -24902,9 +24909,6 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Cancel PvB timeout since user is rolling
             _cancel_pvb_timeout_jobs(context, user.id, active_pvb_game_id)
 
-            # Invalidate any active cashout button immediately (player chose to roll)
-            _active_cashout_buttons.pop(active_pvb_game_id, None)
-
             user_roll = update.message.dice.value
 
             # Add to user_rolls list
@@ -24914,8 +24918,16 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Check if user has completed all rolls
             if len(game['user_rolls']) < game_rolls:
-                # Don't send spam messages - user knows to send more rolls
+                # Mid-round partial roll: re-render the existing cashout button
+                # with an updated match-win multiplier so the label reflects the
+                # new state (player already committed some dice). Don't spam a
+                # new message — just edit the old keyboard.
+                await _refresh_pvb_cashout_button(context, active_pvb_game_id, game, user.id)
                 return
+
+            # Round will now resolve — invalidate the cashout button so the
+            # player can't cash out after already locking in all their rolls.
+            _active_cashout_buttons.pop(active_pvb_game_id, None)
 
             # User finished rolling
             user_rolls = game['user_rolls']
@@ -25130,9 +25142,8 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     _co_round = game.get('current_round', 1)
                     _co_mult = calculate_cashout_multiplier(game, user_id=user.id)
                     _co_keyboard = _build_pvb_cashout_keyboard(_co_match_id, _co_round, _co_mult)
-                    _register_cashout_button(_co_match_id, user.id, update.effective_chat.id, _co_round)
 
-                    await update.message.reply_text(
+                    _co_sent = await update.message.reply_text(
                         f"{pe('robot')} <b>BOT ROLLED FIRST!</b>\n\n"
                         f"Bot rolled: [{bot_rolls_text}] = {bot_total}\n\n"
                         f"{username_display}, Your turn! Send {game_rolls} {expected_emoji} to respond.\n"
@@ -25140,6 +25151,8 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode=ParseMode.HTML,
                         reply_markup=_co_keyboard
                     )
+                    _register_cashout_button(_co_match_id, user.id, update.effective_chat.id, _co_round,
+                                             message_id=getattr(_co_sent, 'message_id', None))
 
                     # Schedule PvB timeout for next round
                     if context.job_queue:
@@ -25164,15 +25177,16 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     _co_round = game.get('current_round', 1)
                     _co_mult = calculate_cashout_multiplier(game, user_id=user.id)
                     _co_keyboard = _build_pvb_cashout_keyboard(_co_match_id, _co_round, _co_mult)
-                    _register_cashout_button(_co_match_id, user.id, update.effective_chat.id, _co_round)
 
-                    await update.message.reply_text(
+                    _co_sent = await update.message.reply_text(
                         f"Score: You {game['user_score']} - {game['bot_score']} Bot. (First to {game['target_score']})\n\n"
                         f"{user.mention_html()}, <b>Your turn! Send {game_rolls} {expected_emoji}!</b>\n"
                         f"Or tap Cashout to collect <b>${round(game['bet_amount'] * _co_mult, 2):.2f}</b>:",
                         parse_mode=ParseMode.HTML,
                         reply_markup=_co_keyboard
                     )
+                    _register_cashout_button(_co_match_id, user.id, update.effective_chat.id, _co_round,
+                                             message_id=getattr(_co_sent, 'message_id', None))
 
                     # Schedule PvB timeout for next round
                     if context.job_queue:
@@ -32235,38 +32249,86 @@ CASHOUT_BASE_MULTIPLIER = round(2 * (1 - CASHOUT_HOUSE_EDGE), 2)  # 1.86x fair p
 _active_cashout_buttons: dict = {}
 
 
+def _is_pvb_session(game: dict) -> bool:
+    """True if this game_sessions entry is a Player-vs-Bot match.
+
+    Covers every PvB entry point:
+      - legacy /dice play_vs_bot_game (user_id/bot_rolls schema only)
+      - xdxw_playbot / gc_playbot (has both players=[host,0] and legacy keys)
+      - converted rpvp/bot challenges
+    """
+    if not isinstance(game, dict):
+        return False
+    if 0 in (game.get("players") or []):
+        return True
+    if game.get("opponent_id") == 0:
+        return True
+    if "user_score" in game or "bot_score" in game or "bot_rolls" in game:
+        return True
+    # Don't treat a plain PvP challenge as PvB just because host_id exists.
+    return False
+
+
 def _build_pvb_match_view(game: dict, user_id: int = None) -> dict:
-    """Return a match-data structure compatible with calculate_match_win_probability
-    derived from a PvB game session (which uses user_score/bot_score/user_rolls/bot_rolls)."""
+    """Project a PvB session into the schema calculate_match_win_probability expects.
+
+    The tricky bit: several PvB flows (xdxw_playbot, gc_playbot) populate BOTH the
+    new PvP-style fields (players/points/player_rolls) AND the legacy PvB fields
+    (user_score/bot_score/user_rolls/bot_rolls). Only `message_listener`'s PvB
+    block updates the legacy fields each round — the new-schema fields go stale.
+    If we read `points` / `player_rolls` directly off the dict, the cashout
+    multiplier ends up frozen at its round-1 value ("~0.93x no matter what").
+
+    So we ALWAYS prefer the legacy fields when they exist and fall back to the
+    PvP-style fields only when the legacy ones were never initialized.
+    """
     if user_id is None:
         user_id = game.get("user_id") or game.get("host_id")
+        # Last resort: pick the non-bot id from players[]
+        if user_id is None:
+            for pid in game.get("players") or []:
+                if pid != 0:
+                    user_id = pid
+                    break
     bot_id = 0
     if user_id is None:
         return {}
 
-    # Allow newer PvP-style PvB sessions (xdxw_playbot, gc_playbot) that already
-    # populate "players"/"points" without a user_score field.
-    user_score = game.get("user_score")
-    bot_score = game.get("bot_score")
-    if user_score is None and "points" in game:
-        user_score = game["points"].get(user_id, 0)
-        bot_score = game["points"].get(bot_id, 0)
+    # Scores: prefer legacy user_score/bot_score (updated live by message_listener)
+    if "user_score" in game or "bot_score" in game:
+        user_score = int(game.get("user_score") or 0)
+        bot_score = int(game.get("bot_score") or 0)
+    elif "points" in game:
+        user_score = int((game["points"] or {}).get(user_id, 0) or 0)
+        bot_score = int((game["points"] or {}).get(bot_id, 0) or 0)
+    else:
+        user_score = 0
+        bot_score = 0
 
-    user_rolls = game.get("user_rolls")
-    bot_rolls = game.get("bot_rolls")
-    if (user_rolls is None or bot_rolls is None) and "player_rolls" in game:
-        user_rolls = game["player_rolls"].get(user_id, [])
-        bot_rolls = game["player_rolls"].get(bot_id, [])
+    # Partial rolls: prefer legacy user_rolls/bot_rolls (updated live each roll)
+    if "user_rolls" in game or "bot_rolls" in game:
+        user_rolls = list(game.get("user_rolls") or [])
+        bot_rolls = list(game.get("bot_rolls") or [])
+    elif "player_rolls" in game:
+        user_rolls = list((game["player_rolls"] or {}).get(user_id, []) or [])
+        bot_rolls = list((game["player_rolls"] or {}).get(bot_id, []) or [])
+    else:
+        user_rolls = []
+        bot_rolls = []
 
     return {
         "players": [user_id, bot_id],
-        "points": {user_id: int(user_score or 0), bot_id: int(bot_score or 0)},
-        "target_points": game.get("target_score") or game.get("target_points") or 1,
-        "game_rolls": game.get("game_rolls", 1),
-        "game_mode": game.get("game_mode", game.get("mode", "normal")),
+        "points": {user_id: user_score, bot_id: bot_score},
+        "target_points": int(
+            game.get("target_score")
+            or game.get("target_points")
+            or 1
+        ),
+        "game_rolls": int(game.get("game_rolls") or game.get("rolls") or 1),
+        "game_mode": game.get("game_mode") or game.get("mode") or "normal",
         "player_rolls": {
-            user_id: list(user_rolls or []),
-            bot_id: list(bot_rolls or []),
+            user_id: user_rolls,
+            bot_id: bot_rolls,
         },
     }
 
@@ -32274,15 +32336,19 @@ def _build_pvb_match_view(game: dict, user_id: int = None) -> dict:
 def calculate_cashout_multiplier(match_data: dict, user_id: int = None) -> float:
     """Calculate the cashout multiplier for the player in a PvB game.
 
-    Multiplier = P(player_wins_match) * 2 * (1 - 7% house edge), so initially
-    (50/50 odds, no rolls yet) the multiplier is 0.93x. As the player gains
-    advantage the multiplier rises; if they fall behind it drops.
+    Based on the probability of winning the *match* (not just this round),
+    mirroring the sidebet engine:
+        multiplier = P(player_wins_match) * 2 * (1 - 7% house edge)
 
-    Floor is 0.10x to avoid showing nonsense like 0.00x late in losing games.
+    So at 50/50 (pre-roll, 0-0) the multiplier is ~0.93x. Score advantage and
+    live partial rolls pull it up; being behind pulls it down. Floor 0.10x
+    avoids showing nonsense like 0.00x late in losing games.
     """
-    # Detect PvB structures that need to be projected onto the
-    # calculate_match_win_probability schema first.
-    if "players" not in match_data and ("user_id" in match_data or "host_id" in match_data):
+    # Always project PvB sessions onto the probability-engine schema using the
+    # freshest fields. Otherwise stale new-schema `points`/`player_rolls` on
+    # xdxw_playbot / gc_playbot sessions (only legacy keys are updated each
+    # round) freeze the multiplier at its round-1 value.
+    if _is_pvb_session(match_data):
         match_data = _build_pvb_match_view(match_data, user_id)
 
     odds = calculate_match_win_probability(match_data)
@@ -32315,13 +32381,37 @@ def _build_pvb_cashout_keyboard(match_id: str, cashout_round: int, multiplier: f
     return create_styled_keyboard(rows)
 
 
-def _register_cashout_button(match_id: str, user_id: int, chat_id: int, cashout_round: int):
-    """Track an active cashout button so subsequent rolls invalidate it."""
+def _register_cashout_button(match_id: str, user_id: int, chat_id: int,
+                             cashout_round: int, message_id: int = None):
+    """Track an active cashout button so subsequent rolls can invalidate or
+    re-render it (to keep the multiplier in sync with live match state)."""
     _active_cashout_buttons[match_id] = {
         "round": cashout_round,
         "user_id": user_id,
         "chat_id": chat_id,
+        "message_id": message_id,
     }
+
+
+async def _refresh_pvb_cashout_button(context, match_id: str, game: dict,
+                                      user_id: int):
+    """Re-render the currently-active cashout button with an updated multiplier
+    computed off the latest match state (partial rolls, score). No-op if the
+    button isn't tracked or we don't have a message id to edit."""
+    info = _active_cashout_buttons.get(match_id)
+    if not info or not info.get("message_id") or not info.get("chat_id"):
+        return
+    try:
+        mult = calculate_cashout_multiplier(game, user_id=user_id)
+        kb = _build_pvb_cashout_keyboard(match_id, info.get("round", 1), mult)
+        await context.bot.edit_message_reply_markup(
+            chat_id=info["chat_id"],
+            message_id=info["message_id"],
+            reply_markup=kb,
+        )
+    except Exception:
+        # Message may have been deleted / too old; silently ignore.
+        pass
 
 
 def is_pvb_game(match_data: dict) -> bool:
@@ -33832,10 +33922,9 @@ async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TY
         _co_round = game_sessions[game_id].get("current_round", 1)
         _co_mult = calculate_cashout_multiplier(game_sessions[game_id], user_id=user.id)
         _co_kb = _build_pvb_cashout_keyboard(game_id, _co_round, _co_mult)
-        _register_cashout_button(game_id, user.id, chat_id, _co_round)
 
         username_display = user.first_name if user.first_name else "Player"
-        await context.bot.send_message(
+        _co_sent = await context.bot.send_message(
             chat_id=chat_id,
             text=f"{pe('robot')} <b>BOT ROLLED FIRST!</b>\n\n"
                  f"Bot rolled: [{bot_rolls_text}] = {bot_total}\n\n"
@@ -33844,6 +33933,8 @@ async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.HTML,
             reply_markup=_co_kb
         )
+        _register_cashout_button(game_id, user.id, chat_id, _co_round,
+                                 message_id=getattr(_co_sent, 'message_id', None))
 
         # Schedule PvB timeout
         if context.job_queue:
@@ -33867,9 +33958,8 @@ async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TY
         _co_round = game_sessions[game_id].get("current_round", 1)
         _co_mult = calculate_cashout_multiplier(game_sessions[game_id], user_id=user.id)
         _co_kb = _build_pvb_cashout_keyboard(game_id, _co_round, _co_mult)
-        _register_cashout_button(game_id, user.id, chat_id, _co_round)
 
-        await context.bot.send_message(
+        _co_sent = await context.bot.send_message(
             chat_id=chat_id,
             text=f"{pe('game')} {game_type.capitalize()} vs Bot started! (ID: <code>{game_id}</code>)\n"
                  f"<b>Mode:</b> {game_mode.capitalize()} ({mode_text})\n"
@@ -33880,6 +33970,8 @@ async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.HTML,
             reply_markup=_co_kb
         )
+        _register_cashout_button(game_id, user.id, chat_id, _co_round,
+                                 message_id=getattr(_co_sent, 'message_id', None))
 
         # Schedule PvB timeout
         if context.job_queue:
