@@ -1083,22 +1083,38 @@ def get_total_balance_usd(user_id: int) -> float:
 
 def deduct_wallet(user_id: int, usd_amount: float, coin: str = None):
     """Deduct crypto equivalent of USD amount from user's wallet.
-    Returns (crypto_amount, coin). Allows negative balance if check was skipped."""
+    Returns (crypto_amount, coin).
+    SECURITY: Validates amount and prevents going negative."""
+    import math as _math_dw
+    if _math_dw.isnan(usd_amount) or _math_dw.isinf(usd_amount) or usd_amount <= 0:
+        logging.warning(f"deduct_wallet: rejected invalid amount {usd_amount} for user {user_id}")
+        return 0.0, coin or get_active_currency(user_id)
     wallet = ensure_wallet_dict(user_id)
     if coin is None:
         coin = get_active_currency(user_id)
     price = LIVE_PRICES.get(coin, 1.0)
     crypto_amount = usd_amount / price
     current = wallet.get(coin, 0.0)
-    if current < crypto_amount:
-        logging.warning(f"Deduct wallet: user {user_id} has {current} {coin} but deducting {crypto_amount} {coin}")
-    wallet[coin] = current - crypto_amount
+    if current < crypto_amount - 1e-10:
+        logging.warning(f"deduct_wallet: INSUFFICIENT user {user_id} has {current} {coin} but needs {crypto_amount} {coin}")
+        raise ValueError("INSUFFICIENT_FUNDS")
+    wallet[coin] = max(0.0, current - crypto_amount)
     return crypto_amount, coin
 
 
 def credit_wallet(user_id: int, usd_amount: float, coin: str = None):
     """Credit crypto equivalent of USD amount to user's wallet.
-    Returns (crypto_amount, coin)."""
+    Returns (crypto_amount, coin).
+    SECURITY: Validates amount before crediting to prevent exploit."""
+    import math as _math_cw
+    if _math_cw.isnan(usd_amount) or _math_cw.isinf(usd_amount) or usd_amount <= 0:
+        logging.warning(f"credit_wallet: rejected invalid amount {usd_amount} for user {user_id}")
+        return 0.0, coin or get_active_currency(user_id)
+    # Max payout circuit breaker
+    max_payout = bot_settings.get('bet_limits', {}).get('max_payout_any_game', 50000.0)
+    if usd_amount > max_payout:
+        logging.error(f"CIRCUIT BREAKER: credit_wallet blocked ${usd_amount:.2f} payout for user {user_id} (max: ${max_payout:.2f})")
+        usd_amount = max_payout
     wallet = ensure_wallet_dict(user_id)
     if coin is None:
         coin = get_active_currency(user_id)
@@ -1109,7 +1125,12 @@ def credit_wallet(user_id: int, usd_amount: float, coin: str = None):
 
 
 def credit_wallet_crypto(user_id: int, crypto_amount: float, coin: str):
-    """Credit a specific crypto amount directly (no conversion)."""
+    """Credit a specific crypto amount directly (no conversion).
+    SECURITY: Validates amount; allows negative only for rain deductions."""
+    import math as _math_cwc
+    if _math_cwc.isnan(crypto_amount) or _math_cwc.isinf(crypto_amount):
+        logging.warning(f"credit_wallet_crypto: rejected NaN/Inf for user {user_id}")
+        return
     wallet = ensure_wallet_dict(user_id)
     wallet[coin] = wallet.get(coin, 0.0) + crypto_amount
 
@@ -1136,7 +1157,12 @@ async def deduct_wallet_safe(user_id: int, usd_amount: float, coin: str = None):
 def credit_wallet_safe(user_id: int, usd_amount: float, coin: str = None):
     """
     Credit is always safe (wins/refunds). No lock needed for credit-only ops.
+    SECURITY: Validates amount before crediting.
     """
+    import math as _math_cws
+    if _math_cws.isnan(usd_amount) or _math_cws.isinf(usd_amount) or usd_amount <= 0:
+        logging.warning(f"credit_wallet_safe: rejected invalid amount {usd_amount} for user {user_id}")
+        return 0.0, coin or get_active_currency(user_id)
     wallet = ensure_wallet_dict(user_id)
     if coin is None:
         coin = get_active_currency(user_id)
@@ -1648,15 +1674,30 @@ def parse_bet_amount(amount_str: str, user_id: int) -> tuple:
     """
     Parse bet amount from user input (always in USD).
     Checks active crypto balance. Returns (amount_in_usd, amount_in_usd, 'USD').
+    SECURITY: Validates against NaN, Inf, negative, and excessive values.
     """
+    import math as _math_parse
     balance_usd = get_active_balance_usd(user_id)
 
     amount_str = amount_str.lower().strip()
 
     if amount_str == 'all':
         amount_usd = balance_usd
+    elif amount_str in ('half', '1/2'):
+        amount_usd = balance_usd / 2
     else:
         amount_usd = float(amount_str)
+
+    # SECURITY: Reject NaN, Inf, negative, zero, and absurdly large values
+    if _math_parse.isnan(amount_usd) or _math_parse.isinf(amount_usd):
+        raise ValueError("Invalid bet amount: NaN or Inf")
+    if amount_usd <= 0:
+        raise ValueError("Bet amount must be positive")
+    if amount_usd > 1_000_000_000:  # $1B sanity cap
+        raise ValueError("Bet amount exceeds maximum")
+
+    # Round to 2 decimal places to prevent float precision exploits
+    amount_usd = round(amount_usd, 2)
 
     return amount_usd, amount_usd, "USD"
 
@@ -4835,24 +4876,24 @@ def build_deposit_menu():
 
     keyboard_rows = [
         [
-            apply_button_style(InlineKeyboardButton("Ethereum", callback_data="deposit_ETH"), 'primary', peb('eth')),
-            apply_button_style(InlineKeyboardButton("BNB Chain", callback_data="deposit_BNB"), 'primary', peb('bnb'))
+            apply_button_style(InlineKeyboardButton("Ethereum", callback_data="deposit_ETH"), 'primary', None),
+            apply_button_style(InlineKeyboardButton("BNB Chain", callback_data="deposit_BNB"), 'primary', None)
         ],
         [
-            apply_button_style(InlineKeyboardButton("Base", callback_data="deposit_BASE"), 'primary', peb('base')),
+            apply_button_style(InlineKeyboardButton("Base", callback_data="deposit_BASE"), 'primary', None),
         ]
     ]
 
     # Add TRON if available
     if TRON_AVAILABLE:
         chains_text.append(f"{pe('trx')} <b>TRON (TRX)</b> - TRX, USDT")
-        keyboard_rows[-1].append(apply_button_style(InlineKeyboardButton("TRON", callback_data="deposit_TRON"), 'primary', peb('trx')))
+        keyboard_rows[-1].append(apply_button_style(InlineKeyboardButton("TRON", callback_data="deposit_TRON"), 'primary', None))
 
     # Add Solana if available
     row_3 = []
     if SOLANA_AVAILABLE:
         chains_text.append(f"{pe('sol')} <b>Solana (SOL)</b> - SOL, USDT, USDC")
-        row_3.append(apply_button_style(InlineKeyboardButton("Solana", callback_data="deposit_SOLANA"), 'primary', peb('sol')))
+        row_3.append(apply_button_style(InlineKeyboardButton("Solana", callback_data="deposit_SOLANA"), 'primary', None))
 
     # TON deposit removed as per requirements
     # if TON_AVAILABLE:
@@ -4864,14 +4905,14 @@ def build_deposit_menu():
 
     # Add bottom row - History BLUE, Back RED
     keyboard_rows.append([
-        apply_button_style(InlineKeyboardButton("Deposit History", callback_data="deposit_history"), 'primary', peb('chart')),  # BLUE
-        apply_button_style(InlineKeyboardButton("Back", callback_data="back_to_main"), 'danger', peb('back'))  # RED
+        apply_button_style(InlineKeyboardButton("Deposit History", callback_data="deposit_history"), 'primary', None),  # BLUE
+        apply_button_style(InlineKeyboardButton("Back", callback_data="back_to_main"), 'danger', None)  # RED
     ])
 
     # Add OxaPay option if configured
     if OXAPAY_MERCHANT_KEY:
         keyboard_rows.append([
-            apply_button_style(InlineKeyboardButton("Deposit via OxaPay", callback_data="deposit_oxapay"), 'primary', peb('lightning'))
+            apply_button_style(InlineKeyboardButton("Deposit via OxaPay", callback_data="deposit_oxapay"), 'primary', None)
         ])
 
     text = (
@@ -5690,8 +5731,10 @@ async def plinko_serve_html(request: aiohttp.web.Request) -> aiohttp.web.Respons
             'Cache-Control': 'public, max-age=300',
             'ETag': _plinko_html_cache_etag,
             'X-Content-Type-Options': 'nosniff',
-            'X-Frame-Options': 'DENY',
-            'Content-Security-Policy': "frame-ancestors 'self' https://*.telegram.org",
+            # X-Frame-Options removed: conflicts with CSP and blocks Telegram WebView
+            'Content-Security-Policy': "frame-ancestors 'self' https://*.telegram.org https://telegram.org",
+            'Access-Control-Allow-Origin': '*',
+            'Connection': 'keep-alive',
         }
     )
 
@@ -5813,8 +5856,10 @@ async def plinko_api_bet(request: aiohttp.web.Request) -> aiohttp.web.Response:
 
     if bet_amount < PLINKO_WEB_MIN_BET:
         return aiohttp.web.json_response({"error": f"Minimum bet is ${PLINKO_WEB_MIN_BET:.2f}"}, status=400)
-    if bet_amount > PLINKO_WEB_MAX_BET:
-        return aiohttp.web.json_response({"error": f"Maximum bet is ${PLINKO_WEB_MAX_BET:.2f}"}, status=400)
+    # Use dynamic max bet (min of static and dynamic)
+    _plinko_dyn_max = min(PLINKO_WEB_MAX_BET, get_dynamic_max_bet("originals", "plinko"))
+    if bet_amount > _plinko_dyn_max:
+        return aiohttp.web.json_response({"error": f"Maximum bet is ${_plinko_dyn_max:.2f}"}, status=400)
 
     # Round to 2 decimal places to prevent floating point exploits
     bet_amount = round(bet_amount, 2)
@@ -5956,8 +6001,8 @@ _chicken_road_server_running = False
 
 # Scalability: Global request concurrency semaphore to prevent event loop saturation
 # Limits concurrent requests per server to prevent overwhelming the event loop under 4k+ load
-_PLINKO_CONCURRENCY_LIMIT = 500  # Max concurrent requests for Plinko
-_CHICKEN_ROAD_CONCURRENCY_LIMIT = 500  # Max concurrent requests for Chicken Road
+_PLINKO_CONCURRENCY_LIMIT = 2000  # Max concurrent requests for Plinko (increased for 2k+ users)
+_CHICKEN_ROAD_CONCURRENCY_LIMIT = 2000  # Max concurrent requests for Chicken Road (increased for 2k+ users)
 _plinko_semaphore = None
 _chicken_road_semaphore = None
 
@@ -6323,9 +6368,12 @@ async def cr_serve_html(request: aiohttp.web.Request) -> aiohttp.web.Response:
         text=_chicken_road_html_cache,
         content_type='text/html',
         headers={
-            'Cache-Control':        'public, max-age=300',
-            'ETag':                 _chicken_road_html_cache_etag,
+            'Cache-Control':          'public, max-age=300',
+            'ETag':                   _chicken_road_html_cache_etag,
             'X-Content-Type-Options': 'nosniff',
+            'Content-Security-Policy': "frame-ancestors 'self' https://*.telegram.org https://telegram.org",
+            'Access-Control-Allow-Origin': '*',
+            'Connection':             'keep-alive',
             'X-Frame-Options':      'DENY',
             'Content-Security-Policy': "frame-ancestors 'self' https://*.telegram.org",
         }
@@ -6438,9 +6486,11 @@ async def cr_api_bet(request: aiohttp.web.Request) -> aiohttp.web.Response:
     if bet_amount < CHICKEN_ROAD_WEB_MIN_BET:
         return aiohttp.web.json_response(
             {"error": f"Minimum bet is ${CHICKEN_ROAD_WEB_MIN_BET:.2f}"}, status=400)
-    if bet_amount > CHICKEN_ROAD_WEB_MAX_BET:
+    # Use dynamic max bet (min of static and dynamic)
+    _cr_dyn_max = min(CHICKEN_ROAD_WEB_MAX_BET, get_dynamic_max_bet("originals", "chicken_road"))
+    if bet_amount > _cr_dyn_max:
         return aiohttp.web.json_response(
-            {"error": f"Maximum bet is ${CHICKEN_ROAD_WEB_MAX_BET:.2f}"}, status=400)
+            {"error": f"Maximum bet is ${_cr_dyn_max:.2f}"}, status=400)
 
     lock = _chicken_road_locks.setdefault(user_id, asyncio.Lock())
     async with lock:
@@ -7978,6 +8028,18 @@ def normalize_username(username):
         username = "@" + username
     return username
 
+
+def display_at(username):
+    """Return username with exactly one leading @ for display purposes.
+    Handles cases where normalize_username() already added @ prefix."""
+    if not username:
+        return "Unknown"
+    s = str(username)
+    stripped = s.lstrip("@")
+    if not stripped:
+        return s
+    return f"@{stripped}"
+
 def load_all_user_data():
     global user_wallets, username_to_userid, user_stats
     try:
@@ -8460,22 +8522,36 @@ load_bot_state()
 
 # --- HELPER TO CHECK BET LIMITS ---
 async def check_bet_limits(update: Update, bet_amount: float, game_name: str, user_id: int = None) -> bool:
+    import math as _math_cbl
     if user_id is None and update.effective_user:
         user_id = update.effective_user.id
     user_lang = get_user_lang(user_id) if user_id else DEFAULT_LANG
     user_currency = get_user_currency(user_id) if user_id else "USD"
 
+    # SECURITY: Reject NaN, Inf, negative, and zero bet amounts
+    if _math_cbl.isnan(bet_amount) or _math_cbl.isinf(bet_amount) or bet_amount <= 0:
+        await update.message.reply_text(f"{pe('cross')} Invalid bet amount.")
+        return False
+
     limits = bot_settings.get('game_limits', {}).get(game_name, {})
     min_bet = limits.get('min', MIN_BALANCE)
-    max_bet = limits.get('max')
+
+    # Use dynamic max bet based on house balance (overrides static limits)
+    dynamic_max = get_dynamic_max_bet(game_category=None, game_type=game_name)
+    static_max = limits.get('max')
+    # Use the lower of static and dynamic limits (or just dynamic if no static)
+    max_bet = min(dynamic_max, static_max) if static_max is not None else dynamic_max
 
     if bet_amount < min_bet:
         min_formatted = format_currency(min_bet, user_currency)
         await update.message.reply_text(get_text("min_bet", user_lang, amount=min_formatted))
         return False
     if max_bet is not None and bet_amount > max_bet:
-        max_formatted = format_currency(max_bet, user_currency)
-        await update.message.reply_text(get_text("max_bet", user_lang, amount=max_formatted))
+        await update.message.reply_text(
+            f"{pe('cross')} Maximum bet for this game is ${max_bet:,.2f}\n"
+            f"Use /maxbet to see current limits.",
+            parse_mode=ParseMode.HTML
+        )
         return False
     return True
 
@@ -8490,16 +8566,194 @@ def validate_bet_amount(bet_amount: float, game_category: str = "originals") -> 
         return False, "Bet amount must be a positive number"
     if bet_amount < MIN_BALANCE:
         return False, f"Minimum bet is ${MIN_BALANCE}"
-    bet_limits = bot_settings.get('bet_limits', {})
-    max_bet_map = {
-        "originals": bet_limits.get('max_per_bet_originals', 1000.0),
-        "slots": bet_limits.get('max_per_bet_slots', 500.0),
-        "pvp": bet_limits.get('max_per_bet_pvp', 2000.0),
-    }
-    max_bet = max_bet_map.get(game_category, 1000.0)
+    # Use dynamic max bet limits based on house balance
+    max_bet = get_dynamic_max_bet(game_category)
     if bet_amount > max_bet:
         return False, f"Maximum bet is ${max_bet:.2f} for this game"
     return True, None
+
+
+# ============================================================================
+# DYNAMIC MAX BET LIMITS - Based on house balance
+# ============================================================================
+# Standard games (Roulette, Blackjack, Baccarat, Crash, Dice, Plinko, Limbo,
+#   7up, Rush, Chicken, etc.): 0.6% of house balance
+# Special games (Mines, Tower, Keno, HiLo): 0.3% of house balance
+# PvP emoji games: No limits (player vs player, house only takes commission)
+# ============================================================================
+
+DYNAMIC_BET_CATEGORY_RATE = {
+    "standard": 0.006,    # 0.6% of house balance
+    "special": 0.003,     # 0.3% of house balance
+    "pvp": None,          # No limit for PvP (player funds, not house risk)
+}
+
+# Map game categories to dynamic bet rate categories
+GAME_TO_DYNAMIC_CATEGORY = {
+    # Standard games (0.6%)
+    "originals": "standard",
+    "slots": "standard",
+    "7up": "standard",
+    "sidebets": "standard",
+    # Special games (0.3%)
+    "special": "special",
+    # PvP (no limit)
+    "pvp": "pvp",
+}
+
+# Map specific game types to their dynamic category
+GAME_TYPE_TO_DYNAMIC_CATEGORY = {
+    # Standard games
+    "roulette": "standard", "blackjack": "standard", "crash": "standard",
+    "dice_roll": "standard", "plinko": "standard", "limbo": "standard",
+    "7up7down": "standard", "7up7down_2dice": "standard", "7up7down_3dice": "standard",
+    "chicken_road": "standard", "coinchain": "standard", "coin_chain": "standard",
+    "coin_flip": "standard", "wheel": "standard", "scratch": "standard",
+    "slots": "standard", "predict": "standard",
+    "classic_rush": "standard", "odd_even_rush": "standard",
+    "high_low_rush": "standard", "rainbow_rush": "standard", "blaze_rush": "standard",
+    # Special games (0.3%)
+    "mines": "special", "tower": "special", "keno": "special", "highlow": "special",
+    # PvP games (no limit)
+    "pvp_dice": "pvp", "pvp_darts": "pvp", "pvp_goal": "pvp", "pvp_bowl": "pvp",
+    "xdxw_dice": "pvp", "xdxw_darts": "pvp", "xdxw_goal": "pvp", "xdxw_bowl": "pvp",
+    "group_challenge_dice": "pvp", "group_challenge_darts": "pvp",
+    "group_challenge_goal": "pvp", "group_challenge_bowl": "pvp",
+    # PvB games use standard limits (house is at risk)
+    "pvb_dice": "standard", "pvb_darts": "standard",
+    "pvb_goal": "standard", "pvb_bowl": "standard",
+    # Side bets
+    "sidebet_win": "standard", "sidebet_lose": "standard",
+}
+
+
+def get_dynamic_max_bet(game_category: str = "originals", game_type: str = None) -> float:
+    """Calculate max bet dynamically based on house balance.
+    Returns the max bet in USD. PvP games return a very high limit (effectively unlimited)."""
+    house_bal = bot_settings.get("house_balance", 100_000_000_000_000.0)
+
+    # Determine the dynamic category
+    if game_type:
+        dyn_cat = GAME_TYPE_TO_DYNAMIC_CATEGORY.get(game_type, "standard")
+    else:
+        dyn_cat = GAME_TO_DYNAMIC_CATEGORY.get(game_category, "standard")
+
+    rate = DYNAMIC_BET_CATEGORY_RATE.get(dyn_cat)
+
+    if rate is None:
+        # PvP: no house risk, return effectively unlimited
+        return 999_999_999.0
+
+    max_bet = house_bal * rate
+    # Floor to 2 decimal places, minimum $0.10
+    return max(0.10, round(max_bet, 2))
+
+
+def get_dynamic_max_bet_for_pvb(game_type: str = None) -> float:
+    """Calculate max bet for PvB (Play vs Bot) mode specifically.
+    Uses standard game limits since the house is at risk."""
+    return get_dynamic_max_bet("originals", game_type)
+
+
+async def maxbet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /maxbet and /limits commands - show dynamic max bet limits."""
+    user = update.effective_user
+    house_bal = bot_settings.get("house_balance", 100_000_000_000_000.0)
+
+    standard_limit = round(house_bal * 0.006, 2)
+    special_limit = round(house_bal * 0.003, 2)
+
+    # Generate PIL image for max bet limits
+    try:
+        img = Image.new('RGB', (600, 420), color=(15, 15, 30))
+        draw = ImageDraw.Draw(img)
+
+        # Try to load font
+        try:
+            font_title = ImageFont.truetype(DASHBOARD_FONT_PATH, 28)
+            font_header = ImageFont.truetype(DASHBOARD_FONT_PATH, 20)
+            font_body = ImageFont.truetype(DASHBOARD_FONT_PATH, 16)
+            font_small = ImageFont.truetype(DASHBOARD_FONT_PATH, 13)
+        except Exception:
+            font_title = ImageFont.load_default()
+            font_header = font_title
+            font_body = font_title
+            font_small = font_title
+
+        # Title
+        draw.text((30, 20), "MAX BET LIMITS", fill=(255, 215, 0), font=font_title)
+        draw.text((30, 55), "@playcsino | Telegram Casino", fill=(150, 150, 170), font=font_small)
+
+        # Divider
+        draw.line([(30, 80), (570, 80)], fill=(60, 60, 80), width=2)
+
+        # Standard games section
+        y = 100
+        draw.text((30, y), "STANDARD GAMES", fill=(0, 200, 255), font=font_header)
+        y += 30
+        draw.text((30, y), f"Limit: ${standard_limit:,.2f}", fill=(0, 255, 100), font=font_body)
+        y += 25
+        draw.text((30, y), "0.6% of house balance", fill=(120, 120, 150), font=font_small)
+        y += 20
+        draw.text((30, y), "Games: Roulette, Blackjack, Crash, Dice, Plinko,", fill=(180, 180, 200), font=font_small)
+        y += 18
+        draw.text((30, y), "Limbo, 7Up, Rush, Chicken Road, Slots, Coinflip", fill=(180, 180, 200), font=font_small)
+
+        # Divider
+        y += 30
+        draw.line([(30, y), (570, y)], fill=(60, 60, 80), width=1)
+
+        # Special games section
+        y += 15
+        draw.text((30, y), "SPECIAL GAMES", fill=(255, 165, 0), font=font_header)
+        y += 30
+        draw.text((30, y), f"Limit: ${special_limit:,.2f}", fill=(0, 255, 100), font=font_body)
+        y += 25
+        draw.text((30, y), "0.3% of house balance", fill=(120, 120, 150), font=font_small)
+        y += 20
+        draw.text((30, y), "Games: Mines, Tower, Keno, HiLo", fill=(180, 180, 200), font=font_small)
+
+        # Divider
+        y += 30
+        draw.line([(30, y), (570, y)], fill=(60, 60, 80), width=1)
+
+        # PvP section
+        y += 15
+        draw.text((30, y), "PVP EMOJI GAMES", fill=(200, 100, 255), font=font_header)
+        y += 30
+        draw.text((30, y), "No Limit", fill=(0, 255, 100), font=font_body)
+        y += 25
+        draw.text((30, y), "Player vs Player - no house risk", fill=(120, 120, 150), font=font_small)
+
+        # Footer
+        draw.line([(30, 390), (570, 390)], fill=(60, 60, 80), width=1)
+        draw.text((30, 398), "Play smart, win big! Limits adjust dynamically.", fill=(100, 100, 130), font=font_small)
+
+        bio = BytesIO()
+        img.save(bio, 'PNG', optimize=True)
+        bio.seek(0)
+
+        await update.message.reply_photo(
+            photo=bio,
+            caption=f"{pe('chart')} <b>Dynamic Max Bet Limits</b>\n\nLimits adjust automatically based on house balance.",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logging.error(f"Error generating maxbet image: {e}")
+        # Fallback to text
+        await update.message.reply_text(
+            f"{pe('chart')} <b>MAX BET LIMITS</b>\n\n"
+            f"<b>STANDARD GAMES</b> (0.6% of house balance)\n"
+            f"Limit: <b>${standard_limit:,.2f}</b>\n"
+            f"Roulette, Blackjack, Crash, Dice, Plinko, Limbo, 7Up, Rush, Chicken, Slots\n\n"
+            f"<b>SPECIAL GAMES</b> (0.3% of house balance)\n"
+            f"Limit: <b>${special_limit:,.2f}</b>\n"
+            f"Mines, Tower, Keno, HiLo\n\n"
+            f"<b>PVP EMOJI GAMES</b>\n"
+            f"No Limit (player vs player)\n\n"
+            f"<i>Limits adjust dynamically based on house balance.</i>",
+            parse_mode=ParseMode.HTML
+        )
 
 
 def check_withdrawal_limit(user_id: int, amount_usd: float) -> tuple:
@@ -18308,12 +18562,12 @@ async def rpvp_target_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.edit_message_text(
         f"{pe('game')} <b>{game_type.upper()} MATCH STARTED!</b> {pe('game')}\n\n"
-        f"{pe('lightning')} @{host_uname} vs @{opp_uname}\n"
+        f"{pe('lightning')} {display_at(host_uname)} vs {display_at(opp_uname)}\n"
         f"{pe('money')} Prize Pool: {currency_symbol}{match['bet_amount_currency'] * 2:.2f}\n"
         f"{pe('target')} Mode: {match['mode'].title()} ({mode_desc})\n"
         f"{pe('rolls')} Rolls: {match['game_rolls']}\n"
         f"{pe('trophy')} Target: First to {target}\n\n"
-        f"@{host_uname}, you roll first! Send {match['game_rolls']} {emoji} emoji{'s' if match['game_rolls'] > 1 else ''}.",
+        f"{display_at(host_uname)}, you roll first! Send {match['game_rolls']} {emoji} emoji{'s' if match['game_rolls'] > 1 else ''}.",
         parse_mode=ParseMode.HTML
     )
 
@@ -19074,11 +19328,11 @@ async def xdxw_accept_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.edit_message_text(
         f"{pe('game')} <b>MATCH STARTED!</b>\n\n"
-        f"👤 @{match['host_username']} vs @{match['opponent_username']}\n"
+        f"👤 {display_at(match['host_username'])} vs {display_at(match['opponent_username'])}\n"
         f"{pe('money')} Prize Pool: {currency_symbol}{match['bet_amount_currency'] * 2:.2f}\n"
         f"🔢 Rolls per round: {match['game_rolls']}\n"
         f"{pe('trophy')} First to {match['target_score']} wins\n\n"
-        f"<b>@{match['host_username']}'s turn!</b>\n"
+        f"<b>{display_at(match['host_username'])}'s turn!</b>\n"
         f"Send {match['game_rolls']} {emoji} to start round 1.",
         parse_mode=ParseMode.HTML
     )
@@ -19662,7 +19916,7 @@ async def group_challenge_accept_callback(update: Update, context: ContextTypes.
 
     await query.edit_message_text(
         f"{pe('game')} <b>MATCH STARTED!</b>\n\n"
-        f"👤 @{match['host_username']} vs @{user.username or user.id}\n"
+        f"👤 {display_at(match['host_username'])} vs {display_at(user.username or str(user.id))}\n"
         f"{pe('money')} Prize Pool: {currency_symbol}{match['bet_amount_currency'] * 2:.2f}\n\n"
         f"Match will begin shortly...",
         parse_mode=ParseMode.HTML
@@ -19673,6 +19927,40 @@ async def group_challenge_accept_callback(update: Update, context: ContextTypes.
     await execute_group_challenge_game(update, context, match_id)
 
 # Callback for host playing with bot
+@check_banned
+@check_maintenance
+async def group_challenge_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle cancel button for group challenges."""
+    query = update.callback_query
+    user = query.from_user
+
+    match_id = query.data.replace("gc_cancel_", "")
+    match = game_sessions.get(match_id)
+
+    if not match or match.get("status") != "pending":
+        await query.answer("This challenge is no longer available.", show_alert=True)
+        return
+
+    if user.id != match["host_id"]:
+        await query.answer("Only the host can cancel this challenge!", show_alert=True)
+        return
+
+    await query.answer()
+    match["status"] = "cancelled"
+
+    # Unpin if pinned
+    if 'pinned_message_id' in match:
+        try:
+            await context.bot.unpin_chat_message(match["chat_id"], match['pinned_message_id'])
+        except Exception:
+            pass
+
+    await query.edit_message_text(
+        f"{pe('cross')} Challenge cancelled by {user.mention_html()}.",
+        parse_mode=ParseMode.HTML
+    )
+
+
 @check_banned
 @check_maintenance
 async def group_challenge_playbot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -19695,6 +19983,16 @@ async def group_challenge_playbot_callback(update: Update, context: ContextTypes
 
     if user.id != match["host_id"]:
         await query.answer("Only the host can play with the bot!", show_alert=True)
+        return
+
+    # Check dynamic max bet limit for PvB (house is at risk)
+    game_key = match.get("game_type", "").replace("group_challenge_", "")
+    pvb_max_bet = get_dynamic_max_bet_for_pvb(f"pvb_{game_key}")
+    if match["bet_amount_usd"] > pvb_max_bet:
+        await query.answer(
+            f"Max bet limit reached! Please lower your bet to ${pvb_max_bet:.2f} or less.",
+            show_alert=True
+        )
         return
 
     # Convert to PvB game
@@ -19846,7 +20144,7 @@ async def execute_group_challenge_game(update: Update, context: ContextTypes.DEF
         f"{emoji} <b>ROUND 1</b> {emoji}\n\n"
         f"Mode: {match['mode'].title()} ({mode_desc})\n"
         f"Target: First to {match.get('target_score', 1)} wins!\n\n"
-        f"<b>@{match['host_username']}, your turn!</b>\n"
+        f"<b>{display_at(match['host_username'])}, your turn!</b>\n"
         f"Send {match['rolls']} {emoji} to start!",
         parse_mode=ParseMode.HTML
     )
@@ -21009,31 +21307,48 @@ CHICKEN_ROAD_MAX_REQUEST_BODY_BYTES   = 8192  # Larger for step requests
 #   Hard:   p = 0.3333 (33.33% survival, 66.67% hit chance per block)
 #
 # This matches MyStake/Stake Chicken Cross game math exactly.
+# ============================================================================
+# CHICKEN ROAD MODES - Stake.com/MyStake-style provably fair configuration
+# ============================================================================
+# Each mode represents a different number of "bones" (dangers) per row.
+# The grid has 4 columns per row. The chicken must avoid the bones.
+#
+# Survival probability per step:
+#   Easy:   1 bone per row  -> 3 safe out of 4 -> p_survive = 0.75
+#   Medium: 2 bones per row -> 2 safe out of 4 -> p_survive = 0.50
+#   Hard:   3 bones per row -> 1 safe out of 4 -> p_survive = 0.25
+#
+# All modes use a consistent 7% house edge.
+# Multiplier at step n: M(n) = (1 - house_edge) / p_survive^n
+#
+# This is the exact formula used by Stake.com and other top-tier casinos.
+# The crash step follows a geometric distribution (provably fair via HMAC-SHA256).
+# ============================================================================
 CHICKEN_ROAD_MODES = {
     "easy": {
-        "p_survive": 0.70,        # 70% survival per step - more volatile than before (was 0.80)
-        "max_steps": 20,
+        "p_survive": 0.75,        # 3/4 safe columns (1 bone per row)
+        "max_steps": 10,          # 10 rows
         "label": "Easy",
         "color": "#22c55e",
-        "house_edge": 0.06,       # 6% house edge for easy (higher edge = lower RTP = harder to profit)
+        "house_edge": 0.07,       # 7% house edge (consistent across all modes)
     },
     "medium": {
-        "p_survive": 0.50,        # 50% survival per step (unchanged)
-        "max_steps": 15,
+        "p_survive": 0.50,        # 2/4 safe columns (2 bones per row)
+        "max_steps": 10,          # 10 rows
         "label": "Medium",
         "color": "#eab308",
-        "house_edge": 0.04,       # 4% house edge for medium
+        "house_edge": 0.07,       # 7% house edge
     },
     "hard": {
-        "p_survive": 0.3333,      # 33.33% survival (unchanged)
-        "max_steps": 12,
+        "p_survive": 0.25,        # 1/4 safe columns (3 bones per row)
+        "max_steps": 10,          # 10 rows
         "label": "Hard",
         "color": "#f97316",
-        "house_edge": 0.03,       # 3% house edge for hard (best RTP, hardest to win)
+        "house_edge": 0.07,       # 7% house edge
     },
 }
-CHICKEN_ROAD_HOUSE_EDGE = 0.04  # Default house edge (used only as fallback)
-CHICKEN_ROAD_RTP = 1.0 - CHICKEN_ROAD_HOUSE_EDGE  # 0.96 (fallback only)
+CHICKEN_ROAD_HOUSE_EDGE = 0.07  # Default house edge (used only as fallback)
+CHICKEN_ROAD_RTP = 1.0 - CHICKEN_ROAD_HOUSE_EDGE  # 0.93
 
 # Rate limiting state (mirrors plinko pattern)
 _chicken_road_rate_limits:   dict = {}   # {user_id: [timestamp, ...]}
@@ -22604,8 +22919,8 @@ async def pvp_timeout_finish_job(context: ContextTypes.DEFAULT_TYPE):
     rolling_username = match_data.get('usernames', {}).get(rolling_user_id, f"User {rolling_user_id}")
     idle_username = match_data.get('usernames', {}).get(idle_user_id, f"User {idle_user_id}")
     # Don't show @ for Bot
-    rolling_display = rolling_username if rolling_user_id == 0 else f"@{rolling_username}"
-    idle_display = idle_username if idle_user_id == 0 else f"@{idle_username}"
+    rolling_display = rolling_username if rolling_user_id == 0 else display_at(rolling_username)
+    idle_display = idle_username if idle_user_id == 0 else display_at(idle_username)
     rolling_mention = f'<a href="tg://user?id={rolling_user_id}">{rolling_display}</a>'
     idle_mention = f'<a href="tg://user?id={idle_user_id}">{idle_display}</a>'
 
@@ -22640,7 +22955,7 @@ async def pvp_timeout_finish_job(context: ContextTypes.DEFAULT_TYPE):
 
         final_winner_username = match_data.get('usernames', {}).get(final_winner, f"Player {final_winner}")
         # Don't show @ for Bot
-        final_winner_display = final_winner_username if final_winner == 0 else f"@{final_winner_username}"
+        final_winner_display = final_winner_username if final_winner == 0 else display_at(final_winner_username)
         final_winner_mention = f'<a href="tg://user?id={final_winner}">{final_winner_display}</a>'
 
         if final_winner != 0:
@@ -24448,6 +24763,9 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Cancel PvB timeout since user is rolling
             _cancel_pvb_timeout_jobs(context, user.id, active_pvb_game_id)
 
+            # Invalidate any active cashout button immediately (player chose to roll)
+            _active_cashout_buttons.pop(active_pvb_game_id, None)
+
             user_roll = update.message.dice.value
 
             # Add to user_rolls list
@@ -24667,11 +24985,47 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     game['waiting_for'] = 'user'
 
                     username_display = user.first_name if user.first_name else "Player"
+
+                    # Calculate cashout multiplier for PvB cashout button
+                    _co_match_id = active_pvb_game_id
+                    _co_round = game.get('current_round', 1)
+                    _co_mult = 0.93  # Default before any scoring
+                    try:
+                        # Build temporary match-like structure for probability calc
+                        _co_match_tmp = {
+                            "players": [user.id, 0],
+                            "points": {user.id: game.get('user_score', 0), 0: game.get('bot_score', 0)},
+                            "target_points": game.get('target_score', 1),
+                            "game_rolls": game_rolls,
+                            "game_mode": game.get('game_mode', 'normal'),
+                            "player_rolls": {user.id: [], 0: bot_rolls},
+                        }
+                        _co_mult = calculate_cashout_multiplier(_co_match_tmp)
+                    except Exception:
+                        pass
+
+                    # Build cashout button (green) + "Roll" instruction (blue)
+                    _co_keyboard = InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            f"Cashout ({_co_mult:.2f}x)",
+                            callback_data=f"pvb_cashout_{_co_match_id}_{_co_round}"
+                        )
+                    ]])
+
+                    # Register active cashout button
+                    _active_cashout_buttons[_co_match_id] = {
+                        "round": _co_round,
+                        "user_id": user.id,
+                        "chat_id": update.effective_chat.id,
+                    }
+
                     await update.message.reply_text(
                         f"{pe('robot')} <b>BOT ROLLED FIRST!</b>\n\n"
                         f"Bot rolled: [{bot_rolls_text}] = {bot_total}\n\n"
-                        f"{username_display}, Your turn! Send {game_rolls} {expected_emoji} to respond.",
-                        parse_mode=ParseMode.HTML
+                        f"{username_display}, Your turn! Send {game_rolls} {expected_emoji} to respond.\n"
+                        f"Or tap Cashout to collect <b>${round(game['bet_amount'] * _co_mult, 2):.2f}</b>:",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=_co_keyboard
                     )
 
                     # Schedule PvB timeout for next round
@@ -24838,8 +25192,8 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         p1_username = match_data.get('usernames', {}).get(p1, f"Player {p1}")
                         p2_username = match_data.get('usernames', {}).get(p2, f"Player {p2}")
                         # Don't show @ for Bot
-                        p1_display = p1_username if p1 == 0 else f"@{p1_username}"
-                        p2_display = p2_username if p2 == 0 else f"@{p2_username}"
+                        p1_display = p1_username if p1 == 0 else display_at(p1_username)
+                        p2_display = p2_username if p2 == 0 else display_at(p2_username)
                         p1_mention = f'<a href="tg://user?id={p1}">{p1_display}</a>'
                         p2_mention = f'<a href="tg://user?id={p2}">{p2_display}</a>'
 
@@ -24883,7 +25237,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     match_data.setdefault("points", {})[p2] = 0
                                 match_data["points"][winner_id] += 1
                                 winner_username = match_data.get('usernames', {}).get(winner_id, f'Player {winner_id}')
-                                winner_mention = f'<a href="tg://user?id={winner_id}">@{winner_username}</a>'
+                                winner_mention = f'<a href="tg://user?id={winner_id}">{display_at(winner_username)}</a>'
                                 text += f"{pe('win')} {winner_mention} wins this round!"
                                 if DEBUG_EMOJI_GAMES:
                                     logging.info(f"POINTS_UPDATED: {match_data['points']}")
@@ -24945,7 +25299,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 user_stats[loser_id]['game_sessions'].append(match_id)
 
                             final_winner_username = match_data.get('usernames', {}).get(final_winner, f"Player {final_winner}")
-                            final_winner_mention = f'<a href="tg://user?id={final_winner}">@{final_winner_username}</a>'
+                            final_winner_mention = f'<a href="tg://user?id={final_winner}">{display_at(final_winner_username)}</a>'
                             text += f"\n\n{pe('trophy')} <b>{final_winner_mention} wins the match and earns ${winnings:.2f}!</b>"
                             # Unpin the message
                             if 'pinned_message_id' in match_data:
@@ -25440,7 +25794,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_in_wallets(update.effective_user.id, update.effective_user.username, context=context)
     message_text = update.message.text.strip().split()
     if len(message_text) != 2:
-        await update.message.reply_text("Usage: /cancel <match_id | deal_id>")
+        await update.message.reply_text("Usage: /cancel <match_id | deal_id | raffle_id>")
         return
     item_id = message_text[1]
 
@@ -25495,7 +25849,52 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(deal['buyer']['id'], f"Your escrow deal {item_id} has been cancelled by the bot owner.")
         except Exception as e: logging.warning(f"Could not notify users about deal cancellation: {e}")
         return
-    await update.message.reply_text("No active match or deal found with that ID.")
+
+    # Check if it's a raffle
+    if item_id in active_raffles:
+        raffle = active_raffles[item_id]
+        prize = raffle.get('prize_usd', 0.0)
+        creator_id = raffle.get('creator')
+        ticket_participants = raffle.get('participants', {})
+
+        # Add raffle prize to house balance (not refunded to creator)
+        bot_settings["house_balance"] = bot_settings.get("house_balance", 0) + prize
+
+        # Refund ticket costs to all participants
+        refund_count = 0
+        for participant_id_str, participant_data in ticket_participants.items():
+            try:
+                pid = int(participant_id_str)
+                ticket_cost_paid = participant_data.get('paid', 0.0)
+                if ticket_cost_paid > 0:
+                    credit_wallet(pid, ticket_cost_paid)
+                    save_user_data(pid)
+                    refund_count += 1
+                    try:
+                        await context.bot.send_message(
+                            pid,
+                            f"{pe('warning')} Raffle <code>{item_id}</code> has been cancelled by admin.\n"
+                            f"Your ticket cost of ${ticket_cost_paid:.2f} has been refunded.",
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
+            except (ValueError, TypeError):
+                continue
+
+        # Remove from active raffles completely
+        del active_raffles[item_id]
+        save_bot_state()
+
+        await update.message.reply_text(
+            f"{pe('check')} Raffle <code>{item_id}</code> cancelled.\n"
+            f"Prize: ${prize:.2f} added to house balance.\n"
+            f"Refunded {refund_count} participant(s) ticket costs.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    await update.message.reply_text("No active match, deal, or raffle found with that ID.")
 
 # --- DICE INVITE HANDLER (accept/decline) ---
 @check_banned
@@ -28036,7 +28435,7 @@ async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for curr in SUPPORTED_CRYPTOS:
         emoji_key = crypto_emoji_map.get(curr, 'coin')
-        bal = get_wallet(user.id).get(curr, 0.0)
+        bal = ensure_wallet_dict(user.id).get(curr, 0.0)
         price = LIVE_PRICES.get(curr, 1.0)
         usd_val = bal * price if curr != 'USDT' else bal
 
@@ -28048,12 +28447,12 @@ async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([apply_button_style(
             InlineKeyboardButton(text, callback_data=f"setcurrency_{curr}"),
             'success' if curr == current_currency else 'primary',
-            peb(emoji_key)
+            None  # Removed custom emoji IDs to prevent Telegram API errors
         )])
 
     keyboard.append([apply_button_style(
         InlineKeyboardButton("Close", callback_data="close"),
-        'danger', peb('cross')
+        'danger', None
     )])
 
     sent = await update.message.reply_text(
@@ -29668,6 +30067,84 @@ async def cancel_withdrawal_conversation(update: Update, context: ContextTypes.D
     return ConversationHandler.END
 
 
+async def withdrawinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: Show withdrawal details and re-present approve/decline buttons.
+    If already processed, show the status and TXID."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Only the bot owner can use this command.")
+        return
+
+    args = update.message.text.strip().split()
+    if len(args) != 2:
+        await update.message.reply_text(
+            "Usage: /withdrawinfo <withdrawal_id>\n"
+            "Example: /withdrawinfo WD-240428-ABC123"
+        )
+        return
+
+    withdrawal_id = args[1]
+    withdrawal = withdrawal_requests.get(withdrawal_id)
+
+    if not withdrawal:
+        await update.message.reply_text(
+            f"{pe('cross')} Withdrawal request <code>{withdrawal_id}</code> not found.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    status = withdrawal.get("status", "unknown")
+    user_id = withdrawal.get("user_id", "N/A")
+    username = withdrawal.get("username", "N/A")
+    amount_usd = withdrawal.get("amount_usd", 0)
+    crypto_amount = withdrawal.get("crypto_amount", 0)
+    coin = withdrawal.get("coin", "USDT")
+    address = withdrawal.get("withdrawal_address", "N/A")
+    timestamp = withdrawal.get("timestamp", "N/A")
+    txid = withdrawal.get("txid")
+
+    formatted_crypto = format_crypto_amount(crypto_amount, coin) if crypto_amount else "N/A"
+
+    text = (
+        f"{pe('withdraw')} <b>Withdrawal Details</b>\n\n"
+        f"<b>Request ID:</b> <code>{withdrawal_id}</code>\n"
+        f"<b>User ID:</b> <code>{user_id}</code>\n"
+        f"<b>User:</b> @{username}\n"
+        f"<b>USD Value:</b> ${amount_usd:.2f}\n"
+        f"<b>Coin:</b> {coin}\n"
+        f"<b>Crypto Amount:</b> {formatted_crypto} {coin}\n"
+        f"<b>Address:</b> <code>{address}</code>\n"
+        f"<b>Requested:</b> {timestamp}\n"
+    )
+
+    if status == "pending":
+        text += f"\n<b>Status:</b> {pe('warning')} <b>PENDING</b>"
+        # Show approve/decline buttons (fresh ones that won't expire)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Approve", callback_data=f"withdrawal_approve_{withdrawal_id}"),
+             InlineKeyboardButton("Cancel", callback_data=f"withdrawal_cancel_{withdrawal_id}")]
+        ])
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    elif status == "approved":
+        approved_at = withdrawal.get("approved_at", "N/A")
+        text += (
+            f"\n<b>Status:</b> {pe('check')} <b>APPROVED</b>\n"
+            f"<b>Approved At:</b> {approved_at}\n"
+            f"<b>TXID:</b> <code>{txid or 'N/A'}</code>"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    elif status == "cancelled":
+        cancelled_at = withdrawal.get("cancelled_at", "N/A")
+        text += (
+            f"\n<b>Status:</b> {pe('cross')} <b>CANCELLED</b>\n"
+            f"<b>Cancelled At:</b> {cancelled_at}\n"
+            f"Funds were returned to user's balance."
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    else:
+        text += f"\n<b>Status:</b> {status.upper()}"
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
 async def recover_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != 'private':
         await update.message.reply_text("For security, please use the /recover command in a private chat with me.")
@@ -30157,7 +30634,7 @@ async def _cleanup_game_sessions():
 
             if status == 'active' and age_hours > 2:
                 to_delete.append(game_id)   # abandoned
-            elif status in ('completed', 'cancelled', 'error', 'declined') and age_hours > 1:
+            elif status in ('completed', 'cancelled', 'error', 'declined', 'cashout') and age_hours > 1:
                 to_delete.append(game_id)   # was 24h, now 1h for completed
             elif status == 'pending' and age_hours > 0.167:   # 10 min
                 to_delete.append(game_id)
@@ -30188,6 +30665,11 @@ async def _cleanup_game_sessions():
             lock = _wallet_locks.get(uid)
             if lock and not lock.locked():
                 _wallet_locks.pop(uid, None)
+
+        # Clean up stale cashout buttons
+        stale_co = [mid for mid, co in list(_active_cashout_buttons.items()) if mid not in game_sessions]
+        for mid in stale_co:
+            _active_cashout_buttons.pop(mid, None)
 
         # Clean up active games index for stale entries
         for uid in list(_user_active_games_index.keys()):
@@ -31249,12 +31731,12 @@ async def sidebets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     f"{pe('live')} <b>LIVE SIDE BET ODDS</b> {pe('live')}\n\n"
                     f"{pe(game_type)} <b>{game_type.upper()} Match</b> (ID: <code>{match_id}</code>)\n\n"
-                    f"{pe('user')} @{p1_name}: Score {odds['p1_score']}\n"
-                    f"{'   ' + pe('robot') + ' ' if p2 == 0 else '   ' + pe('user') + ' @'}{p2_name}: Score {odds['p2_score']}\n"
+                    f"{pe('user')} {display_at(p1_name)}: Score {odds['p1_score']}\n"
+                    f"   {pe('robot') + ' Bot' if p2 == 0 else pe('user') + ' ' + display_at(p2_name)}: Score {odds['p2_score']}\n"
                     f"{pe('trophy')} Target: First to {odds['target']}\n\n"
                     f"{pe('odds')} <b>Live Multipliers:</b>\n"
-                    f"   {pe('high')} @{p1_name} wins: <b>{odds['mult_win_p1']}x</b> ({odds['p_win_p1']*100:.1f}% chance)\n"
-                    f"   {pe('low')} {'Bot' if p2 == 0 else '@' + p2_name} wins: <b>{odds['mult_win_p2']}x</b> ({odds['p_win_p2']*100:.1f}% chance)\n\n"
+                    f"   {pe('high')} {display_at(p1_name)} wins: <b>{odds['mult_win_p1']}x</b> ({odds['p_win_p1']*100:.1f}% chance)\n"
+                    f"   {pe('low')} {'Bot' if p2 == 0 else display_at(p2_name)} wins: <b>{odds['mult_win_p2']}x</b> ({odds['p_win_p2']*100:.1f}% chance)\n\n"
                     f"{pe('warning')} <i>Multipliers change dynamically based on game progress. Place bets using:</i>\n"
                     f"<code>/win amount</code> (reply to player msg) - Bet player wins\n"
                     f"<code>/lose amount</code> (reply to player msg) - Bet player loses"
@@ -31295,7 +31777,7 @@ async def sidebets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   - Bets lock when probability exceeds 98%\n"
         f"   - House edge: {SIDEBET_HOUSE_EDGE*100:.0f}%\n"
         f"   - Multipliers can change after each roll\n"
-        f"   - You cannot bet on your own games",
+        f"   - Multipliers can change based on game state",
         parse_mode=ParseMode.HTML
     )
 
@@ -31348,14 +31830,8 @@ async def win_bet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Cannot bet on own game
+    # Players can now bet on their own matches too
     players = match_data.get("players", [])
-    if user.id in players or match_data.get("user_id") == user.id:
-        await update.message.reply_text(
-            f"{pe('cross')} You cannot place side bets on your own game!",
-            parse_mode=ParseMode.HTML
-        )
-        return
 
     # Calculate odds
     odds = calculate_match_win_probability(match_data)
@@ -31420,7 +31896,7 @@ async def win_bet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_name = normalize_username(target_user.username) or f"Player {target_user.id}"
     await update.message.reply_text(
         f"{pe('sidebet')} <b>Side Bet Placed!</b>\n\n"
-        f"{pe('confirm')} Betting @{target_name} <b>WINS</b>\n"
+        f"{pe('confirm')} Betting {display_at(target_name)} <b>WINS</b>\n"
         f"{pe('money')} Amount: {currency_symbol}{bet_amount_currency:.2f}\n"
         f"{pe('lightning')} Multiplier: <b>{bet_multiplier}x</b>\n"
         f"{pe('money')} Potential payout: <b>{currency_symbol}{bet_amount_usd * bet_multiplier:.2f}</b>\n\n"
@@ -31478,14 +31954,8 @@ async def lose_bet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Cannot bet on own game
+    # Players can now bet on their own matches too
     players = match_data.get("players", [])
-    if user.id in players or match_data.get("user_id") == user.id:
-        await update.message.reply_text(
-            f"{pe('cross')} You cannot place side bets on your own game!",
-            parse_mode=ParseMode.HTML
-        )
-        return
 
     # Calculate odds
     odds = calculate_match_win_probability(match_data)
@@ -31550,7 +32020,7 @@ async def lose_bet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_name = normalize_username(target_user.username) or f"Player {target_user.id}"
     await update.message.reply_text(
         f"{pe('sidebet')} <b>Side Bet Placed!</b>\n\n"
-        f"{pe('cross')} Betting @{target_name} <b>LOSES</b>\n"
+        f"{pe('cross')} Betting {display_at(target_name)} <b>LOSES</b>\n"
         f"{pe('money')} Amount: {currency_symbol}{bet_amount_currency:.2f}\n"
         f"{pe('lightning')} Multiplier: <b>{bet_multiplier}x</b>\n"
         f"{pe('money')} Potential payout: <b>{currency_symbol}{bet_amount_usd * bet_multiplier:.2f}</b>\n\n"
@@ -31591,7 +32061,7 @@ async def resolve_sidebets_for_match(match_id: str, winner_player_index: str, co
                     await context.bot.send_message(
                         chat_id=chat_id,
                         text=f"{pe('sidebet')} {pe('win')} <b>Side Bet Won!</b>\n\n"
-                             f"@{bettor_name} won <b>${payout:.2f}</b> ({multiplier}x) on side bet!",
+                             f"{display_at(bettor_name)} won <b>${payout:.2f}</b> ({multiplier}x) on side bet!",
                         parse_mode=ParseMode.HTML
                     )
             except Exception as e:
@@ -31603,6 +32073,178 @@ async def resolve_sidebets_for_match(match_id: str, winner_player_index: str, co
 
         save_user_data(bettor_id)
         # Clean up
+        active_sidebets.pop(sb_id, None)
+
+
+# ============================================================================
+# PVB CASHOUT SYSTEM - Allows players to cash out during PvB emoji games
+# ============================================================================
+# Cashout multiplier = p_player_wins * 2 * (1 - CASHOUT_HOUSE_EDGE)
+# Initially (before any rolls): 0.5 * 2 * 0.93 = 0.93x
+# After bot rolls and player hasn't yet: recalculated based on live odds
+# House edge on cashout: 7%
+# ============================================================================
+CASHOUT_HOUSE_EDGE = 0.07  # 7% house edge on cashouts
+
+# Track active cashout button message IDs to invalidate them
+# {match_id: {"message_id": int, "chat_id": int, "round": int, "user_id": int}}
+_active_cashout_buttons: dict = {}
+
+
+def calculate_cashout_multiplier(match_data: dict) -> float:
+    """Calculate the cashout multiplier for the player in a PvB game.
+    Returns the multiplier (e.g., 0.93x at start, higher if player is ahead)."""
+    odds = calculate_match_win_probability(match_data)
+    players = match_data.get("players", [])
+    if len(players) < 2:
+        return 0.93
+
+    # Player is always p1 in PvB (bot is p2 = 0)
+    p_player_wins = odds.get("p_win_p1", 0.5)
+
+    # Cashout = probability * full_payout * (1 - house_edge)
+    # Full payout in PvB is bet * 2 (winner takes all minus house fee)
+    # So cashout_multiplier = p * 2 * (1 - edge)
+    multiplier = p_player_wins * 2 * (1 - CASHOUT_HOUSE_EDGE)
+
+    return round(multiplier, 2)
+
+
+def is_pvb_game(match_data: dict) -> bool:
+    """Check if a game session is a PvB (Player vs Bot) game."""
+    players = match_data.get("players", [])
+    return 0 in players and match_data.get("status") == "active"
+
+
+async def pvb_cashout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle cashout button press in PvB emoji games."""
+    query = update.callback_query
+    user = query.from_user
+
+    # Parse callback data: pvb_cashout_{match_id}_{round}
+    parts = query.data.split("_")
+    if len(parts) < 4:
+        await query.answer("Invalid cashout request.", show_alert=True)
+        return
+
+    match_id = parts[2]
+    cashout_round = int(parts[3]) if len(parts) > 3 else 0
+
+    match_data = game_sessions.get(match_id)
+    if not match_data:
+        await query.answer("Game no longer exists.", show_alert=True)
+        return
+
+    # Verify this is the correct player (STRICT: only the game player can cashout)
+    players = match_data.get("players", [])
+    player_id = [p for p in players if p != 0]
+    if not player_id or user.id != player_id[0]:
+        await query.answer("This cashout button is not for you.", show_alert=True)
+        return
+
+    # Check if the cashout button is still valid (not expired by a new round/roll)
+    active_co = _active_cashout_buttons.get(match_id)
+    if not active_co or active_co.get("round") != cashout_round:
+        await query.answer("This cashout button has expired.", show_alert=True)
+        return
+
+    # Invalidate the cashout button immediately
+    _active_cashout_buttons.pop(match_id, None)
+
+    if match_data.get("status") != "active":
+        await query.answer("Game is no longer active.", show_alert=True)
+        return
+
+    await query.answer()
+
+    # Calculate cashout amount
+    bet_amount = match_data.get("bet_amount_usd", match_data.get("bet_amount", 0))
+    cashout_mult = calculate_cashout_multiplier(match_data)
+    cashout_amount = round(bet_amount * cashout_mult, 2)
+
+    # Credit the player
+    credit_wallet(user.id, cashout_amount)
+    save_user_data(user.id)
+
+    # Mark game as completed with cashout
+    match_data["status"] = "cashout"
+    match_data["cashout_amount"] = cashout_amount
+    match_data["cashout_multiplier"] = cashout_mult
+
+    # Update house balance (house keeps bet - cashout)
+    house_profit = bet_amount - cashout_amount
+    bot_settings["house_balance"] = bot_settings.get("house_balance", 0) + house_profit
+
+    # Unpin if pinned
+    chat_id = match_data.get("chat_id")
+    if 'pinned_message_id' in match_data and chat_id:
+        try:
+            await context.bot.unpin_chat_message(chat_id, match_data['pinned_message_id'])
+        except Exception:
+            pass
+
+    # Send cashout confirmation
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"{pe('cashout')} <b>CASHOUT!</b>\n\n"
+                f"{user.mention_html()} cashed out of their match!\n"
+                f"{pe('money')} Cashout: <b>${cashout_amount:.2f}</b> ({cashout_mult}x)\n"
+                f"{pe('money')} Original bet: ${bet_amount:.2f}\n\n"
+                f"Match ID: <code>{match_id}</code>"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logging.error(f"Failed to send cashout message: {e}")
+
+    # Void and refund all side bets on this match
+    await void_sidebets_for_cashout(match_id, context)
+
+    # Clean up
+    game_sessions[match_id] = match_data
+    _unindex_user_game(user.id, match_id)
+
+
+async def void_sidebets_for_cashout(match_id: str, context):
+    """Void all side bets for a match where a player cashed out.
+    Refund all bettors and notify them via DM."""
+    if match_id not in match_sidebets:
+        return
+
+    sidebet_ids = match_sidebets.pop(match_id, [])
+    for sb_id in sidebet_ids:
+        sb = active_sidebets.get(sb_id)
+        if not sb or sb.get("status") != "active":
+            continue
+
+        bettor_id = sb["bettor_id"]
+        bet_amount = sb["bet_amount_usd"]
+
+        # Refund the bettor
+        credit_wallet(bettor_id, bet_amount)
+        sb["status"] = "voided"
+        sb["void_reason"] = "Player cashed out"
+        save_user_data(bettor_id)
+
+        # Notify bettor via DM
+        try:
+            bettor_name = sb.get("bettor_username", f"User {bettor_id}")
+            await context.bot.send_message(
+                chat_id=bettor_id,
+                text=(
+                    f"{pe('warning')} <b>Side Bet Voided</b>\n\n"
+                    f"Your side bet (ID: <code>{sb_id}</code>) has been voided because "
+                    f"the player cashed out of the match.\n\n"
+                    f"{pe('money')} <b>Refund: ${bet_amount:.2f}</b> has been returned to your wallet.\n\n"
+                    f"Match ID: <code>{match_id}</code>"
+                ),
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logging.warning(f"Could not notify bettor {bettor_id} about voided sidebet: {e}")
+
         active_sidebets.pop(sb_id, None)
 
 
@@ -32000,8 +32642,10 @@ def main():
     app.add_handler(CommandHandler("achievements", achievements_command, block=False))
     app.add_handler(CommandHandler("language", language_command, block=False))
     app.add_handler(CommandHandler(["currency", "cur"], currency_command, block=False))
+    app.add_handler(CommandHandler(["maxbet", "limits"], maxbet_command, block=False))
     app.add_handler(CommandHandler("admin", admin_dashboard_command, block=False))
     app.add_handler(CommandHandler("setbal", setbal_command, block=False))
+    app.add_handler(CommandHandler("withdrawinfo", withdrawinfo_command, block=False))
     app.add_handler(CommandHandler("resetleaderboard", resetleaderboard_command, block=False))
     app.add_handler(CommandHandler("setdaily", setdaily_command, block=False)) # NEW
     app.add_handler(CommandHandler("dailyoff", dailyoff_command, block=False)) # NEW
@@ -32167,7 +32811,11 @@ def main():
     app.add_handler(CallbackQueryHandler(group_challenge_target_callback, pattern=r"^gc_target_", block=False))
     app.add_handler(CallbackQueryHandler(group_challenge_accept_callback, pattern=r"^gc_accept_", block=False))
     app.add_handler(CallbackQueryHandler(group_challenge_playbot_callback, pattern=r"^gc_playbot_", block=False))
+    app.add_handler(CallbackQueryHandler(group_challenge_cancel_callback, pattern=r"^gc_cancel_", block=False))
     app.add_handler(CallbackQueryHandler(group_challenge_botfirst_callback, pattern=r"^gc_botfirst_", block=False))
+
+    # PvB Cashout handler
+    app.add_handler(CallbackQueryHandler(pvb_cashout_callback, pattern=r"^pvb_cashout_", block=False))
 
     # 5. XdXw handlers
     app.add_handler(CallbackQueryHandler(xdxw_mode_callback, pattern=r"^xdxw_mode_|^xdxw_cancel$", block=False))
