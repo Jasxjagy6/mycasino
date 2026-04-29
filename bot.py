@@ -33334,14 +33334,21 @@ async def leaderboard_referral_command(update: Update, context: ContextTypes.DEF
         sent_message = await update.message.reply_text(f"{pe('push')} Referral Leaderboard", parse_mode=ParseMode.HTML, reply_markup=reply_markup)
     set_menu_owner(sent_message, update.effective_user.id)
 
-async def _event_loop_watchdog():
+async def _event_loop_watchdog(application=None):
     """Watchdog task to confirm event loop is still running.
 
     PERFORMANCE: Ticks every 30s and only logs at DEBUG on the happy path.
     The old INFO-every-10s write caused noticeable log volume (+file I/O
     every 10s) that served no operational purpose once we know the loop is
     alive. WARNING logs still fire on anomalies (queue backlog, task
-    explosions) which is what operators actually care about."""
+    explosions) which is what operators actually care about.
+
+    The PTB application is passed in from ``post_init`` so we can inspect
+    its update queue. The previous version referenced a bare ``app`` name
+    which only existed as a local in ``main()``, so every queue-check tick
+    raised ``NameError: name 'app' is not defined`` and got swallowed into
+    a recurring ``[WATCHDOG] Error checking queue`` log line.
+    """
     counter = 0
     last_task_count = 0
     while True:
@@ -33363,10 +33370,12 @@ async def _event_loop_watchdog():
             )
         last_task_count = task_count
 
+        if application is None:
+            continue
         try:
-            app_instance = app
-            if hasattr(app_instance, 'update_queue'):
-                qsize = app_instance.update_queue.qsize()
+            update_queue = getattr(application, 'update_queue', None)
+            if update_queue is not None and hasattr(update_queue, 'qsize'):
+                qsize = update_queue.qsize()
                 if qsize > 100:
                     logging.warning(
                         f"[WATCHDOG] Update queue backed up: {qsize} pending"
@@ -33385,8 +33394,10 @@ async def post_init(application: Application):
     # during startup was just noise, not a useful signal.
     logging.info("post_init starting...")
     
-    # Start event loop watchdog
-    application.create_task(_event_loop_watchdog())
+    # Start event loop watchdog (passes the PTB application so the
+    # watchdog can inspect update_queue without relying on a module-level
+    # ``app`` name that doesn't exist).
+    application.create_task(_event_loop_watchdog(application))
     logging.info("Event loop watchdog started")
     
     # Initialize PostgreSQL pool and load data if enabled
