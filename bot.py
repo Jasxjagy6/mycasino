@@ -14573,258 +14573,400 @@ def generate_bj_image(
     split_bets: list = None,  # List of bet amounts for each split hand
     split_results: list = None,  # List of results for completed hands: [{status, value}]
 ) -> BytesIO:
-    """
-    Render a 800x500 (or 800x600 for split) blackjack table image with neon bluish-black theme.
+    """Render the blackjack table image — circuit-board / neon-result design.
 
-    - dealer_hand[0] is always shown face-up.
-    - dealer_hand[1] is hidden unless show_dealer_hole=True.
-    - Additional dealer cards (index 2+) are always shown face-up.
-    - Player profile pic + name at top left
-    - Bot username at top right
-    - For split mode: shows two player hands with blue highlight on active hand
-    - Returns a BytesIO PNG buffer.
+    Mirrors ``example_designs/blackjack_pil_image_template_design.png``.
+    Layout:
+      - Wide canvas with a navy → faint-purple gradient + decorative
+        circuit-board lines on the left and right edges.
+      - Wireframe-mesh head avatar in the top-left, "@bot_username" in
+        the top-right (blue).
+      - Gold "DEALER" pill at top-centre + "Value: N" below it.
+      - Dealer cards centred below the pill.
+      - Glowing red "result band" overlapping the dealer card row when a
+        result is set (e.g. "Dealer Wins" / "Player Wins" / "Push" /
+        "Blackjack!").
+      - Gold "PLAYER" label below the band, then either a single hand or
+        the split hands side-by-side. Hand 1 / Hand 2 labels are coloured
+        gold and red respectively (red = currently active in split mode
+        when the active hand is index 1, else gold).
+      - Bottom info bar: "Bet: $X" left, "BLACKJACK ALSO SUPPORTS SPLIT"
+        with a dice glyph centre, "BLACKJACK" gold + diamond right.
+      - Footer hairline: "Play Responsibly • Telegram Casino • blackjack".
     """
+    from PIL import ImageFilter as _ImgFilter
+
     is_split = split_hands is not None and len(split_hands) >= 2
-    # Slightly taller canvas to leave room for the new info bar + footer.
-    W, H = (800, 640) if is_split else (800, 540)
-    img = Image.new("RGB", (W, H), BJ_TABLE_COLOR)
+    W, H = (1100, 820) if is_split else (1100, 720)
+
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Background gradient effect (subtle radial glow from center)
-    center_x, center_y = W // 2, H // 2
-    for radius in range(250, 0, -15):
-        alpha = int(12 * (radius / 250))
-        glow_color = (8 + alpha, 12 + alpha // 2, 28 + alpha)
-        draw.ellipse(
-            [center_x - radius * 2, center_y - radius, center_x + radius * 2, center_y + radius],
-            fill=glow_color
-        )
+    # ── BACKGROUND: navy → faint purple ──────────────────────
+    BG_TOP = (4, 8, 28)
+    BG_MID = (10, 8, 36)
+    BG_BOT = (28, 14, 50)
+    for yy in range(H):
+        t = yy / H
+        if t < 0.5:
+            u = t * 2
+            r = int(BG_TOP[0] + u * (BG_MID[0] - BG_TOP[0]))
+            g = int(BG_TOP[1] + u * (BG_MID[1] - BG_TOP[1]))
+            b = int(BG_TOP[2] + u * (BG_MID[2] - BG_TOP[2]))
+        else:
+            u = (t - 0.5) * 2
+            r = int(BG_MID[0] + u * (BG_BOT[0] - BG_MID[0]))
+            g = int(BG_MID[1] + u * (BG_BOT[1] - BG_MID[1]))
+            b = int(BG_MID[2] + u * (BG_BOT[2] - BG_MID[2]))
+        draw.line([(0, yy), (W, yy)], fill=(r, g, b))
 
-    # Background felt texture (subtle grid lines)
-    for gx in range(0, W, 40):
-        draw.line([(gx, 0), (gx, H)], fill=BJ_FELT_LINE, width=1)
-    for gy in range(0, H, 40):
-        draw.line([(0, gy), (W, gy)], fill=BJ_FELT_LINE, width=1)
+    # ── DECORATIVE CIRCUIT-BOARD LINES ───────────────────────
+    rng = random.Random(7)
+    line_color = (50, 35, 100)
+    pad_color  = (90, 60, 160)
+    band_y = H // 2 - 30
+    # Horizontal lines extending into the side margins (matches the template's
+    # circuit traces flanking the result band).
+    for side, x_start, sign in (
+        ("L", 20, 1), ("L", 20, 1), ("R", W - 20, -1), ("R", W - 20, -1),
+    ):
+        offset = rng.randint(-40, 40)
+        ly = band_y + offset
+        seg_n = rng.randint(2, 4)
+        cur_x = x_start
+        cur_y = ly
+        for _ in range(seg_n):
+            seg_len = rng.randint(60, 140)
+            draw.line([(cur_x, cur_y), (cur_x + sign * seg_len, cur_y)],
+                      fill=line_color, width=1)
+            cur_x += sign * seg_len
+            step = rng.choice([-30, -22, 22, 30])
+            draw.line([(cur_x, cur_y), (cur_x, cur_y + step)],
+                      fill=line_color, width=1)
+            cur_y += step
+        draw.ellipse([cur_x - 3, cur_y - 3, cur_x + 3, cur_y + 3],
+                     fill=pad_color)
+    # Generic mesh.
+    for _ in range(60):
+        sx = rng.choice([rng.randint(0, 90), rng.randint(W - 90, W - 1)])
+        sy = rng.randint(40, H - 80)
+        sl = rng.randint(40, 110)
+        sign = 1 if sx < W // 2 else -1
+        draw.line([(sx, sy), (sx + sign * sl, sy)],
+                  fill=line_color, width=1)
+    # Sparkle dots.
+    for _ in range(70):
+        sx, sy = rng.randint(0, W), rng.randint(0, H)
+        br = rng.randint(40, 130)
+        draw.ellipse([sx - 1, sy - 1, sx + 1, sy + 1], fill=(br, br, br + 20))
 
-    # Top header bar area
-    header_y = 50
+    # ── WIREFRAME HEAD (top-left) ───────────────────────────
+    head_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    head_draw = ImageDraw.Draw(head_layer)
+    h_cx, h_cy, h_rx, h_ry = 92, 100, 56, 70
+    head_draw.ellipse([h_cx - h_rx, h_cy - h_ry, h_cx + h_rx, h_cy + h_ry],
+                      outline=(70, 200, 255, 220), width=2)
+    for ang in range(-80, 81, 18):
+        rad = math.radians(ang)
+        x = h_cx + math.sin(rad) * h_rx
+        head_draw.line([(int(x), h_cy - h_ry), (int(x), h_cy + h_ry)],
+                       fill=(60, 170, 230, 110), width=1)
+    for ang in range(-70, 71, 18):
+        rad = math.radians(ang)
+        yy = h_cy + math.sin(rad) * h_ry
+        head_draw.line([(h_cx - h_rx, int(yy)), (h_cx + h_rx, int(yy))],
+                       fill=(60, 170, 230, 90), width=1)
+    head_draw.ellipse([h_cx - 3, h_cy - 5, h_cx + 3, h_cy + 1],
+                      fill=(180, 230, 255, 255))
+    head_layer = head_layer.filter(_ImgFilter.GaussianBlur(radius=0.5))
+    img.alpha_composite(head_layer)
 
-    # Player profile pic area at top left (50x50 circle placeholder)
-    profile_pic_size = 50
-    profile_pic_x, profile_pic_y = 15, 10
-
-    # Draw profile pic circle background
-    draw.ellipse(
-        [profile_pic_x, profile_pic_y, profile_pic_x + profile_pic_size, profile_pic_y + profile_pic_size],
-        fill=BJ_BORDER,
-        outline=BJ_ACCENT,
-        width=2
-    )
-
-    # If profile pic image provided, paste it (clipped to circle)
-    if player_profile_pic:
-        try:
-            profile_pic_resized = player_profile_pic.resize((profile_pic_size - 4, profile_pic_size - 4), Image.LANCZOS)
-            # Create circular mask
-            mask = Image.new("L", (profile_pic_size - 4, profile_pic_size - 4), 0)
-            mask_draw = ImageDraw.Draw(mask)
-            mask_draw.ellipse([0, 0, profile_pic_size - 4, profile_pic_size - 4], fill=255)
-            img_rgba = img.convert("RGBA")
-            profile_rgba = profile_pic_resized.convert("RGBA")
-            profile_rgba.putalpha(mask)
-            img_rgba.paste(profile_rgba, (profile_pic_x + 2, profile_pic_y + 2), profile_rgba)
-            img = img_rgba.convert("RGB")
-            draw = ImageDraw.Draw(img)
-        except Exception:
-            pass
-
-    # Player name next to profile pic
-    font_player = _bj_get_font(16)
-    if player_username:
-        display_name = f"@{player_username}" if not player_username.startswith("@") else player_username
-        draw.text((profile_pic_x + profile_pic_size + 10, profile_pic_y + 12), display_name, font=font_player, fill=BJ_TEXT_WHITE)
-
-    # Bot username at top right corner + Telegram Casino subtitle
-    font_wm = _bj_get_font(16)
-    font_wm_sub = _bj_get_font(11)
+    # ── TOP-RIGHT BOT USERNAME ──────────────────────────────
+    font_bot = _bj_get_font(28)
     wm_text = f"@{bot_username}" if not bot_username.startswith("@") else bot_username
-    wm_w = draw.textlength(wm_text, font=font_wm)
-    draw.text((W - wm_w - 15, 14), wm_text, font=font_wm, fill=BJ_ACCENT)
-    sub_label = "Telegram Casino"
-    sub_w = draw.textlength(sub_label, font=font_wm_sub)
-    draw.text((W - sub_w - 15, 34), sub_label, font=font_wm_sub, fill=BJ_TEXT_LIGHT)
+    wm_w = draw.textlength(wm_text, font=font_bot)
+    draw.text((W - wm_w - 30, 30), wm_text, font=font_bot, fill=(90, 200, 255))
 
-    # Decorative divider line below header
-    draw.line([(15, header_y + 5), (W - 15, header_y + 5)], fill=BJ_BORDER, width=1)
+    # ── DEALER PILL ─────────────────────────────────────────
+    font_pill = _bj_get_font(22)
+    dealer_lbl = "DEALER"
+    dlw = draw.textlength(dealer_lbl, font=font_pill)
+    pill_w = int(dlw + 70)
+    pill_h = 44
+    pill_x = (W - pill_w) // 2
+    pill_y = 50
+    draw.rounded_rectangle(
+        [pill_x, pill_y, pill_x + pill_w, pill_y + pill_h],
+        radius=20, fill=(28, 18, 8), outline=BJ_TEXT_GOLD, width=2,
+    )
+    draw.text((pill_x + (pill_w - dlw) / 2, pill_y + 8),
+              dealer_lbl, font=font_pill, fill=BJ_TEXT_GOLD)
 
-    # Divider line between dealer and player sections
-    draw.line([(30, H // 2 + 10), (W - 30, H // 2 + 10)], fill=BJ_BORDER, width=1)
-
-    font_label  = _bj_get_font(18)
-    font_value  = _bj_get_font(20)
-    font_result = _bj_get_font(32)
-    font_info   = _bj_get_font(15)
-    font_small  = _bj_get_font(13)
-
-    # Offset content below header
-    content_offset = header_y + 15
-
-    # DEALER section
-    draw.text((40, content_offset), "DEALER", font=font_label, fill=BJ_TEXT_GOLD)
-
-    # Calculate dealer display value
-    if show_dealer_hole:
-        d_val_str = f"Value: {dealer_value}" if dealer_value else ""
+    # Dealer value text below pill.
+    font_val = _bj_get_font(22)
+    if show_dealer_hole and dealer_value is not None:
+        dv_str = f"Value: {dealer_value}"
+    elif dealer_value is not None and len(dealer_hand or []) > 0:
+        dv_str = f"Value: ?"
     else:
-        # Only show value of the visible card
-        if dealer_hand:
-            rank0, _ = _bj_parse_card(dealer_hand[0])
-            if rank0 in ('J', 'Q', 'K'):
-                visible_val = 10
-            elif rank0 == 'A':
-                visible_val = 11
-            else:
-                try:
-                    visible_val = int(rank0)
-                except ValueError:
-                    visible_val = 0
-            d_val_str = f"Shows: {visible_val}"
-        else:
-            d_val_str = ""
+        dv_str = ""
+    if dv_str:
+        dvw = draw.textlength(dv_str, font=font_val)
+        draw.text(((W - dvw) / 2, pill_y + pill_h + 6),
+                  dv_str, font=font_val, fill=BJ_TEXT_WHITE)
 
-    draw.text((40, content_offset + 20), d_val_str, font=font_value, fill=BJ_TEXT_LIGHT)
+    # ── DEALER CARDS ────────────────────────────────────────
+    dealer_cards = list(dealer_hand or [])
+    n_dealer = len(dealer_cards)
+    # Larger card size for visual presence.
+    CARD_W2 = int(BJ_CARD_W * 1.4)
+    CARD_H2 = int(BJ_CARD_H * 1.4)
+    card_gap = 10
+    dealer_row_w = n_dealer * CARD_W2 + (n_dealer - 1) * card_gap if n_dealer else 0
+    dealer_x0 = (W - dealer_row_w) // 2
+    dealer_y0 = pill_y + pill_h + 50
 
-    # Draw dealer cards starting x=40, y=content_offset + 45
-    dx, dy = 40, content_offset + 45
-    for i, card_str in enumerate(dealer_hand):
-        rank, suit = _bj_parse_card(card_str)
+    # Save current image temporarily as RGB for card drawing helpers, then we
+    # composite back. Use an RGB buffer to leverage the existing helpers.
+    rgb_img = img.convert("RGB")
+    rgb_draw = ImageDraw.Draw(rgb_img)
+
+    def _draw_card_scaled(rgb_draw_, x, y, rank, suit, scale=1.4):
+        """Draw a single face-up card scaled up from the base 78x110 template."""
+        cw = int(BJ_CARD_W * scale)
+        ch = int(BJ_CARD_H * scale)
+        # Shadow.
+        rgb_draw_.rounded_rectangle([x + 3, y + 3, x + cw + 3, y + ch + 3],
+                                     radius=BJ_CARD_RADIUS + 2,
+                                     fill=(0, 0, 0))
+        rgb_draw_.rounded_rectangle([x, y, x + cw, y + ch],
+                                     radius=BJ_CARD_RADIUS + 2,
+                                     fill=BJ_CARD_BG,
+                                     outline=(180, 180, 180), width=1)
+        color = BJ_RED if suit in ('♥', '♦') else BJ_BLACK_SUIT
+        f_rank = _bj_get_font(int(28 * scale / 1.4))
+        f_suit_corner = _bj_get_font(int(24 * scale / 1.4))
+        f_suit_center = _bj_get_font(int(54 * scale / 1.4))
+        # Top-left rank + suit.
+        rgb_draw_.text((x + 8, y + 6), rank, font=f_rank, fill=color)
+        rgb_draw_.text((x + 8, y + 6 + int(28 * scale / 1.4)), suit,
+                       font=f_suit_corner, fill=color)
+        # Center suit pip.
+        cx = x + cw // 2
+        cy = y + ch // 2
+        sw = rgb_draw_.textlength(suit, font=f_suit_center)
+        rgb_draw_.text((cx - sw / 2, cy - int(36 * scale / 1.4)),
+                       suit, font=f_suit_center, fill=color)
+        # Bottom-right (rotated-feel) rank + suit.
+        rgb_draw_.text((x + cw - 22, y + ch - int(60 * scale / 1.4)),
+                       rank, font=f_rank, fill=color)
+        rgb_draw_.text((x + cw - 22, y + ch - int(34 * scale / 1.4)),
+                       suit, font=f_suit_corner, fill=color)
+
+    def _draw_hidden_scaled(rgb_draw_, x, y, scale=1.4):
+        cw = int(BJ_CARD_W * scale)
+        ch = int(BJ_CARD_H * scale)
+        rgb_draw_.rounded_rectangle([x + 3, y + 3, x + cw + 3, y + ch + 3],
+                                     radius=BJ_CARD_RADIUS + 2,
+                                     fill=(0, 0, 0))
+        rgb_draw_.rounded_rectangle([x, y, x + cw, y + ch],
+                                     radius=BJ_CARD_RADIUS + 2,
+                                     fill=BJ_CARD_BACK,
+                                     outline=(80, 80, 160), width=2)
+        for i in range(-ch, cw, 14):
+            rgb_draw_.line([(x + i, y), (x + i + ch, y + ch)],
+                            fill=(40, 60, 140), width=1)
+        f = _bj_get_font(int(28 * scale / 1.4))
+        rgb_draw_.text((x + cw // 2 - 10, y + ch // 2 - 16),
+                       "?", font=f, fill=(100, 120, 220))
+
+    for i, c in enumerate(dealer_cards):
+        cx = dealer_x0 + i * (CARD_W2 + card_gap)
         if i == 1 and not show_dealer_hole:
-            _bj_draw_hidden_card(draw, dx, dy)
+            _draw_hidden_scaled(rgb_draw, cx, dealer_y0)
         else:
-            _bj_draw_card(draw, dx, dy, rank, suit)
-        dx += BJ_CARD_W + 12
+            rank, suit = _bj_parse_card(c)
+            _draw_card_scaled(rgb_draw, cx, dealer_y0, rank, suit)
 
-    # PLAYER section (below divider)
-    player_section_y = H // 2 + 25 if not is_split else 280
-    draw.text((40, player_section_y), "PLAYER", font=font_label, fill=BJ_TEXT_GOLD)
+    # Re-composite RGB image back into our RGBA workspace.
+    img = rgb_img.convert("RGBA")
+    draw = ImageDraw.Draw(img)
+
+    # ── RESULT BAND (only when result_text is provided) ─────
+    if result_text:
+        is_win = result_color == BJ_WIN_COLOR or (result_color and result_color[1] > 200 and result_color[0] < 200)
+        is_push = result_color == BJ_PUSH_COLOR or (result_color and result_color[0] > 200 and result_color[1] > 150 and result_color[2] < 100)
+        if is_win:
+            band_color = (60, 235, 130)
+            band_inner = (8, 36, 22)
+        elif is_push:
+            band_color = (240, 200, 60)
+            band_inner = (40, 30, 8)
+        else:
+            band_color = (255, 70, 80)
+            band_inner = (50, 8, 16)
+
+        band_w = int(W * 0.65)
+        band_h = 110
+        band_x = (W - band_w) // 2
+        band_y = dealer_y0 + CARD_H2 - 30  # overlap the bottom of dealer cards
+        # Soft outer glow.
+        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow)
+        for k, (alpha, pad) in enumerate([(140, 18), (90, 12), (60, 6)]):
+            gd.rounded_rectangle(
+                [band_x - pad, band_y - pad, band_x + band_w + pad, band_y + band_h + pad],
+                radius=18,
+                fill=(band_color[0], band_color[1], band_color[2], alpha),
+            )
+        glow = glow.filter(_ImgFilter.GaussianBlur(radius=14))
+        img.alpha_composite(glow)
+        draw = ImageDraw.Draw(img)
+        # Band fill.
+        draw.rounded_rectangle(
+            [band_x, band_y, band_x + band_w, band_y + band_h],
+            radius=18, fill=band_inner, outline=band_color, width=3,
+        )
+        # Highlight.
+        draw.rounded_rectangle(
+            [band_x + 6, band_y + 6, band_x + band_w - 6, band_y + 16],
+            radius=6, fill=(band_color[0] // 4, band_color[1] // 4, band_color[2] // 4),
+        )
+        # Result text.
+        f_result = _bj_get_font(46)
+        rw = draw.textlength(result_text, font=f_result)
+        draw.text(
+            (band_x + (band_w - rw) / 2, band_y + (band_h - 50) / 2),
+            result_text, font=f_result, fill=BJ_TEXT_WHITE,
+        )
+        result_band_bottom = band_y + band_h
+    else:
+        result_band_bottom = dealer_y0 + CARD_H2
+
+    # ── PLAYER LABEL ────────────────────────────────────────
+    player_label = "PLAYER"
+    f_player_lbl = _bj_get_font(26)
+    plw = draw.textlength(player_label, font=f_player_lbl)
+    player_lbl_y = result_band_bottom + 18
+    draw.text(((W - plw) / 2, player_lbl_y),
+              player_label, font=f_player_lbl, fill=BJ_TEXT_GOLD)
+
+    # ── PLAYER CARDS ────────────────────────────────────────
+    rgb_img = img.convert("RGB")
+    rgb_draw = ImageDraw.Draw(rgb_img)
+    cards_top = player_lbl_y + 40
+    f_handlbl = _bj_get_font(20)
+    f_handval = _bj_get_font(22)
 
     if is_split:
-        # Split mode: draw two hands side by side horizontally
-        hand_spacing = 380  # Space between the two hand groups
-        hand_start_x = [40, 40 + hand_spacing]  # X positions for each hand
-
-        for hand_idx, hand in enumerate(split_hands[:2]):  # Max 2 hands
-            hand_x = hand_start_x[hand_idx]
-            hand_y = player_section_y + 25
-            hand_label = f"Hand {hand_idx + 1}"
-            is_active = (hand_idx == split_active_hand)
-
-            # Check if this hand is already resolved
-            hand_result = None
-            if split_results:
-                for r in split_results:
-                    if r["hand"] == hand_idx:
-                        hand_result = r
-                        break
-
-            # Draw hand label with highlight for active hand
-            label_color = BJ_ACCENT if is_active else BJ_TEXT_LIGHT
-            if hand_result and hand_result["status"] == "bust":
-                label_color = BJ_RED
-            elif hand_result and hand_result["status"] in ("stand", "21", "doubled"):
-                label_color = BJ_WIN_COLOR
-
-            draw.text((hand_x, hand_y), hand_label, font=font_label, fill=label_color)
-
-            # Hand value
-            h_value = calculate_hand_value(hand)
-            draw.text((hand_x, hand_y + 20), f"Value: {h_value}", font=font_value, fill=BJ_TEXT_LIGHT)
-
-            # Draw hand cards with blue highlight border if active
-            px, py = hand_x, hand_y + 45
-            if is_active and not hand_result:
-                # Draw blue highlight box around cards area
-                card_count = len(hand)
-                box_width = card_count * (BJ_CARD_W + 12) + 10
-                draw.rounded_rectangle(
-                    [px - 5, py - 5, px + box_width, py + BJ_CARD_H + 5],
-                    radius=8,
-                    outline=BJ_ACCENT,
-                    width=3
+        # Two hands side-by-side; each hand is its own card row centred in
+        # one half of the canvas.
+        for hi, hand in enumerate(split_hands[:2]):
+            n = max(2, len(hand))
+            row_w = n * CARD_W2 + (n - 1) * card_gap
+            # Box bounds.
+            x_center = int(W * (0.30 if hi == 0 else 0.70))
+            row_x0 = x_center - row_w // 2
+            for j, c in enumerate(hand):
+                rank, suit = _bj_parse_card(c)
+                _draw_card_scaled(rgb_draw, row_x0 + j * (CARD_W2 + card_gap),
+                                  cards_top, rank, suit)
+            # Hand label (Hand 1 left of cards, Hand 2 right of cards).
+            is_active = (split_active_hand == hi)
+            hand_color = BJ_TEXT_GOLD if hi == 0 else BJ_LOSE_COLOR
+            label_str = f"Hand {hi + 1}"
+            value_str = ""
+            if split_results and hi < len(split_results):
+                v = split_results[hi].get("value")
+                value_str = f"Value: {v}" if v is not None else ""
+            else:
+                # Fallback: compute from hand using calculate_hand_value when present.
+                try:
+                    v = calculate_hand_value(hand)
+                    value_str = f"Value: {v}"
+                except Exception:
+                    value_str = ""
+            label_x = (row_x0 - 110) if hi == 0 else (row_x0 + row_w + 30)
+            rgb_draw.text((label_x, cards_top + 10), label_str,
+                           font=f_handlbl, fill=hand_color)
+            if value_str:
+                rgb_draw.text((label_x, cards_top + 40), value_str,
+                               font=f_handval, fill=BJ_TEXT_WHITE)
+            # Active-hand outline (subtle red glow stroke).
+            if is_active and not split_results:
+                rgb_draw.rounded_rectangle(
+                    [row_x0 - 6, cards_top - 6,
+                     row_x0 + row_w + 6, cards_top + CARD_H2 + 6],
+                    radius=14, outline=BJ_LOSE_COLOR, width=2,
                 )
-
-            for card_str in hand:
-                rank, suit = _bj_parse_card(card_str)
-                _bj_draw_card(draw, px, py, rank, suit)
-                px += BJ_CARD_W + 12
-
-            # Bet amount for this hand
-            if split_bets and hand_idx < len(split_bets):
-                draw.text((hand_x, hand_y + BJ_CARD_H + 50), f"Bet: ${split_bets[hand_idx]:.2f}", font=font_small, fill=BJ_TEXT_LIGHT)
-
-            # Result status if resolved
-            if hand_result:
-                status_text = hand_result["status"].upper()
-                status_color = BJ_RED if hand_result["status"] == "bust" else BJ_WIN_COLOR
-                draw.text((hand_x + len(hand) * (BJ_CARD_W + 12) + 10, hand_y + 5), f"[{status_text}]", font=font_small, fill=status_color)
     else:
-        # Normal mode: single player hand
-        p_val_str = f"Value: {player_value}" if player_value else ""
-        draw.text((40, player_section_y + 20), p_val_str, font=font_value, fill=BJ_TEXT_LIGHT)
+        n = max(2, len(player_hand or []))
+        row_w = n * CARD_W2 + (n - 1) * card_gap
+        row_x0 = (W - row_w) // 2
+        for j, c in enumerate(player_hand or []):
+            rank, suit = _bj_parse_card(c)
+            _draw_card_scaled(rgb_draw, row_x0 + j * (CARD_W2 + card_gap),
+                              cards_top, rank, suit)
+        # Player value bottom-centered.
+        if player_value is not None:
+            pv_str = f"Value: {player_value}"
+            pvw = rgb_draw.textlength(pv_str, font=f_handval)
+            rgb_draw.text(((W - pvw) / 2, cards_top + CARD_H2 + 14),
+                           pv_str, font=f_handval, fill=BJ_TEXT_WHITE)
 
-        # Draw player cards
-        px, py = 40, player_section_y + 45
-        for card_str in player_hand:
-            rank, suit = _bj_parse_card(card_str)
-            _bj_draw_card(draw, px, py, rank, suit)
-            px += BJ_CARD_W + 12
-
-    # Result overlay (if game finished)
-    if result_text:
-        rc = result_color or BJ_WIN_COLOR
-        # Semi-transparent overlay band across center
-        overlay = Image.new("RGBA", (W, 60), (*rc, 160))
-        img_rgba = img.convert("RGBA")
-        img_rgba.paste(overlay, (0, H // 2 - 10), overlay)
-        img = img_rgba.convert("RGB")
-        draw = ImageDraw.Draw(img)
-        rw = draw.textlength(result_text, font=font_result)
-        draw.text(((W - rw) // 2, H // 2 - 22), result_text, font=font_result, fill=(255, 255, 255))
-
-    # Bottom info bar
-    bar_y = H - 36
-    # Translucent bottom band for legibility
-    band = Image.new("RGBA", (W, 36), (4, 8, 22, 220))
-    img_rgba2 = img.convert("RGBA")
-    img_rgba2.paste(band, (0, bar_y), band)
-    img = img_rgba2.convert("RGB")
+    img = rgb_img.convert("RGBA")
     draw = ImageDraw.Draw(img)
-    # Left: bet amount
-    left_text = ""
-    if bet_amount is not None:
-        left_text += f"Bet: ${bet_amount:.2f}"
-    if left_text:
-        draw.text((14, bar_y + 8), left_text, font=font_info, fill=BJ_TEXT_GOLD)
 
-    # Center hint: BLACKJACK ALSO SUPPORTS SPLIT
-    if not is_split:
+    # ── BOTTOM INFO BAR ────────────────────────────────────
+    bar_h = 56
+    bar_y = H - bar_h - 26
+    draw.rounded_rectangle(
+        [16, bar_y, W - 16, bar_y + bar_h],
+        radius=14, fill=(14, 22, 50), outline=BJ_TEXT_GOLD, width=2,
+    )
+    # Bet (left).
+    bet_str = f"Bet: ${bet_amount:.2f}" if bet_amount is not None else "Bet: —"
+    f_bar = _bj_get_font(22)
+    draw.text((38, bar_y + (bar_h - 26) / 2), bet_str,
+              font=f_bar, fill=BJ_TEXT_WHITE)
+    # Center hint with dice glyph.
+    if is_split:
+        hint = "BLACKJACK SPLIT — ACTIVE HAND HIGHLIGHTED"
+    else:
         hint = "BLACKJACK ALSO SUPPORTS SPLIT"
-        hint_w = draw.textlength(hint, font=font_small)
-        draw.text(((W - hint_w) // 2, bar_y + 11), hint, font=font_small, fill=BJ_TEXT_GOLD)
+    f_hint = _bj_get_font(18)
+    hw = draw.textlength(hint, font=f_hint)
+    # Dice glyph (small two-rect motif).
+    glyph_x = (W - hw) // 2 - 38
+    glyph_y = bar_y + (bar_h - 24) // 2
+    draw.rounded_rectangle([glyph_x, glyph_y, glyph_x + 22, glyph_y + 22],
+                           radius=4, fill=(220, 180, 80))
+    draw.rounded_rectangle([glyph_x + 8, glyph_y - 6,
+                             glyph_x + 30, glyph_y + 16],
+                           radius=4, fill=(180, 130, 40))
+    draw.text(((W - hw) / 2, bar_y + (bar_h - 22) / 2),
+              hint, font=f_hint, fill=BJ_TEXT_GOLD)
+    # Right "BLACKJACK" + diamond.
+    bj_lbl = "BLACKJACK"
+    f_bj = _bj_get_font(22)
+    bw2 = draw.textlength(bj_lbl, font=f_bj)
+    draw.text((W - bw2 - 60, bar_y + (bar_h - 26) / 2),
+              bj_lbl, font=f_bj, fill=BJ_TEXT_GOLD)
+    dx, dy = W - 38, bar_y + bar_h // 2
+    draw.polygon([(dx, dy - 10), (dx + 10, dy), (dx, dy + 10), (dx - 10, dy)],
+                 fill=(90, 200, 255))
 
-    # Right: BLACKJACK label
-    label = "BLACKJACK"
-    lw = draw.textlength(label, font=font_info)
-    draw.text((W - lw - 14, bar_y + 8), label, font=font_info, fill=BJ_ACCENT)
-
-    # Soft footer line below the info bar
+    # ── FOOTER LINE ───────────────────────────────────────
     footer = "Play Responsibly  •  Telegram Casino  •  blackjack"
-    fw = draw.textlength(footer, font=font_small)
-    draw.text(((W - fw) // 2, H - 14), footer, font=font_small, fill=(60, 80, 120))
+    f_footer = _bj_get_font(14)
+    fw = draw.textlength(footer, font=f_footer)
+    draw.text(((W - fw) // 2, H - 22), footer,
+              font=f_footer, fill=BJ_TEXT_DIM)
 
-    # Save to BytesIO
+    # ── PNG OUT ───────────────────────────────────────────
+    out = img.convert("RGB")
     buf = BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    out.save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf
 
