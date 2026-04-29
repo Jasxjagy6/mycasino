@@ -84,7 +84,7 @@ else:
     USE_POSTGRES_FOR_ALL = False
 import qrcode
 from io import BytesIO
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # Blockchain-specific libraries for non-EVM chains
 try:
@@ -1261,8 +1261,38 @@ def _get_cached_wagered_rank(user_id: int) -> int | None:
     return _wagered_rank_cache.get(user_id)
 
 
-def _rebuild_leaderboards():
-    """Rebuild all leaderboard caches from user_stats data."""
+# -- Leaderboard rebuild cache ------------------------------------------------
+# `_rebuild_leaderboards` walks the entire `user_stats` dict (one full O(N)
+# pass + heap-select). With several thousand users this is non-trivial work
+# and the previous code path called it twice on every `/leaderboard` invocation
+# (once in `leaderboard_command`, once in `generate_leaderboard_image`). We
+# memoise the rebuild for 60 s so the per-command cost stops scaling with user
+# count. Mutating commands (`/resetleaderboard`, weekly/monthly resets) call
+# `_invalidate_leaderboard_cache()` to force a fresh rebuild on next access.
+_leaderboard_rebuilt_at: float = 0.0
+_LEADERBOARD_REBUILD_TTL = 60.0  # seconds
+
+
+def _invalidate_leaderboard_cache():
+    """Force the next `_rebuild_leaderboards` call to do real work."""
+    global _leaderboard_rebuilt_at
+    _leaderboard_rebuilt_at = 0.0
+
+
+def _rebuild_leaderboards(force: bool = False):
+    """Rebuild all leaderboard caches from user_stats data.
+
+    Cached for `_LEADERBOARD_REBUILD_TTL` seconds — pass `force=True` from
+    invalidation paths (admin reset, weekly/monthly rollover) to bypass the
+    cache.
+    """
+    global _leaderboard_rebuilt_at
+    import time as _time_lb
+    if not force:
+        now_mono = _time_lb.monotonic()
+        if (_leaderboard_rebuilt_at and
+                now_mono - _leaderboard_rebuilt_at < _LEADERBOARD_REBUILD_TTL):
+            return  # cached result is still fresh
     now = datetime.now(timezone.utc)
     week_start = now - timedelta(days=now.weekday())  # Monday
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -1331,6 +1361,7 @@ def _rebuild_leaderboards():
     leaderboard_data["weekly"] = _heapq_rl.nlargest(10, weekly, key=lambda x: x[2])
     leaderboard_data["monthly"] = _heapq_rl.nlargest(10, monthly, key=lambda x: x[2])
     leaderboard_data["highest_wins"] = _heapq_rl.nlargest(10, highest_wins, key=lambda x: x[2])
+    _leaderboard_rebuilt_at = _time_lb.monotonic()
 
 # --- Global Control Flag ---
 bot_stopped = False
@@ -1344,8 +1375,13 @@ active_manual_scans: dict = {}
 # Write-Behind Save System
 _dirty_users: set = set()
 _dirty_lock = asyncio.Lock()
+# PERFORMANCE: 16 workers. Disk writes are atomic (tmp+rename) and small,
+# so the bottleneck is fsync / dentry update — not CPU. With 5000+ users
+# and a steady stream of dirty-user flushes plus on-demand profile/state
+# saves, 8 was too tight; 16 keeps the flush queue from backing up under
+# bursty load (raffle finalisation, surprise drop, broadcast handlers).
 _save_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=8, thread_name_prefix="disk_writer"
+    max_workers=32, thread_name_prefix="disk_writer"
 )
 
 # -- Global Callback Deduplication ------------------------------------------
@@ -1450,14 +1486,23 @@ _MENU_OWNER_TTL = 3600          # 1 hour
 _leaderboard_buffer: list = []
 _leaderboard_buffer_lock = asyncio.Lock()
 
-# Image generation executor and caches
+# Image generation executor and caches.
+# PERFORMANCE: 16 workers. PIL rendering is CPU-bound but releases the GIL
+# during compression (PNG/JPEG encode). With many concurrent emoji-game
+# results and stats requests, 8 was a visible queueing point under burst
+# load — bumped to 16 so renderer fan-out stops queueing at the executor.
 _image_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=8, thread_name_prefix="image_gen"
+    max_workers=16, thread_name_prefix="image_gen"
 )
 _profile_pic_cache: dict = {}       # user_id -> (PIL.Image, timestamp)
 _PROFILE_PIC_CACHE_TTL = 300        # 5 minutes
 _bot_username_cache: str = None
 _bot_info_cache = None
+
+# Recent limbo plays per chat: chat_id -> list[(user_id, display_name)],
+# newest first, max 3. Used to populate the player rail in the limbo PIL.
+_recent_limbo_players: dict = {}
+_RECENT_LIMBO_MAX = 3
 
 # Shared HTTP client for price updates
 _shared_http_client: httpx.AsyncClient = None
@@ -1645,7 +1690,26 @@ DASHBOARD_TEMPLATE_PATH = "clean_template.jpg"
 
 # Font configuration (use a TTF font for better quality)
 # You can replace this with any .ttf font file path
-DASHBOARD_FONT_PATH = "bold.ttf"  # Default system font
+# Resolve a real bold font from common system locations so the PIL renderers
+# don't silently fall back to ImageFont.load_default() (a tiny 8px bitmap).
+def _resolve_dashboard_font():
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+        "bold.ttf",
+    ]
+    for p in candidates:
+        try:
+            if os.path.exists(p):
+                return p
+        except Exception:
+            pass
+    return "bold.ttf"
+
+DASHBOARD_FONT_PATH = _resolve_dashboard_font()
 DASHBOARD_FONT_FALLBACK = None  # Will use PIL default if custom font not found
 
 # Dashboard text configuration: coordinates (X, Y), font size, and color (R, G, B)
@@ -8395,18 +8459,31 @@ def _sync_save_bot_state_json():
         logging.error(f"Failed to save bot state JSON: {e}")
 
 
+# Bot state write-behind: 17 handlers call ``save_bot_state()`` synchronously
+# from async contexts. Each call serialises the whole state dict + writes the
+# file synchronously inline on the event loop. At 5k+ users that's tens of MB
+# of JSON encoding per click. We instead flip a dirty flag and let a 5 s
+# background loop coalesce all dirty writes onto ``_save_executor``.
+_bot_state_dirty: bool = False
+_bot_state_extras_dirty: bool = False  # escrow / groups / recovery / gift codes
+_bot_state_dirty_lock = asyncio.Lock()
+
+
 def save_bot_state():
     """Persist non-user-data ("bot state") — called from many admin handlers.
 
-    PERFORMANCE: This used to blast every user's record to disk (thousands of
-    json files) and ``concurrent.futures.wait(... timeout=30)`` *inside the
-    event loop*, which froze every handler for up to 30 s on a single admin
-    click. User data is already persisted continuously via the write-behind
-    ``_dirty_users`` flush task — we only need to save the truly global
-    state here (withdrawals, settings, group/escrow/raffle registries).
-    ``save_bot_state_full()`` below still does the fat shutdown save; call
-    that path only from actual shutdown.
+    Now non-blocking: flips a dirty flag and lets ``_flush_bot_state_loop``
+    coalesce writes to ``_save_executor``. Worst-case staleness on crash:
+    one ``BOT_STATE_FLUSH_INTERVAL`` window. Synchronous shutdown still
+    forces an immediate flush via ``save_bot_state_full()``.
     """
+    global _bot_state_dirty, _bot_state_extras_dirty
+    _bot_state_dirty = True
+    _bot_state_extras_dirty = True
+
+
+def save_bot_state_inline():
+    """Original blocking save — kept for shutdown / startup paths."""
     try:
         _sync_save_bot_state_json()
         save_all_escrow_deals()
@@ -8415,6 +8492,38 @@ def save_bot_state():
         save_all_gift_codes()
     except Exception as e:
         logging.error(f"save_bot_state partial failure: {e}")
+
+
+BOT_STATE_FLUSH_INTERVAL = 5  # seconds
+
+
+async def _flush_bot_state_loop():
+    """Background loop coalescing ``save_bot_state()`` writes off the event loop."""
+    global _bot_state_dirty, _bot_state_extras_dirty
+    while True:
+        try:
+            await asyncio.sleep(BOT_STATE_FLUSH_INTERVAL)
+            if not (_bot_state_dirty or _bot_state_extras_dirty):
+                continue
+            do_state = _bot_state_dirty
+            do_extras = _bot_state_extras_dirty
+            _bot_state_dirty = False
+            _bot_state_extras_dirty = False
+            loop = asyncio.get_running_loop()
+            try:
+                if do_state:
+                    await loop.run_in_executor(_save_executor, _sync_save_bot_state_json)
+                if do_extras:
+                    await loop.run_in_executor(_save_executor, save_all_escrow_deals)
+                    await loop.run_in_executor(_save_executor, save_all_group_settings)
+                    await loop.run_in_executor(_save_executor, save_all_recovery_data)
+                    await loop.run_in_executor(_save_executor, save_all_gift_codes)
+            except Exception as e:
+                logging.error(f"Bot state flush failed: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logging.error(f"_flush_bot_state_loop error: {e}")
 
 
 def save_bot_state_full():
@@ -9049,7 +9158,7 @@ def _render_dashboard_sync(text_data: dict, profile_pic):
     """
     try:
         import random as _rand
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw, ImageFont, ImageFilter
         from io import BytesIO
 
         W, H = 1000, 560
@@ -9477,251 +9586,390 @@ async def generate_stats_image(user_id: int, context: ContextTypes.DEFAULT_TYPE,
 
 
 def _render_stats_sync(text_data, game_list, pvp_entries, profile_pic_data):
-    """Render stats image - institutional premium casino design."""
+    """Render stats image — circuit-board / wireframe-head design.
+
+    Mirrors ``example_designs/stats_pil_image_design_template.png``.
+    Layout (rough):
+      - Header: bot username centered + "TELEGRAM CASINO • PLAYER STATS" sub.
+        Top-right: bot username + "Since <date>".
+      - Wireframe head avatar in the top-left (geometric mesh).
+      - Glass-effect "name card": first name large + @username + ID.
+      - Right of name card: small badge with rank "#N" + circle avatar +
+        level pill ("Bronze I" / "Silver II" / etc.).
+      - 4×2 grid of colored stat tiles (games, wagered, win rate, P&L /
+        avg bet, biggest win, fav game, bonuses) — each tile has a thin
+        coloured border that matches the metric type.
+      - "GAME BREAKDOWN" table with diamond bullets per row, P&L coloured.
+      - Decorative circuit-board lines on the left/right edges + bottom.
+      - Footer: "Play Responsibly • Gamble with Control" centered, bot
+        username + diamond glyph in the bottom-right.
+    """
     try:
-        W, H = 920, 860
-        img = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+        W, H = 1060, 980
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
         # ── PALETTE ──────────────────────────────────────────────
-        C_BG_TOP      = (4,  10, 24)
-        C_BG_BOT      = (8,  18, 40)
-        C_CARD        = (10, 20, 42)
-        C_CARD_ALT    = (7,  15, 33)
-        C_BORDER      = (22, 48, 90)
-        C_GOLD        = (255, 200, 60)
-        C_GOLD_DIM    = (180, 140, 40)
-        C_BLUE        = (70, 160, 255)
-        C_BLUE_DIM    = (40, 100, 200)
-        C_GREEN       = (0,  210, 110)
-        C_RED         = (255, 70, 80)
-        C_WHITE       = (240, 245, 255)
-        C_MUTED       = (100, 120, 160)
-        C_PURPLE      = (170, 110, 255)
-        C_HEADER_BG   = (6,  14, 32)
-        C_ACCENT_LINE = (30, 70, 140)
-
-        # ── BACKGROUND ───────────────────────────────────────────
-        for yy in range(H):
-            t = yy / H
-            r = int(C_BG_TOP[0] + t * (C_BG_BOT[0] - C_BG_TOP[0]))
-            g = int(C_BG_TOP[1] + t * (C_BG_BOT[1] - C_BG_TOP[1]))
-            b = int(C_BG_TOP[2] + t * (C_BG_BOT[2] - C_BG_TOP[2]))
-            draw.line([(0, yy), (W, yy)], fill=(r, g, b))
-
-        # Subtle stars
-        _rng = random.Random(99)
-        for _ in range(100):
-            sx, sy = _rng.randint(0, W), _rng.randint(0, H)
-            br = _rng.randint(40, 140)
-            draw.ellipse([sx-1, sy-1, sx+1, sy+1], fill=(br, br, br+15))
-
-        # Outer border — double ring
-        draw.rounded_rectangle([2, 2, W-3, H-3], radius=20, outline=C_BLUE_DIM, width=2)
-        draw.rounded_rectangle([5, 5, W-6, H-6], radius=18, outline=C_ACCENT_LINE, width=1)
+        C_BG_TOP   = (3,  6,  22)
+        C_BG_MID   = (10, 10, 36)
+        C_BG_BOT   = (28, 14, 50)
+        C_HEADER   = (8,  16, 40)
+        C_CARD     = (14, 22, 48)
+        C_CARD_ALT = (10, 18, 40)
+        C_BORDER   = (28, 56, 110)
+        C_WHITE    = (235, 240, 255)
+        C_MUTED    = (130, 145, 180)
+        C_BLUE     = (90, 200, 255)
+        C_BLUE_DIM = (35, 110, 200)
+        C_GOLD     = (255, 200, 80)
+        C_GOLD_DIM = (170, 130, 30)
+        C_GREEN    = (80, 235, 140)
+        C_RED      = (255, 90, 100)
+        C_PURPLE   = (180, 110, 255)
+        C_GRAY     = (120, 130, 160)
+        C_CIRCUIT  = (40, 70, 130)
 
         # ── FONTS ────────────────────────────────────────────────
         def _tf(size):
-            try: return ImageFont.truetype(DASHBOARD_FONT_PATH, size)
-            except: return ImageFont.load_default()
+            try:
+                return ImageFont.truetype(DASHBOARD_FONT_PATH, size)
+            except Exception:
+                return ImageFont.load_default()
 
-        fH1 = _tf(26)   # heading 1
-        fH2 = _tf(20)   # heading 2
-        fH3 = _tf(15)   # heading 3
-        fBody = _tf(13)  # body
-        fSmall = _tf(11) # small
-        fTiny = _tf(9)   # tiny
-        fBig = _tf(36)   # big value
-        fMed = _tf(22)   # medium value
-        fTag = _tf(17)   # tag/badge
+        fHero  = _tf(36)
+        fSub   = _tf(13)
+        fName  = _tf(46)
+        fH3    = _tf(20)
+        fBody  = _tf(16)
+        fSmall = _tf(13)
+        fTiny  = _tf(11)
+        fTile  = _tf(28)
+        fTileLb= _tf(12)
+        fLevel = _tf(18)
+        fRank  = _tf(20)
 
-        # ── HEADER BAR ───────────────────────────────────────────
-        # Gradient header (top 58px)
-        for yy in range(58):
-            t = yy / 58
-            hb = int(6 + t * 4)
-            draw.line([(0, yy), (W, yy)], fill=(hb, hb+2, hb+14))
-        # Gold accent bar at bottom of header
-        for yy in range(58, 61):
-            alpha = int(220 * (1 - (yy-58)/3))
-            draw.line([(0, yy), (W, yy)], fill=C_GOLD)
+        # ── BACKGROUND: navy → faint purple gradient ─────────────
+        for yy in range(H):
+            t = yy / H
+            if t < 0.55:
+                u = t / 0.55
+                r = int(C_BG_TOP[0] + u * (C_BG_MID[0] - C_BG_TOP[0]))
+                g = int(C_BG_TOP[1] + u * (C_BG_MID[1] - C_BG_TOP[1]))
+                b = int(C_BG_TOP[2] + u * (C_BG_MID[2] - C_BG_TOP[2]))
+            else:
+                u = (t - 0.55) / 0.45
+                r = int(C_BG_MID[0] + u * (C_BG_BOT[0] - C_BG_MID[0]))
+                g = int(C_BG_MID[1] + u * (C_BG_BOT[1] - C_BG_MID[1]))
+                b = int(C_BG_MID[2] + u * (C_BG_BOT[2] - C_BG_MID[2]))
+            draw.line([(0, yy), (W, yy)], fill=(r, g, b))
 
-        # Bot username — centered, gold
-        bot_label = f"@{text_data['bot_username']}"
-        bw = draw.textlength(bot_label, font=fH2)
-        draw.text(((W-bw)/2, 8), bot_label, fill=C_GOLD, font=fH2)
+        # Decorative circuit-board lines on left edge + bottom.
+        _rng = random.Random(42)
+        # Bottom right grid (perspective lines).
+        for i in range(20):
+            yline = H - 280 + i * 14
+            draw.line([(W // 2 - i * 22, yline), (W - 30, yline)],
+                      fill=(40, 50, 100), width=1)
+        for i in range(18):
+            x0 = int(W / 2 + i * (W / 2 - 30) / 18)
+            draw.line([(x0, H - 280), (x0 + i * 18, H - 30)],
+                      fill=(40, 50, 100), width=1)
+        # Left edge circuit lines.
+        for _ in range(24):
+            x0 = _rng.randint(8, 90)
+            y0 = _rng.randint(280, H - 200)
+            seg = _rng.randint(50, 130)
+            draw.line([(x0, y0), (x0 + seg, y0)], fill=C_CIRCUIT, width=1)
+            draw.line([(x0 + seg, y0), (x0 + seg, y0 + 18)], fill=C_CIRCUIT, width=1)
+            draw.ellipse([x0 + seg - 3, y0 + 16, x0 + seg + 3, y0 + 22], fill=C_BLUE_DIM)
+        # Right edge circuit lines.
+        for _ in range(16):
+            x0 = _rng.randint(W - 130, W - 30)
+            y0 = _rng.randint(80, 230)
+            seg = _rng.randint(40, 90)
+            draw.line([(x0, y0), (x0 - seg, y0)], fill=C_CIRCUIT, width=1)
+            draw.line([(x0 - seg, y0), (x0 - seg, y0 + 14)], fill=C_CIRCUIT, width=1)
+            draw.ellipse([x0 - seg - 3, y0 + 12, x0 - seg + 3, y0 + 18], fill=C_BLUE_DIM)
+        # Faint star sparkle.
+        for _ in range(80):
+            sx, sy = _rng.randint(0, W), _rng.randint(0, H)
+            br = _rng.randint(40, 130)
+            draw.ellipse([sx - 1, sy - 1, sx + 1, sy + 1], fill=(br, br, br + 20))
+
+        # ── HEADER STRIP ─────────────────────────────────────────
+        draw.rectangle([0, 0, W, 90], fill=C_HEADER)
+        # Bot username centered.
+        bot_lbl = f"@{text_data['bot_username']}"
+        bw = draw.textlength(bot_lbl, font=fHero)
+        draw.text(((W - bw) / 2, 12), bot_lbl, fill=C_WHITE, font=fHero)
+        # Subtitle.
         sub = "TELEGRAM CASINO  •  PLAYER STATS"
-        sw = draw.textlength(sub, font=fTiny)
-        draw.text(((W-sw)/2, 34), sub, fill=C_MUTED, font=fTiny)
-        # Member since — right
+        sw = draw.textlength(sub, font=fSub)
+        draw.text(((W - sw) / 2, 58), sub, fill=C_MUTED, font=fSub)
+        # Top-right.
+        rt_lbl = f"@{text_data['bot_username']}"
+        rw = draw.textlength(rt_lbl, font=fSmall)
+        draw.text((W - rw - 22, 18), rt_lbl, fill=C_BLUE, font=fSmall)
         ms = f"Since {text_data['member_since']}"
         msw = draw.textlength(ms, font=fTiny)
-        draw.text((W-msw-16, 44), ms, fill=C_MUTED, font=fTiny)
+        draw.text((W - msw - 22, 44), ms, fill=C_MUTED, font=fTiny)
+        # Hairline under header.
+        draw.line([(0, 92), (W, 92)], fill=C_GOLD_DIM, width=1)
 
-        y = 72  # cursor after header
+        # ── WIREFRAME HEAD AVATAR (top-left) ─────────────────────
+        head_cx, head_cy = 110, 165
+        head_rx, head_ry = 80, 100
+        head_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        head_draw = ImageDraw.Draw(head_layer)
+        # Outline ellipse + inner mesh.
+        head_draw.ellipse(
+            [head_cx - head_rx, head_cy - head_ry, head_cx + head_rx, head_cy + head_ry],
+            outline=(70, 200, 255, 200), width=2,
+        )
+        # Vertical mesh lines.
+        for ang in range(-80, 81, 14):
+            rad = math.radians(ang)
+            x = head_cx + math.sin(rad) * head_rx
+            head_draw.line(
+                [(int(x), head_cy - head_ry), (int(x), head_cy + head_ry)],
+                fill=(60, 170, 230, 110), width=1,
+            )
+        # Horizontal arcs (as lines for simplicity).
+        for ang in range(-70, 71, 14):
+            rad = math.radians(ang)
+            yy = head_cy + math.sin(rad) * head_ry
+            head_draw.line(
+                [(head_cx - head_rx, int(yy)), (head_cx + head_rx, int(yy))],
+                fill=(60, 170, 230, 90), width=1,
+            )
+        # A small bright "third-eye" dot.
+        head_draw.ellipse(
+            [head_cx - 3, head_cy - 6, head_cx + 3, head_cy], fill=(180, 230, 255, 255),
+        )
+        head_layer = head_layer.filter(ImageFilter.GaussianBlur(radius=0.6))
+        img.alpha_composite(head_layer)
 
-        # ── PROFILE CARD ─────────────────────────────────────────
-        PC_H = 96
-        draw.rounded_rectangle([14, y, W-14, y+PC_H], radius=14, fill=C_CARD, outline=C_BORDER, width=1)
-        # Left gold accent strip
-        draw.rounded_rectangle([14, y, 20, y+PC_H], radius=4, fill=C_GOLD)
+        # ── NAME CARD (centre, glass blue glow) ──────────────────
+        NC_X0 = 220
+        NC_X1 = W - 250
+        NC_Y0 = 110
+        NC_Y1 = 226
+        # Outer glow.
+        glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow_layer)
+        gd.rounded_rectangle([NC_X0 - 6, NC_Y0 - 6, NC_X1 + 6, NC_Y1 + 6],
+                             radius=22, outline=(70, 200, 255, 110), width=4)
+        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=4))
+        img.alpha_composite(glow_layer)
+        # Card.
+        draw.rounded_rectangle([NC_X0, NC_Y0, NC_X1, NC_Y1], radius=18,
+                               fill=(10, 22, 50), outline=C_BLUE, width=2)
+        # First name.
+        name_str = (text_data.get("first_name", "Player") or "Player")[:18] + ".."
+        if len(text_data.get("first_name") or "") <= 16:
+            name_str = (text_data.get("first_name") or "Player")[:18]
+        draw.text((NC_X0 + 30, NC_Y0 + 14), name_str, fill=C_WHITE, font=fName)
+        # Username + ID.
+        uname = text_data.get("username", "")
+        draw.text((NC_X0 + 32, NC_Y0 + 70), uname, fill=C_MUTED, font=fSmall)
+        uid_str = f"ID: {text_data.get('user_id', '')}"
+        draw.text((NC_X0 + 32, NC_Y0 + 90), uid_str, fill=(85, 100, 140), font=fTiny)
 
-        # Avatar
-        AV = 68
-        ax, ay = 50, y + (PC_H - AV) // 2
-        # Avatar glow ring
-        draw.ellipse([ax-4, ay-4, ax+AV+3, ay+AV+3], outline=C_GOLD, width=2)
+        # ── RANK / LEVEL CARD (right of name card) ───────────────
+        RC_X0 = W - 230
+        RC_X1 = W - 28
+        RC_Y0 = 110
+        RC_Y1 = 226
+        draw.rounded_rectangle([RC_X0, RC_Y0, RC_X1, RC_Y1], radius=18,
+                               fill=(20, 14, 38), outline=C_PURPLE, width=2)
+        # Rank pill (top-left of card).
+        rk_pill_w, rk_pill_h = 60, 30
+        rkx0 = RC_X0 + 18
+        rky0 = RC_Y0 + 18
+        draw.rounded_rectangle([rkx0, rky0, rkx0 + rk_pill_w, rky0 + rk_pill_h],
+                               radius=12, fill=(48, 28, 14), outline=C_GOLD, width=2)
+        rk_str = text_data.get("rank", "#---")
+        rkw = draw.textlength(rk_str, font=fRank)
+        draw.text((rkx0 + (rk_pill_w - rkw) / 2, rky0 + 4), rk_str, fill=C_GOLD, font=fRank)
+        # Avatar (top-right of card).
+        av_r = 22
+        av_cx = RC_X1 - 30
+        av_cy = rky0 + rk_pill_h // 2
         if profile_pic_data and isinstance(profile_pic_data, Image.Image):
             try:
-                pic = profile_pic_data.convert("RGBA").resize((AV, AV), Image.Resampling.LANCZOS)
-                mask = Image.new("L", (AV, AV), 0)
-                ImageDraw.Draw(mask).ellipse([0, 0, AV-1, AV-1], fill=255)
-                circ = Image.new("RGBA", (AV, AV), (0,0,0,0))
-                circ.paste(pic, (0,0), mask)
-                img.paste(circ, (ax, ay), circ)
-            except:
-                draw.ellipse([ax, ay, ax+AV, ay+AV], fill=C_CARD_ALT, outline=C_BLUE, width=2)
+                sz = av_r * 2
+                src = profile_pic_data.convert("RGBA").resize((sz, sz), Image.Resampling.LANCZOS)
+                mask = Image.new("L", (sz, sz), 0)
+                ImageDraw.Draw(mask).ellipse([0, 0, sz - 1, sz - 1], fill=255)
+                img.paste(src, (av_cx - av_r, av_cy - av_r), mask)
+                draw.ellipse([av_cx - av_r, av_cy - av_r, av_cx + av_r, av_cy + av_r],
+                             outline=C_PURPLE, width=2)
+            except Exception:
+                draw.ellipse([av_cx - av_r, av_cy - av_r, av_cx + av_r, av_cy + av_r],
+                             fill=(40, 24, 60), outline=C_PURPLE, width=2)
         else:
-            draw.ellipse([ax, ay, ax+AV, ay+AV], fill=C_CARD_ALT, outline=C_BLUE, width=2)
-            init = text_data["first_name"][:1].upper()
-            iw = draw.textlength(init, font=fH1)
-            draw.text((ax + (AV-iw)//2, ay + (AV-28)//2), init, fill=C_BLUE, font=fH1)
+            draw.ellipse([av_cx - av_r, av_cy - av_r, av_cx + av_r, av_cy + av_r],
+                         fill=(40, 24, 60), outline=C_PURPLE, width=2)
+        # Level pill (centered below).
+        lvl_str = text_data.get("level", "Bronze I")
+        lvw = draw.textlength(lvl_str, font=fLevel)
+        lpw = max(int(lvw + 36), 130)
+        lph = 38
+        lpx = RC_X0 + (RC_X1 - RC_X0 - lpw) // 2
+        lpy = RC_Y0 + 64
+        draw.rounded_rectangle([lpx, lpy, lpx + lpw, lpy + lph], radius=14,
+                               fill=(40, 18, 60), outline=C_PURPLE, width=2)
+        draw.text((lpx + (lpw - lvw) / 2, lpy + 8), lvl_str, fill=C_PURPLE, font=fLevel)
 
-        # Name + username
-        nx = ax + AV + 18
-        draw.text((nx, y+12), text_data["first_name"], fill=C_WHITE, font=fH1)
-        draw.text((nx, y+44), text_data["username"], fill=C_MUTED, font=fBody)
-        uid_text = f"ID: {text_data['user_id']}"
-        draw.text((nx, y+62), uid_text, fill=(70, 90, 130), font=fSmall)
+        # ── 4×2 STAT TILE GRID ───────────────────────────────────
+        TILE_Y0 = 250
+        TILE_GAP = 14
+        TILE_W = (W - 28 - TILE_GAP * 3) // 4
+        TILE_H = 96
 
-        # Rank badge — top right of profile card
-        rk = text_data["rank"]
-        rkw = draw.textlength(rk, font=fMed)
-        rbx = W - 130
-        rby = y + 10
-        draw.rounded_rectangle([rbx-8, rby-4, rbx+rkw+20, rby+34], radius=10, fill=(30,22,5), outline=C_GOLD, width=2)
-        draw.text((rbx+6, rby), rk, fill=C_GOLD, font=fMed)
+        def _draw_tile(col, row, value, label, border_color, value_color, icon_glyph=None):
+            x0 = 14 + col * (TILE_W + TILE_GAP)
+            y0 = TILE_Y0 + row * (TILE_H + TILE_GAP)
+            x1 = x0 + TILE_W
+            y1 = y0 + TILE_H
+            draw.rounded_rectangle([x0, y0, x1, y1], radius=14,
+                                   fill=(14, 24, 50), outline=border_color, width=2)
+            # Subtle outer glow.
+            gl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            gld = ImageDraw.Draw(gl)
+            gld.rounded_rectangle([x0 - 2, y0 - 2, x1 + 2, y1 + 2],
+                                  radius=16,
+                                  outline=(border_color[0], border_color[1], border_color[2], 80),
+                                  width=2)
+            gl = gl.filter(ImageFilter.GaussianBlur(radius=3))
+            img.alpha_composite(gl)
+            # Icon circle on the left.
+            ic_cx = x0 + 32
+            ic_cy = y0 + TILE_H // 2 - 4
+            draw.ellipse([ic_cx - 18, ic_cy - 18, ic_cx + 18, ic_cy + 18],
+                         fill=(8, 16, 36), outline=border_color, width=2)
+            if icon_glyph:
+                gw = draw.textlength(icon_glyph, font=fH3)
+                draw.text((ic_cx - gw / 2, ic_cy - 12), icon_glyph,
+                          fill=border_color, font=fH3)
+            # Value (centered horizontally in remaining space).
+            val_str = str(value)
+            vw = draw.textlength(val_str, font=fTile)
+            val_cx = (x0 + 60 + x1) // 2
+            draw.text((val_cx - vw / 2, y0 + 18), val_str, fill=value_color, font=fTile)
+            # Label below.
+            lbw = draw.textlength(label, font=fTileLb)
+            draw.text((val_cx - lbw / 2, y0 + 60), label, fill=C_MUTED, font=fTileLb)
 
-        # Level badge — below rank
-        lv = text_data["level"]
-        lvw = draw.textlength(lv, font=fTag)
-        lbx = rbx - 8
-        lby = rby + 42
-        draw.rounded_rectangle([lbx, lby, lbx+lvw+28, lby+26], radius=8, fill=(25,12,45), outline=C_PURPLE, width=1)
-        draw.text((lbx+14, lby+3), lv, fill=C_PURPLE, font=fTag)
+        # Row 1
+        total_pnl = text_data.get("total_pnl", 0.0)
+        pnl_pos = total_pnl >= 0
+        _draw_tile(0, 0, text_data.get("total_games", 0), "GAMES PLAYED",
+                   C_GRAY, C_WHITE, "⌬")
+        _draw_tile(1, 0, f"${text_data.get('total_wagered', 0):,.2f}", "TOTAL WAGERED",
+                   C_BLUE, C_BLUE, "$")
+        _draw_tile(2, 0, f"{text_data.get('win_rate', 0):.1f}%", "WIN RATE",
+                   C_GOLD, C_GOLD, "◷")
+        pnl_str = f"{'+' if pnl_pos else ''}${total_pnl:,.2f}"
+        _draw_tile(3, 0, pnl_str, "NET P&L",
+                   C_GREEN if pnl_pos else C_RED,
+                   C_GREEN if pnl_pos else C_RED, "▣")
+        # Row 2
+        _draw_tile(0, 1, f"${text_data.get('avg_bet', 0):,.2f}", "AVG BET",
+                   C_BLUE, C_BLUE, "✎")
+        biggest = text_data.get("biggest_win", 0.0)
+        _draw_tile(1, 1, f"+${biggest:,.2f}", "BIGGEST WIN",
+                   C_GOLD, C_GOLD, "♛")
+        fav = text_data.get("fav_game", "—") or "—"
+        _draw_tile(2, 1, str(fav)[:14], "FAV GAME",
+                   C_GRAY, C_WHITE, "♦")
+        bonuses = text_data.get("total_bonuses", 0.0) or 0.0
+        _draw_tile(3, 1, f"${bonuses:,.2f}", "BONUSES",
+                   C_PURPLE, C_PURPLE, "🎁")
 
-        y += PC_H + 14
+        # ── GAME BREAKDOWN TABLE ─────────────────────────────────
+        BR_Y0 = TILE_Y0 + 2 * (TILE_H + TILE_GAP) + 22
+        # Section header.
+        section_lbl = "GAME  BREAKDOWN"
+        slw = draw.textlength(section_lbl, font=fSmall)
+        # Hairline + label centered overlay.
+        draw.line([(20, BR_Y0), (W - 20, BR_Y0)], fill=C_BORDER, width=1)
+        # Erase a slot for the label.
+        draw.rectangle([(W - slw) / 2 - 12, BR_Y0 - 9, (W + slw) / 2 + 12, BR_Y0 + 9],
+                       fill=C_BG_MID)
+        draw.text(((W - slw) / 2, BR_Y0 - 8), section_lbl, fill=C_BLUE, font=fSmall)
+        # Table column headers.
+        BR_Y0 += 14
+        col_game = 30
+        col_played = int(W * 0.45)
+        col_wr = int(W * 0.62)
+        col_pnl = W - 40
+        draw.text((col_game, BR_Y0), "GAME", fill=C_MUTED, font=fTiny)
+        draw.text((col_played, BR_Y0), "PLAYED", fill=C_MUTED, font=fTiny)
+        draw.text((col_wr, BR_Y0), "WIN RATE", fill=C_MUTED, font=fTiny)
+        draw.text((col_pnl, BR_Y0), "P&L", fill=C_MUTED, font=fTiny, anchor="ra")
+        BR_Y0 += 18
+        # Rows.
+        rows = (game_list or [])[:6]
+        if not rows:
+            draw.text((col_game, BR_Y0 + 8), "No games played yet",
+                      fill=C_MUTED, font=fSmall)
+            BR_Y0 += 36
+        else:
+            for entry in rows:
+                draw.line([(20, BR_Y0), (W - 20, BR_Y0)], fill=(20, 30, 60), width=1)
+                # Diamond bullet.
+                bx = col_game - 12
+                by = BR_Y0 + 18
+                draw.polygon([(bx, by - 5), (bx + 5, by), (bx, by + 5), (bx - 5, by)],
+                             fill=C_GOLD)
+                # Game name.
+                gname = entry.get("name", "")
+                draw.text((col_game + 2, BR_Y0 + 12), str(gname)[:24],
+                          fill=C_WHITE, font=fBody)
+                # Played count.
+                draw.text((col_played, BR_Y0 + 12), str(entry.get("games", 0)),
+                          fill=C_WHITE, font=fBody)
+                # Win rate (red < 50%, green ≥ 50%).
+                wr = entry.get("wr", 0.0)
+                wr_color = C_GREEN if wr >= 50 else C_RED
+                draw.text((col_wr, BR_Y0 + 12), f"{wr:.1f}%",
+                          fill=wr_color, font=fBody)
+                # P&L right-aligned.
+                pnl = entry.get("pnl", 0.0)
+                pnl_color = C_GREEN if pnl >= 0 else C_RED
+                pnl_str = f"{'+' if pnl >= 0 else '-'}${abs(pnl):,.2f}"
+                draw.text((col_pnl, BR_Y0 + 12), pnl_str,
+                          fill=pnl_color, font=fBody, anchor="ra")
+                BR_Y0 += 36
+            draw.line([(20, BR_Y0), (W - 20, BR_Y0)], fill=(20, 30, 60), width=1)
 
-        # ── STAT CARDS (2 rows × 4) ──────────────────────────────
-        pnl_val = text_data["total_pnl"]
-        pnl_pos = pnl_val >= 0
-        pnl_color = C_GREEN if pnl_pos else C_RED
-        pnl_sign = "+" if pnl_pos else ""
-        pnl_bg = (4, 28, 16) if pnl_pos else (28, 6, 8)
+        # ── FOOTER ──────────────────────────────────────────────
+        ftr_y = H - 30
+        draw.line([(0, ftr_y - 14), (W, ftr_y - 14)], fill=C_BORDER, width=1)
+        ftr = "Play Responsibly  •  Gamble with Control"
+        fw = draw.textlength(ftr, font=fSmall)
+        draw.text(((W - fw) / 2, ftr_y - 8), ftr, fill=C_MUTED, font=fSmall)
+        # Diamond + bot username right.
+        wm = f"@{text_data['bot_username']}"
+        wmw = draw.textlength(wm, font=fSmall)
+        draw.text((W - wmw - 30, ftr_y - 8), wm, fill=C_BLUE, font=fSmall)
+        dx, dy = W - 22, ftr_y - 4
+        draw.polygon([(dx, dy - 8), (dx + 8, dy), (dx, dy + 8), (dx - 8, dy)],
+                     fill=C_BLUE)
 
-        stat_cards = [
-            # (value, label, value_color, border_color, card_fill)
-            (str(text_data["total_games"]),                 "GAMES PLAYED",  C_WHITE,   C_BORDER,   C_CARD),
-            (format_compact_usd(text_data["total_wagered"]),"TOTAL WAGERED", C_BLUE,    C_BLUE_DIM, (8,18,40)),
-            (f'{text_data["win_rate"]:.1f}%',               "WIN RATE",      C_GOLD,    C_GOLD_DIM, (22,18,4)),
-            (f'{pnl_sign}{format_compact_usd(pnl_val)}',   "NET P&L",       pnl_color, pnl_color,  pnl_bg),
-            (format_compact_usd(text_data["avg_bet"]),      "AVG BET",       C_BLUE,    C_BLUE_DIM, C_CARD),
-            (f'+{format_compact_usd(text_data["biggest_win"])}', "BIGGEST WIN", C_GOLD, C_GOLD_DIM, (22,18,4)),
-            (get_display_name(text_data["fav_game"])[:14],  "FAV GAME",      C_WHITE,   C_BORDER,   C_CARD),
-            (format_compact_usd(text_data["total_bonuses"]),"BONUSES",       C_PURPLE,  C_PURPLE,   (18,8,35)),
-        ]
-        CW = (W - 28 - 3*10) // 4  # card width
-        CH = 78                      # card height
-        GAP = 10
-
-        for row in range(2):
-            for col in range(4):
-                idx = row*4 + col
-                val, lbl, vcol, bcol, cfill = stat_cards[idx]
-                cx = 14 + col*(CW+GAP)
-                cy = y + row*(CH+GAP)
-                # Card body
-                draw.rounded_rectangle([cx, cy, cx+CW, cy+CH], radius=12, fill=cfill, outline=bcol, width=1)
-                # Top accent line
-                draw.rounded_rectangle([cx+1, cy+1, cx+CW-1, cy+5], radius=3, fill=bcol)
-                # Value
-                vw = draw.textlength(val, font=fH2)
-                if vw > CW - 16:
-                    val_f = fBody
-                    vw = draw.textlength(val, font=fBody)
-                else:
-                    val_f = fH2
-                draw.text((cx + (CW-vw)//2, cy+14), val, fill=vcol, font=val_f)
-                # Label
-                lw = draw.textlength(lbl, font=fTiny)
-                draw.text((cx + (CW-lw)//2, cy+54), lbl, fill=C_MUTED, font=fTiny)
-
-        y += 2*(CH+GAP) + 6
-
-        # ── SECTION DIVIDER ──────────────────────────────────────
-        def section_header(title, yy):
-            tw = draw.textlength(title, font=fSmall)
-            draw.line([(14, yy+7), ((W-tw)//2 - 10, yy+7)], fill=C_ACCENT_LINE, width=1)
-            draw.text(((W-tw)//2, yy), title, fill=C_BLUE, font=fSmall)
-            draw.line([((W+tw)//2 + 10, yy+7), (W-14, yy+7)], fill=C_ACCENT_LINE, width=1)
-            return yy + 22
-
-        y = section_header("GAME  BREAKDOWN", y)
-
-        # Column headers
-        draw.text((24, y), "GAME", fill=C_MUTED, font=fTiny)
-        draw.text((320, y), "PLAYED", fill=C_MUTED, font=fTiny)
-        draw.text((450, y), "WIN RATE", fill=C_MUTED, font=fTiny)
-        draw.text((W-20, y), "P&L", fill=C_MUTED, font=fTiny, anchor="ra")
-        y += 16
-        draw.line([(14, y), (W-14, y)], fill=C_BORDER, width=1)
-        y += 6
-
-        GL = game_list[:7]
-        for i, g in enumerate(GL):
-            gname = g["name"][:22]
-            ggames = g["games"]
-            gwr = g["wr"]
-            gpnl = g["pnl"]
-            gpnl_pos = g["pnl_positive"]
-            gpnl_color = C_GREEN if gpnl_pos else C_RED
-
-            RH = 30
-            bg = C_CARD if i % 2 == 0 else C_CARD_ALT
-            draw.rounded_rectangle([14, y, W-14, y+RH], radius=7, fill=bg)
-            # Left accent dot for top game
-            if i == 0:
-                draw.ellipse([17, y+11, 21, y+19], fill=C_GOLD)
-            draw.text((28, y+7), gname, fill=C_WHITE if i==0 else (200,210,230), font=fBody)
-            draw.text((320, y+8), f"{ggames:,}", fill=C_MUTED, font=fSmall)
-            wr_color = C_GREEN if gwr >= 50 else C_RED
-            draw.text((450, y+8), f"{gwr:.1f}%", fill=wr_color, font=fSmall)
-            pnl_str = f"+{format_compact_usd(gpnl)}" if gpnl_pos else format_compact_usd(gpnl)
-            draw.text((W-20, y+8), pnl_str, fill=gpnl_color, font=fSmall, anchor="ra")
-            y += RH + 4
-
-        # ── FOOTER ───────────────────────────────────────────────
-        y = H - 34
-        draw.line([(14, y), (W-14, y)], fill=C_BORDER, width=1)
-        footer = "Play Responsibly  •  Gamble with Control"
-        fw = draw.textlength(footer, font=fTiny)
-        draw.text(((W-fw)//2, y+8), footer, fill=(60, 75, 100), font=fTiny)
-
-        # ── SAVE ─────────────────────────────────────────────────
+        # ── SAVE ────────────────────────────────────────────────
         buf = BytesIO()
         img = img.convert("RGB")
-        img.save(buf, format='PNG', optimize=True)
+        img.save(buf, format="PNG", optimize=True)
         buf.seek(0)
         return buf
     except Exception as e:
         logging.error(f"Error rendering stats image: {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return None
 
-
-# ============================================================
-# LEADERBOARD TEMPLATE - 1:1 copy of example design
-# ============================================================
 async def generate_leaderboard_image(context, period='all_time', viewing_user_id=None):
     """Generate leaderboard template image with user's actual rank."""
     try:
@@ -9745,12 +9993,26 @@ async def generate_leaderboard_image(context, period='all_time', viewing_user_id
         data = leaderboard_data.get(data_key, [])
 
         entries = []
+        top_uids = []
         if data_key == 'highest_wins':
             for i, (uid, uname, wamt, gtype, ts) in enumerate(data[:10]):
                 entries.append({"rank": i + 1, "username": get_privacy_display_name(uid, uname), "value": wamt})
+                top_uids.append(uid)
         else:
             for i, (uid, uname, wagered) in enumerate(data[:10]):
                 entries.append({"rank": i + 1, "username": get_privacy_display_name(uid, uname), "value": wagered})
+                top_uids.append(uid)
+
+        # Fetch real Telegram avatars for the top-3 (best-effort) so the
+        # hexagonal podium circles aren't all blank/wireframe placeholders.
+        top_avatars = {}
+        for rank_idx, uid in enumerate(top_uids[:3], start=1):
+            try:
+                pic = await _get_cached_profile_picture(context, uid)
+                if pic is not None:
+                    top_avatars[rank_idx] = pic
+            except Exception:
+                pass
 
         # Calculate viewing user's rank and wagered amount
         user_rank = None
@@ -9783,14 +10045,20 @@ async def generate_leaderboard_image(context, period='all_time', viewing_user_id
                 user_rank = rank
 
         loop = asyncio.get_running_loop()
+        # Use functools.partial so the kwargs (notably ``top_avatars``) are
+        # forwarded into the executor without relying on positional ordering.
+        from functools import partial as _lb_partial
         result = await loop.run_in_executor(
             _image_executor,
-            _render_leaderboard_sync,
-            entries,
-            bot_username,
-            section_title,
-            user_rank,
-            user_wagered,
+            _lb_partial(
+                _render_leaderboard_sync,
+                entries,
+                bot_username,
+                section_title,
+                user_rank,
+                user_wagered,
+                top_avatars=top_avatars,
+            ),
         )
         return result
     except Exception as e:
@@ -9798,242 +10066,409 @@ async def generate_leaderboard_image(context, period='all_time', viewing_user_id
         return None
 
 
-def _render_leaderboard_sync(entries, bot_username, section_title, user_rank=None, user_wagered=0.0):
-    """Render leaderboard image - institutional premium casino design."""
+def _render_leaderboard_sync(entries, bot_username, section_title, user_rank=None, user_wagered=0.0,
+                             value_formatter=None, your_rank_label="YOUR POSITION",
+                             your_value_label="Total Wagered",
+                             top_avatars=None):
+    """Render the leaderboard card — hexagonal-podium design that mirrors
+    ``example_designs/leaderboard_pil_design_template.png``.
+
+    Layout (top→bottom):
+      • Dark blue header strip with `LEADERBOARD` centered, `@bot_username`
+        + `CASINO` subtitle in the top-right.
+      • Section title pill (e.g. "All-Time Top Wagered").
+      • Three hexagonal pedestals in 3D perspective. #2 is left (silver),
+        #1 is center+taller (gold), #3 is right (bronze). Each pedestal has
+        a coloured light-beam shooting up, a circular avatar floating above
+        in the beam, and the user's name + value over the beam.
+      • "RANKS 4 — 10" separator.
+      • Left: "YOUR POSITION" card (rounded blue-bordered).
+      • Right: rows for ranks 4–10, alternating filled/empty.
+      • Footer: "Play Responsibly • Telegram Casino", diamond glyph
+        bottom-right.
+
+    `top_avatars` is an optional dict mapping ``rank → PIL.Image`` (1, 2 or 3)
+    so the top-3 podium circles can show real Telegram avatars. Falls back
+    to the wireframe-mask placeholder when an avatar is not provided.
+    `value_formatter` formats the numeric `entry['value']` (defaults to USD).
+    """
+    if value_formatter is None:
+        value_formatter = lambda v: f"${v:,.2f}"
     try:
-        W, H = 760, 1120
+        # Larger canvas to fit the hexagonal podium + ranks 4-10 + your-position card.
+        W, H = 850, 1180
         img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
         # ── PALETTE ──────────────────────────────────────────────
-        C_BG_TOP    = (3,  8, 20)
-        C_BG_BOT    = (8, 16, 38)
+        C_BG_TOP    = (5,  8,  28)
+        C_BG_MID    = (10, 12, 36)
+        C_BG_BOT    = (18, 10, 42)
+        C_HEADER    = (10, 20, 56)
         C_CARD      = (10, 20, 44)
         C_CARD_ALT  = (7,  15, 34)
-        C_BORDER    = (22, 48, 90)
+        C_BORDER    = (28, 56, 110)
         C_GOLD      = (255, 200, 60)
         C_GOLD_DIM  = (160, 120, 20)
-        C_SILVER    = (200, 210, 230)
-        C_SILVER_DIM= (110, 120, 145)
-        C_BRONZE    = (210, 140, 70)
-        C_BRONZE_DIM= (120, 80, 35)
-        C_BLUE      = (70, 160, 255)
-        C_BLUE_DIM  = (35, 90, 180)
-        C_GREEN     = (0, 210, 110)
+        C_SILVER    = (210, 220, 235)
+        C_SILVER_DIM= (110, 125, 150)
+        C_BRONZE    = (220, 145, 80)
+        C_BRONZE_DIM= (130, 85,  40)
+        C_BLUE      = (90, 200, 255)
+        C_BLUE_DIM  = (35, 110, 200)
+        C_GREEN     = (60, 230, 130)
         C_WHITE     = (240, 245, 255)
-        C_MUTED     = (100, 120, 160)
+        C_MUTED     = (130, 145, 180)
         C_ACCENT    = (25, 60, 120)
 
         MEDAL = [C_GOLD, C_SILVER, C_BRONZE]
         MEDAL_DIM = [C_GOLD_DIM, C_SILVER_DIM, C_BRONZE_DIM]
-        MEDAL_BG = [(35,28,4), (22,26,36), (32,20,8)]
+        MEDAL_BG = [(35,28,4), (24,28,38), (32,22,10)]
 
-        # ── BACKGROUND ───────────────────────────────────────────
+        # ── BACKGROUND: dark navy → faint purple gradient ────────
         for yy in range(H):
             t = yy / H
-            r = int(C_BG_TOP[0] + t*(C_BG_BOT[0]-C_BG_TOP[0]))
-            g = int(C_BG_TOP[1] + t*(C_BG_BOT[1]-C_BG_TOP[1]))
-            b = int(C_BG_TOP[2] + t*(C_BG_BOT[2]-C_BG_TOP[2]))
-            draw.line([(0,yy),(W,yy)], fill=(r,g,b))
+            if t < 0.5:
+                u = t * 2
+                r = int(C_BG_TOP[0] + u * (C_BG_MID[0] - C_BG_TOP[0]))
+                g = int(C_BG_TOP[1] + u * (C_BG_MID[1] - C_BG_TOP[1]))
+                b = int(C_BG_TOP[2] + u * (C_BG_MID[2] - C_BG_TOP[2]))
+            else:
+                u = (t - 0.5) * 2
+                r = int(C_BG_MID[0] + u * (C_BG_BOT[0] - C_BG_MID[0]))
+                g = int(C_BG_MID[1] + u * (C_BG_BOT[1] - C_BG_MID[1]))
+                b = int(C_BG_MID[2] + u * (C_BG_BOT[2] - C_BG_MID[2]))
+            draw.line([(0, yy), (W, yy)], fill=(r, g, b))
 
-        # Subtle stars
-        _rng = random.Random(7)
+        # Subtle "circuit-board" lines on the left + right edges (decorative).
+        _rng = random.Random(11)
+        for _ in range(40):
+            sx0 = _rng.choice([_rng.randint(0, 80), _rng.randint(W - 80, W - 1)])
+            sy0 = _rng.randint(50, H - 50)
+            seg_len = _rng.randint(40, 110)
+            draw.line([(sx0, sy0), (sx0 + seg_len, sy0)], fill=(20, 30, 70), width=1)
+            draw.line([(sx0 + seg_len, sy0), (sx0 + seg_len, sy0 - 20)], fill=(20, 30, 70), width=1)
+            draw.ellipse([sx0 + seg_len - 2, sy0 - 22, sx0 + seg_len + 2, sy0 - 18], fill=(60, 130, 200))
+
+        # Decorative starfield.
         for _ in range(120):
-            sx,sy = _rng.randint(0,W), _rng.randint(0,H)
-            br = _rng.randint(30,120)
-            draw.ellipse([sx-1,sy-1,sx+1,sy+1], fill=(br,br,br+20))
-
-        # Double outer border
-        draw.rounded_rectangle([2,2,W-3,H-3], radius=22, outline=C_GOLD_DIM, width=2)
-        draw.rounded_rectangle([5,5,W-6,H-6], radius=20, outline=C_ACCENT, width=1)
+            sx, sy = _rng.randint(0, W), _rng.randint(0, H)
+            br = _rng.randint(40, 140)
+            draw.ellipse([sx - 1, sy - 1, sx + 1, sy + 1], fill=(br, br, br + 20))
 
         # ── FONTS ────────────────────────────────────────────────
         def _tf(size):
-            try: return ImageFont.truetype(DASHBOARD_FONT_PATH, size)
-            except: return ImageFont.load_default()
+            try:
+                return ImageFont.truetype(DASHBOARD_FONT_PATH, size)
+            except Exception:
+                return ImageFont.load_default()
 
-        fH1   = _tf(30)   # main title
-        fH2   = _tf(22)   # section title
-        fH3   = _tf(17)   # sub heading
-        fBody = _tf(14)   # body / row text
-        fSmall= _tf(11)   # small labels
-        fTiny = _tf(9)    # tiny / footer
-        fBig  = _tf(42)   # big number (#1 rank)
-        fMed  = _tf(28)   # medium number
-        fRk   = _tf(20)   # rank number in rows
+        fHero  = _tf(50)   # LEADERBOARD title
+        fH3    = _tf(20)   # section pill text
+        fBody  = _tf(16)   # row text
+        fSmall = _tf(13)   # small labels
+        fTiny  = _tf(11)   # footer
+        fHexN  = _tf(72)   # gigantic #1/#2/#3 inside hex
+        fBadge = _tf(14)   # rank badge text
+        fName  = _tf(20)   # podium username
+        fAmt   = _tf(15)   # podium amount
+        fYRk   = _tf(58)   # YOUR POSITION rank glyph
 
-        y = 18
-
-        # ── HEADER ───────────────────────────────────────────────
-        # Gold accent header band
-        for yy in range(y, y+62):
-            t = (yy-y)/62
-            hb = int(5 + t*6)
-            draw.line([(0,yy),(W,yy)], fill=(hb, hb+2, hb+16))
-        draw.line([(0,y+62),(W,y+62)], fill=C_GOLD, width=2)
-
-        # Bot username top-right
+        # ── HEADER STRIP ─────────────────────────────────────────
+        HDR_H = 92
+        draw.rectangle([0, 0, W, HDR_H], fill=C_HEADER)
+        # Hero title centered.
+        title = "LEADERBOARD"
+        tw = draw.textlength(title, font=fHero)
+        draw.text(((W - tw) // 2, 18), title, fill=C_BLUE, font=fHero)
+        # Top-right: @bot_username + CASINO subtitle.
         bot_lbl = f"@{bot_username}"
         blw = draw.textlength(bot_lbl, font=fSmall)
-        draw.text((W-blw-18, y+8), bot_lbl, fill=C_GOLD, font=fSmall)
-        draw.text((W-blw-18, y+26), "CASINO", fill=C_MUTED, font=fTiny)
+        draw.text((W - blw - 22, 18), bot_lbl, fill=C_WHITE, font=fSmall)
+        casino_sub = "CASINO"
+        cw = draw.textlength(casino_sub, font=fTiny)
+        draw.text((W - cw - 22, 38), casino_sub, fill=C_MUTED, font=fTiny)
+        # Top-left: small leaderboard chip.
+        lb_chip = "leaderboard"
+        lcw = draw.textlength(lb_chip, font=fSmall)
+        chip_y = HDR_H + 12
+        draw.text((W - lcw - 22, chip_y), lb_chip, fill=C_BLUE, font=fSmall)
+        # tiny bar-chart glyph next to it
+        draw.rectangle([W - lcw - 38, chip_y + 4, W - lcw - 34, chip_y + 18], fill=C_BLUE)
+        draw.rectangle([W - lcw - 32, chip_y + 8, W - lcw - 28, chip_y + 18], fill=C_BLUE)
+        draw.rectangle([W - lcw - 26, chip_y + 12, W - lcw - 22, chip_y + 18], fill=C_BLUE)
 
-        # "LEADERBOARD" with shadow effect
-        title = "LEADERBOARD"
-        tw = draw.textlength(title, font=fH1)
-        tx = (W-tw)//2
-        # shadow
-        draw.text((tx+2, y+14), title, fill=C_GOLD_DIM, font=fH1)
-        draw.text((tx, y+12), title, fill=C_GOLD, font=fH1)
-        y += 82
-
-        # Section title pill
+        # ── SECTION TITLE PILL ───────────────────────────────────
         stw = draw.textlength(section_title, font=fH3)
-        pill_x = (W-stw)//2 - 28
-        draw.rounded_rectangle([pill_x, y, pill_x+stw+56, y+36], radius=18,
-                                fill=(14, 28, 56), outline=C_BLUE, width=2)
-        # Blue dots on pill sides
-        draw.ellipse([pill_x-6, y+14, pill_x+2, y+22], fill=C_BLUE)
-        draw.ellipse([pill_x+stw+54, y+14, pill_x+stw+62, y+22], fill=C_BLUE)
-        draw.text(((W-stw)//2, y+7), section_title, fill=(140, 210, 255), font=fH3)
-        y += 50
+        pill_w = int(stw + 56)
+        pill_h = 46
+        pill_x = (W - pill_w) // 2
+        pill_y = HDR_H + 38
+        draw.rounded_rectangle([pill_x, pill_y, pill_x + pill_w, pill_y + pill_h],
+                               radius=22, fill=(8, 18, 44), outline=C_BLUE_DIM, width=2)
+        draw.text((pill_x + 28, pill_y + 11), section_title, fill=C_WHITE, font=fH3)
 
-        # ── TOP 3 SHOWCASE ───────────────────────────────────────
+        # Decorative dotted side lines below pill (matches the template).
+        for dx in range(20, pill_x - 20, 14):
+            draw.line([(dx, pill_y + pill_h // 2), (dx + 6, pill_y + pill_h // 2)],
+                      fill=C_BORDER, width=1)
+        for dx in range(pill_x + pill_w + 20, W - 20, 14):
+            draw.line([(dx, pill_y + pill_h // 2), (dx + 6, pill_y + pill_h // 2)],
+                      fill=C_BORDER, width=1)
+
+        # ── TOP-3 HEXAGONAL PODIUM ───────────────────────────────
         top3 = entries[:3]
+        avatars = top_avatars or {}
 
-        def draw_podium_card(rank_num, entry, x, cy, card_w, card_h, is_center):
-            """Draw a top-3 rank card."""
-            mc = MEDAL[rank_num-1]
-            mdim = MEDAL_DIM[rank_num-1]
-            mbg = MEDAL_BG[rank_num-1]
+        def _hex_polygon(cx, cy, radius_w, radius_h):
+            """Return a 6-point hex polygon (pointy top/bottom)."""
+            return [
+                (cx, cy - radius_h),
+                (cx + radius_w, cy - radius_h // 2),
+                (cx + radius_w, cy + radius_h // 2),
+                (cx, cy + radius_h),
+                (cx - radius_w, cy + radius_h // 2),
+                (cx - radius_w, cy - radius_h // 2),
+            ]
 
-            # Card background
-            draw.rounded_rectangle([x, cy, x+card_w, cy+card_h], radius=16,
-                                    fill=mbg, outline=mc, width=2)
-            # Inner glow line at top
-            draw.rounded_rectangle([x+1, cy+1, x+card_w-1, cy+8], radius=4, fill=mc)
+        def _paste_avatar_circle(cx, cy, r, pic, ring_color):
+            """Paste a circular avatar at (cx, cy) with radius r."""
+            box = (cx - r, cy - r, cx + r, cy + r)
+            # Glow ring.
+            draw.ellipse([box[0] - 4, box[1] - 4, box[2] + 4, box[3] + 4],
+                         outline=ring_color, width=3)
+            if isinstance(pic, Image.Image):
+                try:
+                    sz = (r * 2, r * 2)
+                    src = pic.convert("RGBA").resize(sz, Image.Resampling.LANCZOS)
+                    mask = Image.new("L", sz, 0)
+                    ImageDraw.Draw(mask).ellipse([0, 0, sz[0] - 1, sz[1] - 1], fill=255)
+                    img.paste(src, (cx - r, cy - r), mask)
+                    return
+                except Exception:
+                    pass
+            # Fallback: dim disc with mask-like initial.
+            draw.ellipse(box, fill=(20, 20, 35), outline=ring_color, width=2)
 
-            # Rank circle — prominent
-            cx_card = x + card_w // 2
-            if is_center:
-                # #1 gets a big circle
-                draw.ellipse([cx_card-28, cy+14, cx_card+28, cy+70], fill=mdim)
-                draw.ellipse([cx_card-24, cy+18, cx_card+24, cy+66], fill=mc)
-                rk_str = "#1"
-                rkw = draw.textlength(rk_str, font=fMed)
-                draw.text((cx_card-rkw//2, cy+26), rk_str, fill=(20,15,4), font=fMed)
-            else:
-                draw.ellipse([cx_card-22, cy+14, cx_card+22, cy+58], fill=mdim)
-                draw.ellipse([cx_card-18, cy+18, cx_card+18, cy+54], fill=mc)
-                rk_str = f"#{rank_num}"
-                rkw = draw.textlength(rk_str, font=fBody)
-                draw.text((cx_card-rkw//2, cy+27), rk_str, fill=(20,15,4), font=fBody)
+        def _draw_light_beam(cx, top_y, bot_y, top_w, bot_w, color):
+            """Translucent trapezoidal beam shooting up from the hex top."""
+            beam = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            beam_draw = ImageDraw.Draw(beam)
+            # Layered alpha so the beam looks brighter at the bottom (where it
+            # leaves the hex) and fades softly toward the top.
+            for layer, (alpha, scale) in enumerate([
+                (110, 1.0),
+                (70,  0.85),
+                (40,  0.7),
+            ]):
+                tw_l = max(2, int(top_w * scale))
+                bw_l = max(4, int(bot_w * scale))
+                poly = [
+                    (cx - bw_l // 2, bot_y),
+                    (cx + bw_l // 2, bot_y),
+                    (cx + tw_l // 2, top_y),
+                    (cx - tw_l // 2, top_y),
+                ]
+                beam_draw.polygon(poly, fill=(color[0], color[1], color[2], alpha))
+            beam = beam.filter(ImageFilter.GaussianBlur(radius=12))
+            img.alpha_composite(beam)
 
-            # Username
-            uname = entry["username"][:16]
-            if is_center:
-                unw = draw.textlength(uname, font=fH3)
-                draw.text((cx_card-unw//2, cy+76), uname, fill=C_WHITE, font=fH3)
-                # Value
-                val_str = f"${entry['value']:,.2f}"
-                vw = draw.textlength(val_str, font=fBody)
-                draw.text((cx_card-vw//2, cy+100), val_str, fill=C_GREEN, font=fBody)
-            else:
-                unw = draw.textlength(uname, font=fSmall)
-                draw.text((cx_card-unw//2, cy+62), uname, fill=C_WHITE, font=fSmall)
-                val_str = f"${entry['value']:,.2f}"
-                vw = draw.textlength(val_str, font=fSmall)
-                draw.text((cx_card-vw//2, cy+80), val_str, fill=C_GREEN, font=fSmall)
+        def _draw_hex_pedestal(rank_num, entry, cx, avatar_cy, hex_h, is_center):
+            """Render a single hex pedestal + avatar + label.
 
-        # Layout: #2 left, #1 center (taller), #3 right
-        SIDE_W, SIDE_H = 190, 115
-        CTR_W, CTR_H  = 240, 134
-        SIDE_Y_OFFSET = 20  # side cards sit lower (shorter on the podium)
-        total_top3_w = SIDE_W + CTR_W + SIDE_W + 16
-        tx0 = (W - total_top3_w) // 2
+            Positioning is driven from ``avatar_cy`` (the y-center of the
+            floating avatar). Username + amount are stacked below the avatar
+            and the hex sits below them. The hex top is computed
+            deterministically so the labels never overlap the hex.
+            """
+            mc = MEDAL[rank_num - 1]
+            mdim = MEDAL_DIM[rank_num - 1]
+            mbg = MEDAL_BG[rank_num - 1]
 
-        if len(top3) >= 1:
-            draw_podium_card(1, top3[0], tx0+SIDE_W+8, y, CTR_W, CTR_H, True)
-        if len(top3) >= 2:
-            draw_podium_card(2, top3[1], tx0, y+SIDE_Y_OFFSET, SIDE_W, SIDE_H, False)
-        if len(top3) >= 3:
-            draw_podium_card(3, top3[2], tx0+SIDE_W+CTR_W+16, y+SIDE_Y_OFFSET, SIDE_W, SIDE_H, False)
+            av_r = 40 if is_center else 32
+            rx = 96 if is_center else 80
+            ry = hex_h // 2
 
-        y += CTR_H + 24
+            # Compute label band + hex top from avatar position so nothing
+            # overlaps.
+            label_top = avatar_cy + av_r + 12
+            hex_top_y = label_top + 56  # username row (24) + amount row (20) + pad
+            cy = hex_top_y + ry
+            poly = _hex_polygon(cx, cy, rx, ry)
 
-        # ── SEPARATOR ────────────────────────────────────────────
-        draw.line([(30,y),(W-30,y)], fill=C_ACCENT, width=1)
-        lbl4 = "RANKS  4 — 10"
-        lbl4w = draw.textlength(lbl4, font=fSmall)
-        draw.text(((W-lbl4w)//2, y+5), lbl4, fill=C_MUTED, font=fSmall)
-        y += 26
+            # 1. Light beam (drawn first, behind the hex).
+            beam_top = max(HDR_H + 60, avatar_cy - av_r - 30)
+            _draw_light_beam(
+                cx, beam_top, cy,
+                top_w=int(rx * 0.7), bot_w=int(rx * 1.7),
+                color=mc,
+            )
 
-        # ── RANKS 4-10 ───────────────────────────────────────────
-        for i, entry in enumerate(entries[3:10]):
-            rank = entry["rank"]
-            uname = entry["username"][:24]
-            val = entry["value"]
+            # 2. Glow halo behind hex.
+            halo = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            halo_draw = ImageDraw.Draw(halo)
+            halo_poly = _hex_polygon(cx, cy, rx + 16, ry + 16)
+            halo_draw.polygon(halo_poly, fill=(mc[0], mc[1], mc[2], 50))
+            halo = halo.filter(ImageFilter.GaussianBlur(radius=10))
+            img.alpha_composite(halo)
 
-            RH = 48
-            bg = C_CARD if i%2==0 else C_CARD_ALT
-            draw.rounded_rectangle([18,y,W-18,y+RH], radius=10, fill=bg, outline=C_BORDER, width=1)
+            # 3. Filled hex with bright outline.
+            draw.polygon(poly, fill=mbg, outline=mc)
+            for _ in range(2):
+                draw.polygon(poly, outline=mc)
+            # Inner thin dim outline for depth.
+            inner = _hex_polygon(cx, cy, rx - 10, ry - 10)
+            draw.polygon(inner, outline=mdim)
 
-            # Rank badge circle
-            draw.ellipse([30,y+10,58,y+38], fill=C_ACCENT)
-            rk_str = f"#{rank}"
-            rkw = draw.textlength(rk_str, font=fSmall)
-            draw.text((44-rkw//2, y+16), rk_str, fill=C_MUTED, font=fSmall)
+            # 4. Big rank glyph centered in hex.
+            rk_str = f"#{rank_num}"
+            rkw = draw.textlength(rk_str, font=fHexN)
+            # Vertically centred-ish in the hex (font ascent makes pure
+            # centring look low; nudge up a bit).
+            glyph_y = cy - 50
+            draw.text((cx - rkw / 2 + 4, glyph_y + 4), rk_str, fill=mdim, font=fHexN)
+            draw.text((cx - rkw / 2, glyph_y), rk_str, fill=mc, font=fHexN)
 
-            # Username
-            draw.text((72, y+13), uname, fill=C_WHITE, font=fBody)
+            # 5. Floating avatar.
+            _paste_avatar_circle(cx, avatar_cy, av_r, avatars.get(rank_num), mc)
 
-            # Value — right aligned
-            val_str = f"${val:,.2f}"
-            vw = draw.textlength(val_str, font=fBody)
-            draw.text((W-32, y+13), val_str, fill=C_GREEN, font=fBody, anchor="ra")
+            # 6. Small "#N" badge clipped to the avatar's top-left.
+            badge_w, badge_h = 42, 24
+            bx0 = cx - av_r - 10
+            by0 = avatar_cy - av_r - 8
+            draw.rounded_rectangle([bx0, by0, bx0 + badge_w, by0 + badge_h],
+                                   radius=8, fill=mbg, outline=mc, width=2)
+            bs = f"#{rank_num}"
+            bsw = draw.textlength(bs, font=fBadge)
+            draw.text((bx0 + (badge_w - bsw) / 2, by0 + 4), bs, fill=mc, font=fBadge)
 
-            y += RH + 5
+            # 7. Username + amount labels between the avatar and the hex top.
+            uname = (entry["username"][:18] if entry and entry.get("username") else "")
+            unw = draw.textlength(uname, font=fName)
+            draw.text((cx - unw / 2, label_top), uname, fill=C_WHITE, font=fName)
+            if entry:
+                val_str = value_formatter(entry["value"])
+                vw = draw.textlength(val_str, font=fAmt)
+                draw.text((cx - vw / 2, label_top + 28), val_str, fill=C_GREEN, font=fAmt)
 
-        # Empty state
-        if not entries:
-            draw.text(((W-100)//2, y+10), "No data yet", fill=C_MUTED, font=fBody)
-            y += 50
+            return cy + ry  # Return hex bottom y for caller layout.
 
-        # ── YOUR RANK CARD ────────────────────────────────────────
-        y += 20
-        draw.line([(30,y),(W-30,y)], fill=C_ACCENT, width=1)
-        y += 10
-        YR_H = 84
-        draw.rounded_rectangle([18,y,W-18,y+YR_H], radius=14, fill=(10,22,46), outline=C_BLUE, width=2)
-        # "YOUR RANK" label
-        draw.text((36, y+10), "YOUR POSITION", fill=C_MUTED, font=fSmall)
-        draw.line([(36, y+24),(W-36, y+24)], fill=C_ACCENT, width=1)
+        # Layout: hex centers and heights.
+        side_hex_h = 130
+        center_hex_h = 170
+        cx_left = int(W * 0.20)
+        cx_mid  = W // 2
+        cx_right = int(W * 0.80)
 
-        # Rank badge
+        # Avatar y positions (center sits higher = taller pedestal).
+        ctr_avatar_y  = HDR_H + 130
+        side_avatar_y = HDR_H + 170
+
+        ctr_bottom = _draw_hex_pedestal(
+            1, top3[0] if len(top3) >= 1 else None,
+            cx_mid, ctr_avatar_y, center_hex_h, True,
+        )
+        _ = _draw_hex_pedestal(
+            2, top3[1] if len(top3) >= 2 else None,
+            cx_left, side_avatar_y, side_hex_h, False,
+        )
+        _ = _draw_hex_pedestal(
+            3, top3[2] if len(top3) >= 3 else None,
+            cx_right, side_avatar_y, side_hex_h, False,
+        )
+
+        # ── RANKS 4-10 SEPARATOR ─────────────────────────────────
+        sep_y = ctr_bottom + 30
+        draw.line([(40, sep_y), (W - 40, sep_y)], fill=C_BORDER, width=1)
+        ranks_lbl = "RANKS  4 — 10"
+        rlw = draw.textlength(ranks_lbl, font=fSmall)
+        draw.rectangle([((W - rlw) // 2 - 8), sep_y - 8, ((W + rlw) // 2 + 8), sep_y + 8],
+                       fill=C_BG_MID)
+        draw.text(((W - rlw) // 2, sep_y - 7), ranks_lbl, fill=C_MUTED, font=fSmall)
+
+        # ── YOUR POSITION (left) + RANKS 4-10 ROWS (right) ───────
+        body_y = sep_y + 26
+        # Your-position card on the left.
+        YP_W = 250
+        YP_H = 170
+        YP_X = 22
+        draw.rounded_rectangle([YP_X, body_y, YP_X + YP_W, body_y + YP_H],
+                               radius=20, fill=(8, 18, 44), outline=C_BLUE, width=2)
+        # Soft outer glow.
+        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow)
+        gd.rounded_rectangle([YP_X - 6, body_y - 6, YP_X + YP_W + 6, body_y + YP_H + 6],
+                             radius=24, outline=(60, 160, 220, 80), width=4)
+        glow = glow.filter(ImageFilter.GaussianBlur(radius=4))
+        img.alpha_composite(glow)
+        # Header line.
+        draw.text((YP_X + 22, body_y + 18), your_rank_label, fill=C_MUTED, font=fSmall)
+        draw.line([(YP_X + 22, body_y + 40), (YP_X + YP_W - 22, body_y + 40)],
+                  fill=C_BORDER, width=1)
+        # Rank glyph + value.
         if user_rank is not None and isinstance(user_rank, int):
             rk_str = f"#{user_rank}"
             rk_color = C_GOLD
-            rk_bg = (30,22,4)
         else:
             rk_str = "–"
             rk_color = C_MUTED
-            rk_bg = C_CARD
-        rkw = draw.textlength(rk_str, font=fMed)
-        draw.rounded_rectangle([36,y+30,36+rkw+26,y+68], radius=10, fill=rk_bg, outline=rk_color, width=2)
-        draw.text((36+13, y+34), rk_str, fill=rk_color, font=fMed)
+        draw.text((YP_X + 22, body_y + 62), rk_str, fill=rk_color, font=fYRk)
+        draw.text((YP_X + 110, body_y + 78), your_value_label, fill=C_MUTED, font=fSmall)
+        if user_wagered > 0:
+            wv = value_formatter(user_wagered)
+        else:
+            wv = "—"
+        draw.text((YP_X + 110, body_y + 96), wv, fill=C_GREEN, font=fName)
 
-        # Wagered amount
-        waged_lbl = "Total Wagered"
-        waged_val = f"${user_wagered:,.2f}" if user_wagered > 0 else "No wager yet"
-        draw.text((rkw+82, y+32), waged_lbl, fill=C_MUTED, font=fSmall)
-        draw.text((rkw+82, y+48), waged_val, fill=C_GREEN, font=fH3)
+        # Right-side ranks 4-10 rows.
+        ROWS_X0 = YP_X + YP_W + 18
+        ROWS_X1 = W - 22
+        rows_y = body_y
+        ROW_H = 64
+        ROW_GAP = 8
+        rank_entries = list(entries[3:10])
+        # Always render exactly 7 slots (filled or empty) so the card stays
+        # visually balanced like the template.
+        for i in range(7):
+            row_top = rows_y + i * (ROW_H + ROW_GAP)
+            row_bot = row_top + ROW_H
+            if row_bot > body_y + YP_H + 220:
+                break
+            entry = rank_entries[i] if i < len(rank_entries) else None
+            row_filled = entry is not None
+            bg = C_CARD if row_filled else (10, 18, 38)
+            draw.rounded_rectangle([ROWS_X0, row_top, ROWS_X1, row_bot],
+                                   radius=12, fill=bg, outline=C_BORDER, width=1)
+            # Avatar circle (left).
+            ac_r = 18
+            ac_cx = ROWS_X0 + 26
+            ac_cy = (row_top + row_bot) // 2
+            draw.ellipse([ac_cx - ac_r, ac_cy - ac_r, ac_cx + ac_r, ac_cy + ac_r],
+                         fill=(18, 30, 60), outline=C_BORDER, width=1)
+            if row_filled:
+                rk_str = f"#{entry['rank']}"
+                rkw = draw.textlength(rk_str, font=fBadge)
+                draw.text((ac_cx - rkw / 2, ac_cy - 8), rk_str, fill=C_BLUE, font=fBadge)
+                # Username.
+                uname = entry["username"][:24]
+                draw.text((ac_cx + ac_r + 16, ac_cy - 10), uname, fill=C_WHITE, font=fBody)
+                # Value (right-aligned).
+                vstr = value_formatter(entry["value"])
+                vw = draw.textlength(vstr, font=fBody)
+                draw.text((ROWS_X1 - vw - 18, ac_cy - 10), vstr, fill=C_GREEN, font=fBody)
+            else:
+                # Empty placeholder row.
+                draw.text((ROWS_X1 - 28, ac_cy - 10), "—", fill=C_MUTED, font=fBody)
 
         # ── FOOTER ────────────────────────────────────────────────
-        y = H - 36
-        draw.line([(18,y),(W-18,y)], fill=C_ACCENT, width=1)
+        footer_y = H - 42
         footer = "Play Responsibly  •  Telegram Casino"
-        fw = draw.textlength(footer, font=fTiny)
-        draw.text(((W-fw)//2, y+10), footer, fill=(60,75,100), font=fTiny)
+        fw = draw.textlength(footer, font=fSmall)
+        draw.text(((W - fw) // 2, footer_y), footer, fill=C_MUTED, font=fSmall)
+        # Tiny diamond glyph in the bottom-right corner.
+        dx, dy = W - 36, footer_y - 4
+        diamond = [(dx, dy - 10), (dx + 10, dy), (dx, dy + 10), (dx - 10, dy)]
+        draw.polygon(diamond, fill=C_BLUE)
 
         # ── SAVE ──────────────────────────────────────────────────
         output = BytesIO()
@@ -10090,137 +10525,29 @@ async def generate_leaderboard_referral_image(context):
 
 
 def _render_leaderboard_referral_sync(entries, bot_username):
-    """Render referral leaderboard template."""
-    try:
-        W, H = 700, 750
-        img = Image.new("RGB", (W, H), (10, 28, 45))
-        draw = ImageDraw.Draw(img)
-
-        import random
-        rng = random.Random(42)
-        for _ in range(60):
-            sx = rng.randint(0, W)
-            sy = rng.randint(0, H)
-            sr = rng.randint(1, 2)
-            draw.ellipse([sx - sr, sy - sr, sx + sr, sy + sr], fill=(255, 255, 255, 150))
-
-        try:
-            f_title = ImageFont.truetype("bold.ttf", 26)
-            f_med = ImageFont.truetype("bold.ttf", 22)
-            f_reg = ImageFont.truetype("bold.ttf", 18)
-            f_small = ImageFont.truetype("bold.ttf", 15)
-            f_xsmall = ImageFont.truetype("bold.ttf", 12)
-            f_val = ImageFont.truetype("bold.ttf", 20)
-            f_section = ImageFont.truetype("bold.ttf", 18)
-            f_col_header = ImageFont.truetype("bold.ttf", 11)
-            f_big_rank = ImageFont.truetype("bold.ttf", 32)
-        except Exception:
-            f_title = f_med = f_reg = f_small = f_xsmall = f_val = f_section = f_col_header = f_big_rank = ImageFont.load_default()
-
-        y = 18
-
-        # Draw trophy icon using PIL shapes (emoji won't render in PIL)
-        trophy_cx, trophy_cy = W // 2, y + 12
-        # Trophy cup
-        draw.ellipse([trophy_cx - 14, trophy_cy - 14, trophy_cx + 14, trophy_cy + 8], outline=(255, 200, 100), width=2, fill=(60, 50, 20))
-        # Handles
-        draw.arc([trophy_cx - 22, trophy_cy - 10, trophy_cx - 6, trophy_cy + 8], 90, 270, fill=(255, 200, 100), width=2)
-        draw.arc([trophy_cx + 6, trophy_cy - 10, trophy_cx + 22, trophy_cy + 8], -90, 90, fill=(255, 200, 100), width=2)
-        # Base
-        draw.rectangle([trophy_cx - 6, trophy_cy + 8, trophy_cx + 6, trophy_cy + 16], fill=(255, 200, 100))
-        draw.rectangle([trophy_cx - 10, trophy_cy + 14, trophy_cx + 10, trophy_cy + 18], fill=(255, 200, 100))
-        y += 32
-
-        # Bot username (no tagline below)
-        bot_un = f"@{bot_username}"
-        bw = draw.textlength(bot_un, font=f_med)
-        draw.text((W - 15 - bw, y), bot_un, fill=(255, 200, 50), font=f_med)
-        y += 30
-
-        # Title
-        full_title = "PlayCasino Leaderboard"
-        ftw = draw.textlength(full_title, font=f_title)
-        title_x = (W - ftw) // 2
-        draw.line([(title_x - 60, y + 12), (title_x - 15, y + 12)], fill=(200, 100, 255), width=2)
-        draw.text((title_x, y), full_title, fill=(255, 255, 255), font=f_title)
-        draw.line([(title_x + ftw + 15, y + 12), (title_x + ftw + 60, y + 12)], fill=(200, 100, 255), width=2)
-        y += 42
-
-        # Section title
-        draw.rounded_rectangle([20, y, W - 20, y + 34], radius=8, outline=(200, 100, 255), width=2, fill=(35, 15, 50))
-        draw.text((40, y + 6), "🏆 Top Referrers", fill=(200, 100, 255), font=f_section)
-        y += 44
-
-        # Column headers
-        draw.text((50, y), "RANK", fill=(150, 150, 150), font=f_col_header)
-        draw.text((110, y), "PLAYER", fill=(150, 150, 150), font=f_col_header)
-        draw.text((W - 30, y), "REFERRALS", fill=(150, 150, 150), font=f_col_header, anchor="ra")
-        y += 20
-
-        medals = ["\U0001F947", "\U0001F948", "\U0001F949"]
-        medal_colors = [(255, 200, 50), (180, 180, 180), (205, 127, 50)]
-        medal_nums = ["1", "2", "3"]
-
-        for i, entry in enumerate(entries):
-            row_h = 42
-            rank = entry["rank"]
-            uname = entry["username"]
-            if len(uname) > 20:
-                uname = uname[:17] + "..."
-            ref_count = entry["referrals"]
-
-            if rank == 1:
-                row_color = (40, 25, 55)
-                draw.rounded_rectangle([20, y, W - 20, y + row_h], radius=10, outline=(200, 100, 255), width=2, fill=row_color)
-            elif rank <= 3:
-                row_color = (30, 20, 45)
-                draw.rounded_rectangle([20, y, W - 20, y + row_h], radius=10, fill=row_color)
-            else:
-                row_color = (22, 15, 35) if i % 2 == 0 else (18, 12, 30)
-                draw.rounded_rectangle([20, y, W - 20, y + row_h], radius=8, fill=row_color)
-
-            if rank <= 3:
-                # Draw colored medal circle with number
-                mc = medal_colors[rank - 1]
-                mx, my = 45, y + 12
-                draw.ellipse([mx - 10, my - 10, mx + 10, my + 10], fill=mc, outline=(255, 255, 255), width=1)
-                nw = draw.textlength(medal_nums[rank - 1], font=f_reg)
-                draw.text((mx - nw // 2, my - 9), medal_nums[rank - 1], fill=(30, 30, 30), font=f_reg)
-            else:
-                draw.text((38, y + 8), f"#{rank}", fill=(150, 150, 150), font=f_reg)
-
-            draw.text((110, y + 10), uname, fill=(255, 255, 255), font=f_reg)
-
-            val_str = str(ref_count)
-            vw = draw.textlength(val_str, font=f_val)
-            draw.text((W - 30, y + 10), val_str, fill=(200, 100, 255), font=f_val, anchor="ra")
-
-            y += row_h + 4
-
-        if not entries:
-            draw.text((W // 2 - 60, y), "No referrals yet", fill=(150, 150, 150), font=f_reg)
-            y += 30
-
-        # Your Rank box
-        y += 10
-        draw.rounded_rectangle([20, y, W - 20, y + 55], radius=12, outline=(200, 100, 255), width=2, fill=(35, 15, 50))
-        draw.rounded_rectangle([35, y + 10, 110, y + 45], radius=8, fill=(50, 20, 60), outline=(200, 100, 255), width=2)
-        draw.text((52, y + 13), "#---", fill=(255, 200, 50), font=f_big_rank)
-        draw.text((125, y + 10), "Your Rank", fill=(150, 200, 150), font=f_xsmall)
-        draw.text((125, y + 28), "0 referrals", fill=(200, 100, 255), font=f_small)
-
-        y += 70
-        draw.text(((W - 110) // 2, y), "Play responsibly", fill=(100, 100, 100), font=f_xsmall)
-
-        output = BytesIO()
-        img.save(output, format='JPEG', quality=92)
-        output.seek(0)
-        return output
-    except Exception as e:
-        logging.error(f"PIL referral leaderboard render error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+    """Render referral leaderboard with the same look as the main wagered
+    leaderboard. Re-uses ``_render_leaderboard_sync`` so the design stays in
+    sync with the example template (hex podium top-3, ranks 4-10, etc.).
+    """
+    converted = []
+    for e in (entries or []):
+        converted.append({
+            "rank": e.get("rank"),
+            "username": e.get("username", ""),
+            "value": int(e.get("referrals", 0) or 0),
+        })
+    return _render_leaderboard_sync(
+        entries=converted,
+        bot_username=bot_username,
+        section_title="All-Time Top Referrers",
+        user_rank=None,
+        user_wagered=0.0,
+        value_formatter=lambda v: (
+            f"{int(v):,} ref" if int(v) == 1 else f"{int(v):,} refs"
+        ),
+        your_rank_label="YOUR REFERRALS",
+        your_value_label="Total Referrals",
+    )
 
 
 # ============================================================
@@ -10834,17 +11161,50 @@ def _render_roulette_sync(username, bet_amount, choice, choice_numbers, winning_
         return None
 
 
+# Per-user in-flight fetches so the first miss for a hot user doesn't fan out
+# to N parallel Telegram API calls when N concurrent commands all need the
+# same avatar (e.g. broadcast/replay scenarios). The first caller does the
+# real fetch, the rest await the same Future.
+_profile_pic_inflight: dict = {}  # user_id -> asyncio.Future
+
+
 async def _get_cached_profile_picture(context, user_id: int):
-    """Return cached profile picture or fetch a fresh one."""
+    """Return cached profile picture or fetch a fresh one.
+
+    PERFORMANCE: coalesces concurrent misses for the same user into a
+    single ``get_user_profile_picture`` call so we never hit the
+    Telegram API N times for the same avatar within a single render
+    burst.
+    """
     now = datetime.now().timestamp()
     cached = _profile_pic_cache.get(user_id)
     if cached:
         img, ts = cached
         if now - ts < _PROFILE_PIC_CACHE_TTL:
             return img
-    img = await get_user_profile_picture(context, user_id)
-    _profile_pic_cache[user_id] = (img, now)
-    return img
+
+    inflight = _profile_pic_inflight.get(user_id)
+    if inflight is not None and not inflight.done():
+        try:
+            return await inflight
+        except Exception:
+            return None
+
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    _profile_pic_inflight[user_id] = fut
+    try:
+        img = await get_user_profile_picture(context, user_id)
+        _profile_pic_cache[user_id] = (img, now)
+        if not fut.done():
+            fut.set_result(img)
+        return img
+    except Exception as e:
+        if not fut.done():
+            fut.set_exception(e)
+        raise
+    finally:
+        _profile_pic_inflight.pop(user_id, None)
 
 async def ensure_user_in_wallets(user_id: int, username: str = None, referrer_id: int = None, context: ContextTypes.DEFAULT_TYPE = None, first_name: str = None):
     """OPTIMIZED: Fast path for existing users, deferred API call for new users."""
@@ -11375,12 +11735,845 @@ def calculate_required_wager(user_id):
 
     return total_needed, breakdown
 
+
+# ============================================================
+# JACKPOT MODULE
+# ------------------------------------------------------------
+# Daily prize pool that accumulates a small percentage of every
+# bet placed. A winner is drawn each day at 5:30 PM IST among
+# users whose 7-day wager meets the configured threshold; the
+# winner is picked weighted by their 7-day wager.
+#
+# State lives in ``jackpot.json`` (next to the other JSON state
+# files). Per-user 7-day wager tracking is bucketed by UTC day
+# so it stays compact (max 7 entries per user).
+#
+# All player names / amounts displayed by this module are
+# computed at runtime from the bot's data — nothing is
+# hard-coded. The example template usernames are illustrative.
+# ============================================================
+
+JACKPOT_FILE = os.path.join(DATA_DIR, "jackpot.json")
+JACKPOT_DEFAULT_THRESHOLD_USD = 100.0    # 7-day wager required to be eligible
+JACKPOT_DEFAULT_ACCUM_RATE = 0.002        # 0.2 % of every bet -> jackpot
+JACKPOT_DRAW_HOUR_IST = 17                # 5:30 PM IST
+JACKPOT_DRAW_MINUTE_IST = 30
+JACKPOT_ANNOUNCE_CHAT = os.environ.get("JACKPOT_ANNOUNCE_CHAT", "@PlayCasino")
+JACKPOT_HISTORY_LIMIT = 50
+
+# IST is UTC+5:30, no daylight savings.
+_JACKPOT_IST_OFFSET = timedelta(hours=5, minutes=30)
+_jackpot_lock = asyncio.Lock()
+_jackpot_dirty = False
+_jackpot_state = {
+    "pool": 0.0,
+    "wager_threshold": JACKPOT_DEFAULT_THRESHOLD_USD,
+    "accum_rate": JACKPOT_DEFAULT_ACCUM_RATE,
+    "user_wagers": {},          # str(user_id) -> {"YYYY-MM-DD": float}
+    "last_winner": None,        # {user_id, username, amount, draw_iso, pool}
+    "history": [],              # last N draws
+    "last_draw_iso": None,
+}
+_jackpot_loaded = False
+
+
+def _jackpot_today_utc_key(now=None):
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%d")
+
+
+def _jackpot_load():
+    """Load jackpot state from disk. Idempotent and safe to call early."""
+    global _jackpot_loaded
+    if _jackpot_loaded:
+        return
+    _jackpot_loaded = True
+    try:
+        if os.path.exists(JACKPOT_FILE):
+            with open(JACKPOT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k in ("pool", "wager_threshold", "accum_rate"):
+                if k in data:
+                    try:
+                        _jackpot_state[k] = float(data[k])
+                    except (TypeError, ValueError):
+                        pass
+            if isinstance(data.get("user_wagers"), dict):
+                _jackpot_state["user_wagers"] = data["user_wagers"]
+            if isinstance(data.get("last_winner"), dict):
+                _jackpot_state["last_winner"] = data["last_winner"]
+            if isinstance(data.get("history"), list):
+                _jackpot_state["history"] = data["history"][-JACKPOT_HISTORY_LIMIT:]
+            _jackpot_state["last_draw_iso"] = data.get("last_draw_iso")
+            logging.info(
+                "Jackpot loaded: pool=$%.2f threshold=$%.2f rate=%.4f users=%d",
+                _jackpot_state["pool"], _jackpot_state["wager_threshold"],
+                _jackpot_state["accum_rate"], len(_jackpot_state["user_wagers"]),
+            )
+    except Exception as e:
+        logging.error(f"Failed to load jackpot state: {e}")
+
+
+def _jackpot_mark_dirty():
+    global _jackpot_dirty
+    _jackpot_dirty = True
+
+
+def _jackpot_save_now():
+    """Synchronous save. Cheap (small JSON), safe to call from async via run_in_executor."""
+    global _jackpot_dirty
+    try:
+        tmp = JACKPOT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_jackpot_state, f, indent=2, default=str)
+        os.replace(tmp, JACKPOT_FILE)
+        _jackpot_dirty = False
+    except Exception as e:
+        logging.error(f"Failed to save jackpot state: {e}")
+
+
+def _jackpot_prune_user(user_id):
+    """Keep only the last 7 UTC-day buckets for this user."""
+    key = str(user_id)
+    bucket = _jackpot_state["user_wagers"].get(key)
+    if not isinstance(bucket, dict):
+        return
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+    pruned = {d: v for d, v in bucket.items() if d > cutoff}
+    if pruned:
+        _jackpot_state["user_wagers"][key] = pruned
+    else:
+        _jackpot_state["user_wagers"].pop(key, None)
+
+
+def _jackpot_user_7d_wager(user_id) -> float:
+    _jackpot_load()
+    _jackpot_prune_user(user_id)
+    bucket = _jackpot_state["user_wagers"].get(str(user_id))
+    if not bucket:
+        return 0.0
+    try:
+        return float(sum(float(v) for v in bucket.values()))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _jackpot_credit(user_id: int, bet_amount_usd: float):
+    """Hook called from ``update_stats_on_bet``. Adds the configured
+    percentage of ``bet_amount_usd`` to the pool and records the bet
+    against the user's 7-day wager bucket."""
+    if bet_amount_usd is None or bet_amount_usd <= 0:
+        return
+    _jackpot_load()
+    rate = float(_jackpot_state.get("accum_rate", JACKPOT_DEFAULT_ACCUM_RATE) or 0.0)
+    contribution = float(bet_amount_usd) * rate
+    if contribution > 0:
+        _jackpot_state["pool"] = float(_jackpot_state.get("pool", 0.0)) + contribution
+    key = str(user_id)
+    bucket = _jackpot_state["user_wagers"].setdefault(key, {})
+    today = _jackpot_today_utc_key()
+    bucket[today] = float(bucket.get(today, 0.0)) + float(bet_amount_usd)
+    _jackpot_prune_user(user_id)
+    _jackpot_mark_dirty()
+
+
+def _jackpot_eligible_entries():
+    """Return list of (user_id_int, weight_float, username_str) for users
+    whose 7-day wager >= threshold."""
+    _jackpot_load()
+    threshold = float(_jackpot_state.get("wager_threshold", JACKPOT_DEFAULT_THRESHOLD_USD))
+    out = []
+    for key, bucket in list(_jackpot_state["user_wagers"].items()):
+        try:
+            uid = int(key)
+        except (TypeError, ValueError):
+            continue
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+        total = 0.0
+        if isinstance(bucket, dict):
+            for d, v in bucket.items():
+                if d > cutoff:
+                    try:
+                        total += float(v)
+                    except (TypeError, ValueError):
+                        pass
+        if total >= threshold:
+            uname = ""
+            try:
+                uname = (user_stats.get(uid, {}).get("userinfo", {}) or {}).get("username") or ""
+            except Exception:
+                uname = ""
+            out.append((uid, total, uname))
+    return out
+
+
+def _jackpot_pick_winner(entries):
+    """Weighted random pick. Returns (uid, weight, username) or None."""
+    if not entries:
+        return None
+    total_w = sum(e[1] for e in entries)
+    if total_w <= 0:
+        return None
+    r = random.uniform(0, total_w)
+    upto = 0.0
+    for entry in entries:
+        upto += entry[1]
+        if r <= upto:
+            return entry
+    return entries[-1]
+
+
+def _jackpot_next_draw_dt(now_utc=None):
+    """Return the next 5:30 PM IST datetime (UTC) at or after ``now_utc``."""
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc + _JACKPOT_IST_OFFSET
+    target_ist = now_ist.replace(
+        hour=JACKPOT_DRAW_HOUR_IST, minute=JACKPOT_DRAW_MINUTE_IST,
+        second=0, microsecond=0,
+    )
+    if target_ist <= now_ist:
+        target_ist = target_ist + timedelta(days=1)
+    return target_ist - _JACKPOT_IST_OFFSET
+
+
+async def _jackpot_run_draw(application):
+    """Perform the daily jackpot draw. Awards the pool to the winner,
+    resets the pool to zero, announces in the configured group."""
+    async with _jackpot_lock:
+        _jackpot_load()
+        pool = float(_jackpot_state.get("pool", 0.0) or 0.0)
+        threshold = float(_jackpot_state.get("wager_threshold", JACKPOT_DEFAULT_THRESHOLD_USD))
+        entries = _jackpot_eligible_entries()
+        now_utc = datetime.now(timezone.utc)
+        draw_iso = now_utc.isoformat()
+
+        if not entries or pool <= 0:
+            logging.info(
+                "Jackpot draw skipped: pool=$%.2f eligible=%d threshold=$%.2f",
+                pool, len(entries), threshold,
+            )
+            _jackpot_state["last_draw_iso"] = draw_iso
+            _jackpot_mark_dirty()
+            try:
+                await asyncio.get_running_loop().run_in_executor(_save_executor, _jackpot_save_now)
+            except Exception:
+                pass
+            return None
+
+        winner = _jackpot_pick_winner(entries)
+        if winner is None:
+            return None
+        uid, weight, uname = winner
+        amount_won = pool
+
+        # Credit the winner.
+        try:
+            credit_wallet_safe(uid, amount_won)
+            try:
+                save_user_data(uid)
+            except Exception:
+                pass
+        except Exception as e:
+            logging.error(f"Failed to credit jackpot winner {uid}: {e}")
+            return None
+
+        # Reset the pool.
+        _jackpot_state["pool"] = 0.0
+        winner_record = {
+            "user_id": uid,
+            "username": uname,
+            "amount": amount_won,
+            "pool": amount_won,
+            "draw_iso": draw_iso,
+            "weight": weight,
+        }
+        _jackpot_state["last_winner"] = winner_record
+        _jackpot_state["last_draw_iso"] = draw_iso
+        history = _jackpot_state.setdefault("history", [])
+        history.append(winner_record)
+        if len(history) > JACKPOT_HISTORY_LIMIT:
+            del history[: -JACKPOT_HISTORY_LIMIT]
+        _jackpot_mark_dirty()
+        try:
+            await asyncio.get_running_loop().run_in_executor(_save_executor, _jackpot_save_now)
+        except Exception:
+            pass
+
+        # Announce the winner in @PlayCasino.
+        try:
+            bot_uname = await get_bot_username(type("ctx", (), {"bot": application.bot})())
+        except Exception:
+            bot_uname = "Casino"
+        try:
+            winner_pic = await _get_cached_profile_picture(
+                type("ctx", (), {"bot": application.bot})(), uid
+            )
+        except Exception:
+            winner_pic = None
+
+        try:
+            loop = asyncio.get_running_loop()
+            img_buf = await loop.run_in_executor(
+                _image_executor,
+                generate_jackpot_winner_image,
+                uname or f"User-{uid}",
+                amount_won,
+                bot_uname,
+                winner_pic,
+                draw_iso,
+            )
+        except Exception as e:
+            logging.error(f"Failed to render jackpot winner image: {e}")
+            img_buf = None
+
+        caption = (
+            f"\U0001F389 <b>JACKPOT WINNER!</b>\n\n"
+            f"@{uname} just won <b>${amount_won:,.2f}</b> from the daily jackpot!\n\n"
+            f"Play more, wager more, and you could be next."
+        )
+
+        try:
+            if img_buf is not None:
+                await application.bot.send_photo(
+                    chat_id=JACKPOT_ANNOUNCE_CHAT,
+                    photo=img_buf,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await application.bot.send_message(
+                    chat_id=JACKPOT_ANNOUNCE_CHAT,
+                    text=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception as e:
+            logging.error(f"Failed to announce jackpot winner in {JACKPOT_ANNOUNCE_CHAT}: {e}")
+
+        # Best-effort DM to the winner.
+        try:
+            await application.bot.send_message(
+                chat_id=uid,
+                text=(
+                    f"\U0001F389 You just won the daily jackpot — "
+                    f"<b>${amount_won:,.2f}</b> has been credited to your wallet."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+        logging.info(
+            "Jackpot drawn: winner=%s amount=$%.2f eligible=%d",
+            uname or uid, amount_won, len(entries),
+        )
+        return winner_record
+
+
+async def _jackpot_scheduler_task(application):
+    """Sleeps until the next 5:30 PM IST, runs the draw, repeats. Runs as a
+    long-lived task started from ``post_init``."""
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            next_dt = _jackpot_next_draw_dt(now_utc)
+            wait_s = max(1.0, (next_dt - now_utc).total_seconds())
+            logging.info(
+                "Jackpot scheduler: next draw at %s UTC (%.0fs)",
+                next_dt.isoformat(timespec="seconds"), wait_s,
+            )
+            await asyncio.sleep(wait_s)
+            try:
+                await _jackpot_run_draw(application)
+            except Exception as e:
+                logging.error(f"Jackpot draw error: {e}", exc_info=True)
+            # Small buffer so we don't immediately re-trigger if the draw
+            # finishes within the same minute.
+            await asyncio.sleep(65)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logging.error(f"Jackpot scheduler crashed: {e}", exc_info=True)
+            await asyncio.sleep(60)
+
+
+def _jackpot_prune_all():
+    """Drop every user-wager bucket entry older than 7 days. Keeps the
+    jackpot state file from growing unbounded as inactive users
+    accumulate stale day-buckets."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+    user_wagers = _jackpot_state.get("user_wagers", {})
+    if not isinstance(user_wagers, dict):
+        return
+    pruned_users = 0
+    for key in list(user_wagers.keys()):
+        bucket = user_wagers.get(key)
+        if not isinstance(bucket, dict):
+            user_wagers.pop(key, None)
+            pruned_users += 1
+            continue
+        cleaned = {d: v for d, v in bucket.items() if d > cutoff}
+        if cleaned:
+            user_wagers[key] = cleaned
+        else:
+            user_wagers.pop(key, None)
+            pruned_users += 1
+    if pruned_users:
+        _jackpot_mark_dirty()
+
+
+async def _jackpot_save_loop():
+    """Background loop that persists jackpot state when dirty (every 30s)
+    and prunes stale user-wager buckets (every 5 minutes)."""
+    last_prune_at = 0.0
+    while True:
+        try:
+            await asyncio.sleep(30)
+            try:
+                import time as _t
+                now_mono = _t.monotonic()
+                if now_mono - last_prune_at > 300:
+                    last_prune_at = now_mono
+                    _jackpot_prune_all()
+            except Exception as e:
+                logging.error(f"Jackpot prune failed: {e}")
+            if _jackpot_dirty:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(_save_executor, _jackpot_save_now)
+                except Exception as e:
+                    logging.error(f"Jackpot background save failed: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logging.error(f"Jackpot save loop error: {e}")
+
+
+# ----- Jackpot PIL renderers (status + winner) -----
+
+def _jackpot_get_font(size: int):
+    paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for p in paths:
+        try:
+            if os.path.exists(p):
+                return ImageFont.truetype(p, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _jackpot_paste_circle_avatar(img, avatar, x, y, size, ring_color):
+    """Paste a circular avatar onto ``img`` at (x, y). Returns possibly
+    converted RGB ``img`` and a fresh ``ImageDraw``."""
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([x - 2, y - 2, x + size + 2, y + size + 2],
+                 outline=ring_color, width=2)
+    if avatar is None:
+        draw.ellipse([x, y, x + size, y + size], fill=(20, 30, 60))
+        return img, draw
+    try:
+        a = avatar.resize((size, size), Image.LANCZOS)
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).ellipse([0, 0, size, size], fill=255)
+        rgba = img.convert("RGBA")
+        a_rgba = a.convert("RGBA")
+        a_rgba.putalpha(mask)
+        rgba.paste(a_rgba, (x, y), a_rgba)
+        img = rgba.convert("RGB")
+        return img, ImageDraw.Draw(img)
+    except Exception:
+        draw.ellipse([x, y, x + size, y + size], fill=(20, 30, 60))
+        return img, draw
+
+
+def generate_jackpot_status_image(
+    pool_amount: float,
+    wager_threshold: float,
+    user_7d_wager: float,
+    next_draw_in_seconds: float,
+    last_winner: dict | None,
+    bot_username: str,
+    player_username: str | None = None,
+    player_profile_pic=None,
+) -> BytesIO:
+    """Render the /jackpot status card. All player names / amounts are
+    runtime values — nothing is hard-coded."""
+    W, H = 800, 700
+    BG = (8, 12, 28)
+    GOLD = (255, 215, 80)
+    GOLD_DIM = (160, 120, 30)
+    GREEN = (0, 220, 130)
+    RED = (255, 80, 80)
+    BLUE = (0, 180, 255)
+    TXT = (240, 244, 255)
+    DIM = (140, 160, 200)
+    BORDER = (28, 60, 120)
+
+    img = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+
+    # Subtle radial glow + grid background.
+    cx, cy = W // 2, 260
+    for r in range(280, 0, -14):
+        a = int(14 * (r / 280))
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                     fill=(8 + a, 12 + a // 2, 28 + a))
+    for gx in range(0, W, 50):
+        draw.line([(gx, 0), (gx, H)], fill=(20, 35, 70), width=1)
+    for gy in range(0, H, 50):
+        draw.line([(0, gy), (W, gy)], fill=(20, 35, 70), width=1)
+
+    # Header bar.
+    f_title = _jackpot_get_font(34)
+    f_sub   = _jackpot_get_font(14)
+    f_lbl   = _jackpot_get_font(16)
+    f_pool  = _jackpot_get_font(72)
+    f_body  = _jackpot_get_font(16)
+    f_small = _jackpot_get_font(13)
+    f_tiny  = _jackpot_get_font(11)
+
+    # Top-left avatar + player username.
+    img, draw = _jackpot_paste_circle_avatar(img, player_profile_pic, 18, 14, 56, BLUE)
+    if player_username:
+        plabel = f"@{player_username}" if not player_username.startswith("@") else player_username
+        draw.text((86, 22), plabel, font=f_lbl, fill=TXT)
+        draw.text((86, 44), "Jackpot status", font=f_small, fill=DIM)
+
+    # Top-right bot watermark.
+    bot_lbl = f"@{bot_username}" if not bot_username.startswith("@") else bot_username
+    bw = draw.textlength(bot_lbl, font=f_lbl)
+    draw.text((W - bw - 18, 18), bot_lbl, font=f_lbl, fill=GOLD)
+    sub_brand = "Telegram Casino"
+    sbw = draw.textlength(sub_brand, font=f_tiny)
+    draw.text((W - sbw - 18, 44), sub_brand, font=f_tiny, fill=DIM)
+
+    # Title strip.
+    draw.line([(20, 86), (W - 20, 86)], fill=GOLD, width=2)
+    title = "DAILY JACKPOT"
+    tw = draw.textlength(title, font=f_title)
+    draw.text(((W - tw) // 2, 100), title, font=f_title, fill=GOLD)
+
+    # Pool amount (huge).
+    pool_str = f"${pool_amount:,.2f}"
+    pw = draw.textlength(pool_str, font=f_pool)
+    draw.text(((W - pw) // 2, 150), pool_str, font=f_pool, fill=GREEN)
+
+    pool_lbl = "current pool"
+    plw = draw.textlength(pool_lbl, font=f_small)
+    draw.text(((W - plw) // 2, 240), pool_lbl, font=f_small, fill=DIM)
+
+    # Countdown card.
+    card_y = 280
+    draw.rounded_rectangle([40, card_y, W - 40, card_y + 90], radius=16,
+                           fill=(12, 22, 50), outline=BORDER, width=2)
+    secs = max(0, int(next_draw_in_seconds))
+    hours = secs // 3600
+    mins = (secs % 3600) // 60
+    cd_str = f"{hours:02d}h {mins:02d}m"
+    draw.text((60, card_y + 14), "NEXT DRAW IN", font=f_lbl, fill=DIM)
+    draw.text((60, card_y + 40), cd_str, font=f_title, fill=GOLD)
+    rt = "Daily at 5:30 PM IST"
+    rtw = draw.textlength(rt, font=f_small)
+    draw.text((W - rtw - 60, card_y + 50), rt, font=f_small, fill=DIM)
+
+    # Eligibility / progress card.
+    elig_y = card_y + 110
+    draw.rounded_rectangle([40, elig_y, W - 40, elig_y + 130], radius=16,
+                           fill=(10, 18, 38), outline=BORDER, width=2)
+    draw.text((60, elig_y + 14), "YOUR 7-DAY WAGER", font=f_lbl, fill=DIM)
+    progress = 0.0 if wager_threshold <= 0 else min(1.0, user_7d_wager / wager_threshold)
+    eligible = user_7d_wager >= wager_threshold and wager_threshold > 0
+    bar_x0, bar_x1 = 60, W - 60
+    bar_y0 = elig_y + 50
+    bar_y1 = elig_y + 70
+    draw.rounded_rectangle([bar_x0, bar_y0, bar_x1, bar_y1], radius=10,
+                           fill=(18, 28, 56))
+    fill_w = int((bar_x1 - bar_x0) * progress)
+    if fill_w > 0:
+        bar_color = GREEN if eligible else BLUE
+        draw.rounded_rectangle(
+            [bar_x0, bar_y0, bar_x0 + fill_w, bar_y1], radius=10, fill=bar_color,
+        )
+    progress_text = f"${user_7d_wager:,.2f} / ${wager_threshold:,.2f}"
+    pw2 = draw.textlength(progress_text, font=f_body)
+    draw.text(((W - pw2) // 2, bar_y1 + 10), progress_text, font=f_body, fill=TXT)
+    if eligible:
+        status = "You are eligible for tonight's draw."
+        scolor = GREEN
+    else:
+        needed = max(0.0, wager_threshold - user_7d_wager)
+        status = f"Wager ${needed:,.2f} more in the next 7 days to qualify."
+        scolor = RED
+    sw = draw.textlength(status, font=f_small)
+    draw.text(((W - sw) // 2, bar_y1 + 32), status, font=f_small, fill=scolor)
+
+    # Last winner card.
+    lw_y = elig_y + 150
+    draw.rounded_rectangle([40, lw_y, W - 40, lw_y + 80], radius=16,
+                           fill=(20, 14, 4), outline=GOLD_DIM, width=2)
+    draw.text((60, lw_y + 12), "LAST WINNER", font=f_lbl, fill=GOLD_DIM)
+    if last_winner:
+        wn = last_winner.get("username") or f"User-{last_winner.get('user_id', '')}"
+        wn_lbl = f"@{wn}" if wn and not wn.startswith("@") else (wn or "")
+        draw.text((60, lw_y + 36), wn_lbl, font=f_lbl, fill=TXT)
+        amt_str = f"+${float(last_winner.get('amount', 0)):,.2f}"
+        aw = draw.textlength(amt_str, font=f_lbl)
+        draw.text((W - aw - 60, lw_y + 36), amt_str, font=f_lbl, fill=GREEN)
+    else:
+        draw.text((60, lw_y + 36), "No winners yet — be the first!", font=f_body, fill=DIM)
+
+    # Footer line.
+    foot = "0.2% of every bet feeds the pool  •  Play Responsibly  •  Telegram Casino"
+    fw = draw.textlength(foot, font=f_tiny)
+    draw.text(((W - fw) // 2, H - 22), foot, font=f_tiny, fill=(70, 95, 140))
+
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
+
+
+def generate_jackpot_winner_image(
+    winner_username: str,
+    amount_won: float,
+    bot_username: str,
+    winner_profile_pic=None,
+    draw_iso: str = None,
+) -> BytesIO:
+    """Render the @PlayCasino winner-announcement card."""
+    W, H = 900, 560
+    BG = (8, 12, 28)
+    GOLD = (255, 215, 80)
+    GOLD_DIM = (160, 120, 30)
+    GREEN = (0, 220, 130)
+    BLUE = (0, 180, 255)
+    TXT = (245, 248, 255)
+    DIM = (150, 170, 210)
+    BORDER = (40, 70, 130)
+
+    img = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+
+    # Big radial glow centred on the avatar.
+    cx, cy = W // 2, 250
+    for r in range(360, 0, -16):
+        a = int(20 * (r / 360))
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                     fill=(10 + a, 14 + a // 2, 32 + a))
+    for gx in range(0, W, 50):
+        draw.line([(gx, 0), (gx, H)], fill=(22, 38, 72), width=1)
+    for gy in range(0, H, 50):
+        draw.line([(0, gy), (W, gy)], fill=(22, 38, 72), width=1)
+
+    f_title = _jackpot_get_font(40)
+    f_sub   = _jackpot_get_font(18)
+    f_lbl   = _jackpot_get_font(16)
+    f_amt   = _jackpot_get_font(80)
+    f_body  = _jackpot_get_font(20)
+    f_tiny  = _jackpot_get_font(12)
+
+    # Top-right bot label.
+    bot_lbl = f"@{bot_username}" if not bot_username.startswith("@") else bot_username
+    bw = draw.textlength(bot_lbl, font=f_lbl)
+    draw.text((W - bw - 18, 18), bot_lbl, font=f_lbl, fill=GOLD)
+    brand = "Telegram Casino"
+    bsw = draw.textlength(brand, font=f_tiny)
+    draw.text((W - bsw - 18, 40), brand, font=f_tiny, fill=DIM)
+
+    # Header strip.
+    draw.line([(20, 70), (W - 20, 70)], fill=GOLD, width=2)
+    title = "JACKPOT WINNER"
+    tw = draw.textlength(title, font=f_title)
+    draw.text(((W - tw) // 2, 86), title, font=f_title, fill=GOLD)
+
+    # Big avatar centred.
+    av_size = 130
+    av_x = (W - av_size) // 2
+    av_y = 150
+    img, draw = _jackpot_paste_circle_avatar(img, winner_profile_pic, av_x, av_y, av_size, GOLD)
+
+    # Winner username.
+    wn = winner_username or "Player"
+    wn_lbl = f"@{wn}" if not wn.startswith("@") else wn
+    nw = draw.textlength(wn_lbl, font=f_body)
+    draw.text(((W - nw) // 2, av_y + av_size + 14), wn_lbl, font=f_body, fill=TXT)
+
+    # Amount.
+    amt_str = f"${amount_won:,.2f}"
+    aw = draw.textlength(amt_str, font=f_amt)
+    draw.text(((W - aw) // 2, av_y + av_size + 50), amt_str, font=f_amt, fill=GREEN)
+
+    # Sub-line.
+    sub = "won the daily jackpot"
+    sw = draw.textlength(sub, font=f_sub)
+    draw.text(((W - sw) // 2, av_y + av_size + 142), sub, font=f_sub, fill=DIM)
+
+    # Footer.
+    foot = "Play Responsibly  •  Telegram Casino  •  jackpot"
+    fw = draw.textlength(foot, font=f_tiny)
+    draw.text(((W - fw) // 2, H - 24), foot, font=f_tiny, fill=(70, 95, 140))
+
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
+
+
+@check_banned
+@check_maintenance
+async def jackpot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """``/jackpot`` — show jackpot status (any user).
+
+    ``/jackpot <amount>`` — owner-only, sets the 7-day wager threshold.
+    ``/jackpot rate <0..1>`` — owner-only, sets the accumulator rate.
+    """
+    user = update.effective_user
+    if not user:
+        return
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    _jackpot_load()
+
+    args = context.args or []
+
+    # --- Owner controls ---
+    if args and is_admin(user.id):
+        first = args[0].lower()
+        if first in ("rate",) and len(args) >= 2:
+            try:
+                new_rate = float(args[1])
+            except ValueError:
+                await update.message.reply_text("Usage: /jackpot rate <0..1>")
+                return
+            if new_rate < 0 or new_rate > 0.5:
+                await update.message.reply_text(
+                    "Rate must be between 0 and 0.5 (i.e. 0%–50%)."
+                )
+                return
+            async with _jackpot_lock:
+                _jackpot_state["accum_rate"] = new_rate
+                _jackpot_mark_dirty()
+                await asyncio.get_running_loop().run_in_executor(_save_executor, _jackpot_save_now)
+            await update.message.reply_text(
+                f"Jackpot accumulator rate set to {new_rate*100:.2f}% per bet.")
+            return
+        if first in ("draw",):
+            await update.message.reply_text("Triggering jackpot draw…")
+            try:
+                rec = await _jackpot_run_draw(context.application)
+                if rec is None:
+                    await update.message.reply_text(
+                        "Draw skipped — no eligible users or empty pool.")
+                else:
+                    await update.message.reply_text(
+                        f"Drew jackpot: @{rec.get('username') or rec.get('user_id')} "
+                        f"won ${rec.get('amount', 0):,.2f}."
+                    )
+            except Exception as e:
+                await update.message.reply_text(f"Draw failed: {e}")
+            return
+        # Otherwise treat first arg as new threshold amount.
+        try:
+            new_thr = float(args[0].replace("$", "").replace(",", ""))
+        except ValueError:
+            await update.message.reply_text(
+                "Usage:\n"
+                "  /jackpot              — view jackpot status\n"
+                "  /jackpot <amount>     — (owner) set 7-day wager threshold\n"
+                "  /jackpot rate <0..1>  — (owner) set accumulator rate\n"
+                "  /jackpot draw         — (owner) trigger an immediate draw"
+            )
+            return
+        if new_thr < 0:
+            await update.message.reply_text("Threshold must be >= 0.")
+            return
+        async with _jackpot_lock:
+            _jackpot_state["wager_threshold"] = new_thr
+            _jackpot_mark_dirty()
+            await asyncio.get_running_loop().run_in_executor(_save_executor, _jackpot_save_now)
+        await update.message.reply_text(
+            f"Jackpot wager threshold set to ${new_thr:,.2f} (7-day wager)."
+        )
+        return
+
+    # --- Player view ---
+    pool = float(_jackpot_state.get("pool", 0.0))
+    threshold = float(_jackpot_state.get("wager_threshold", JACKPOT_DEFAULT_THRESHOLD_USD))
+    user_w = _jackpot_user_7d_wager(user.id)
+    last_winner = _jackpot_state.get("last_winner")
+
+    now_utc = datetime.now(timezone.utc)
+    next_dt = _jackpot_next_draw_dt(now_utc)
+    secs = max(0, int((next_dt - now_utc).total_seconds()))
+
+    bot_uname = await get_bot_username(context)
+    profile_pic = await _get_cached_profile_picture(context, user.id)
+
+    try:
+        loop = asyncio.get_running_loop()
+        img_buf = await loop.run_in_executor(
+            _image_executor,
+            generate_jackpot_status_image,
+            pool, threshold, user_w, secs, last_winner,
+            bot_uname, user.username, profile_pic,
+        )
+    except Exception as e:
+        logging.error(f"Jackpot status render failed: {e}")
+        img_buf = None
+
+    rate_pct = float(_jackpot_state.get("accum_rate", JACKPOT_DEFAULT_ACCUM_RATE)) * 100
+    eligible = user_w >= threshold
+    elig_line = (
+        "\u2705 You are eligible for tonight's draw."
+        if eligible
+        else f"Wager ${max(0.0, threshold - user_w):,.2f} more in the next 7 days to qualify."
+    )
+    last_line = ""
+    if isinstance(last_winner, dict) and last_winner.get("username"):
+        last_line = (
+            f"\nLast winner: @{last_winner['username']} "
+            f"won ${float(last_winner.get('amount', 0)):,.2f}"
+        )
+    caption = (
+        f"\U0001F4B0 <b>Daily Jackpot</b>\n"
+        f"Pool: <b>${pool:,.2f}</b>\n"
+        f"Your 7-day wager: ${user_w:,.2f} / ${threshold:,.2f}\n"
+        f"Each bet contributes {rate_pct:.2f}% to the pool.\n"
+        f"Draw: 5:30 PM IST daily.\n"
+        f"{elig_line}{last_line}"
+    )
+
+    try:
+        if img_buf is not None:
+            await update.message.reply_photo(
+                photo=img_buf, caption=caption, parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.message.reply_text(caption, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logging.error(f"Failed to send jackpot status: {e}")
+
+
+# ============================================================
+# END JACKPOT MODULE
+# ============================================================
+
+
 async def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False,
                                multiplier=0, context=None, game_type=None):
     """OPTIMIZED ASYNC version. Fast in-memory mutations only. Defers all heavy work."""
     stats = user_stats[user_id]
     stats["bets"]["count"] += 1
     stats["bets"]["amount"] += amount
+    # Jackpot accumulator hook: 0.2% of every bet feeds the pool, and the
+    # bet contributes to the user's 7-day eligibility wager.
+    try:
+        _jackpot_credit(user_id, amount)
+    except Exception as _e:
+        logging.error(f"Jackpot credit hook failed: {_e}")
 
     reduce_unwagered_amounts(user_id, amount)
 
@@ -13430,241 +14623,407 @@ def generate_bj_image(
     split_bets: list = None,  # List of bet amounts for each split hand
     split_results: list = None,  # List of results for completed hands: [{status, value}]
 ) -> BytesIO:
-    """
-    Render a 800x500 (or 800x600 for split) blackjack table image with neon bluish-black theme.
+    """Render the blackjack table image — circuit-board / neon-result design.
 
-    - dealer_hand[0] is always shown face-up.
-    - dealer_hand[1] is hidden unless show_dealer_hole=True.
-    - Additional dealer cards (index 2+) are always shown face-up.
-    - Player profile pic + name at top left
-    - Bot username at top right
-    - For split mode: shows two player hands with blue highlight on active hand
-    - Returns a BytesIO PNG buffer.
+    Mirrors ``example_designs/blackjack_pil_image_template_design.png``.
+    Layout:
+      - Wide canvas with a navy → faint-purple gradient + decorative
+        circuit-board lines on the left and right edges.
+      - Wireframe-mesh head avatar in the top-left, "@bot_username" in
+        the top-right (blue).
+      - Gold "DEALER" pill at top-centre + "Value: N" below it.
+      - Dealer cards centred below the pill.
+      - Glowing red "result band" overlapping the dealer card row when a
+        result is set (e.g. "Dealer Wins" / "Player Wins" / "Push" /
+        "Blackjack!").
+      - Gold "PLAYER" label below the band, then either a single hand or
+        the split hands side-by-side. Hand 1 / Hand 2 labels are coloured
+        gold and red respectively (red = currently active in split mode
+        when the active hand is index 1, else gold).
+      - Bottom info bar: "Bet: $X" left, "BLACKJACK ALSO SUPPORTS SPLIT"
+        with a dice glyph centre, "BLACKJACK" gold + diamond right.
+      - Footer hairline: "Play Responsibly • Telegram Casino • blackjack".
     """
+    from PIL import ImageFilter as _ImgFilter
+
     is_split = split_hands is not None and len(split_hands) >= 2
-    W, H = (800, 600) if is_split else (800, 500)
-    img = Image.new("RGB", (W, H), BJ_TABLE_COLOR)
+    W, H = (1100, 820) if is_split else (1100, 720)
+
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Background gradient effect (subtle radial glow from center)
-    center_x, center_y = W // 2, H // 2
-    for radius in range(250, 0, -15):
-        alpha = int(12 * (radius / 250))
-        glow_color = (8 + alpha, 12 + alpha // 2, 28 + alpha)
-        draw.ellipse(
-            [center_x - radius * 2, center_y - radius, center_x + radius * 2, center_y + radius],
-            fill=glow_color
-        )
+    # ── BACKGROUND: navy → faint purple ──────────────────────
+    BG_TOP = (4, 8, 28)
+    BG_MID = (10, 8, 36)
+    BG_BOT = (28, 14, 50)
+    for yy in range(H):
+        t = yy / H
+        if t < 0.5:
+            u = t * 2
+            r = int(BG_TOP[0] + u * (BG_MID[0] - BG_TOP[0]))
+            g = int(BG_TOP[1] + u * (BG_MID[1] - BG_TOP[1]))
+            b = int(BG_TOP[2] + u * (BG_MID[2] - BG_TOP[2]))
+        else:
+            u = (t - 0.5) * 2
+            r = int(BG_MID[0] + u * (BG_BOT[0] - BG_MID[0]))
+            g = int(BG_MID[1] + u * (BG_BOT[1] - BG_MID[1]))
+            b = int(BG_MID[2] + u * (BG_BOT[2] - BG_MID[2]))
+        draw.line([(0, yy), (W, yy)], fill=(r, g, b))
 
-    # Background felt texture (subtle grid lines)
-    for gx in range(0, W, 40):
-        draw.line([(gx, 0), (gx, H)], fill=BJ_FELT_LINE, width=1)
-    for gy in range(0, H, 40):
-        draw.line([(0, gy), (W, gy)], fill=BJ_FELT_LINE, width=1)
+    # ── DECORATIVE CIRCUIT-BOARD LINES ───────────────────────
+    rng = random.Random(7)
+    line_color = (50, 35, 100)
+    pad_color  = (90, 60, 160)
+    band_y = H // 2 - 30
+    # Horizontal lines extending into the side margins (matches the template's
+    # circuit traces flanking the result band).
+    for side, x_start, sign in (
+        ("L", 20, 1), ("L", 20, 1), ("R", W - 20, -1), ("R", W - 20, -1),
+    ):
+        offset = rng.randint(-40, 40)
+        ly = band_y + offset
+        seg_n = rng.randint(2, 4)
+        cur_x = x_start
+        cur_y = ly
+        for _ in range(seg_n):
+            seg_len = rng.randint(60, 140)
+            draw.line([(cur_x, cur_y), (cur_x + sign * seg_len, cur_y)],
+                      fill=line_color, width=1)
+            cur_x += sign * seg_len
+            step = rng.choice([-30, -22, 22, 30])
+            draw.line([(cur_x, cur_y), (cur_x, cur_y + step)],
+                      fill=line_color, width=1)
+            cur_y += step
+        draw.ellipse([cur_x - 3, cur_y - 3, cur_x + 3, cur_y + 3],
+                     fill=pad_color)
+    # Generic mesh.
+    for _ in range(60):
+        sx = rng.choice([rng.randint(0, 90), rng.randint(W - 90, W - 1)])
+        sy = rng.randint(40, H - 80)
+        sl = rng.randint(40, 110)
+        sign = 1 if sx < W // 2 else -1
+        draw.line([(sx, sy), (sx + sign * sl, sy)],
+                  fill=line_color, width=1)
+    # Sparkle dots.
+    for _ in range(70):
+        sx, sy = rng.randint(0, W), rng.randint(0, H)
+        br = rng.randint(40, 130)
+        draw.ellipse([sx - 1, sy - 1, sx + 1, sy + 1], fill=(br, br, br + 20))
 
-    # Top header bar area
-    header_y = 50
+    # ── WIREFRAME HEAD (top-left) ───────────────────────────
+    head_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    head_draw = ImageDraw.Draw(head_layer)
+    h_cx, h_cy, h_rx, h_ry = 92, 100, 56, 70
+    head_draw.ellipse([h_cx - h_rx, h_cy - h_ry, h_cx + h_rx, h_cy + h_ry],
+                      outline=(70, 200, 255, 220), width=2)
+    for ang in range(-80, 81, 18):
+        rad = math.radians(ang)
+        x = h_cx + math.sin(rad) * h_rx
+        head_draw.line([(int(x), h_cy - h_ry), (int(x), h_cy + h_ry)],
+                       fill=(60, 170, 230, 110), width=1)
+    for ang in range(-70, 71, 18):
+        rad = math.radians(ang)
+        yy = h_cy + math.sin(rad) * h_ry
+        head_draw.line([(h_cx - h_rx, int(yy)), (h_cx + h_rx, int(yy))],
+                       fill=(60, 170, 230, 90), width=1)
+    head_draw.ellipse([h_cx - 3, h_cy - 5, h_cx + 3, h_cy + 1],
+                      fill=(180, 230, 255, 255))
+    head_layer = head_layer.filter(_ImgFilter.GaussianBlur(radius=0.5))
+    img.alpha_composite(head_layer)
 
-    # Player profile pic area at top left (50x50 circle placeholder)
-    profile_pic_size = 50
-    profile_pic_x, profile_pic_y = 15, 10
-
-    # Draw profile pic circle background
-    draw.ellipse(
-        [profile_pic_x, profile_pic_y, profile_pic_x + profile_pic_size, profile_pic_y + profile_pic_size],
-        fill=BJ_BORDER,
-        outline=BJ_ACCENT,
-        width=2
-    )
-
-    # If profile pic image provided, paste it (clipped to circle)
-    if player_profile_pic:
-        try:
-            profile_pic_resized = player_profile_pic.resize((profile_pic_size - 4, profile_pic_size - 4), Image.LANCZOS)
-            # Create circular mask
-            mask = Image.new("L", (profile_pic_size - 4, profile_pic_size - 4), 0)
-            mask_draw = ImageDraw.Draw(mask)
-            mask_draw.ellipse([0, 0, profile_pic_size - 4, profile_pic_size - 4], fill=255)
-            img_rgba = img.convert("RGBA")
-            profile_rgba = profile_pic_resized.convert("RGBA")
-            profile_rgba.putalpha(mask)
-            img_rgba.paste(profile_rgba, (profile_pic_x + 2, profile_pic_y + 2), profile_rgba)
-            img = img_rgba.convert("RGB")
-            draw = ImageDraw.Draw(img)
-        except Exception:
-            pass
-
-    # Player name next to profile pic
-    font_player = _bj_get_font(16)
-    if player_username:
-        display_name = f"@{player_username}" if not player_username.startswith("@") else player_username
-        draw.text((profile_pic_x + profile_pic_size + 10, profile_pic_y + 12), display_name, font=font_player, fill=BJ_TEXT_WHITE)
-
-    # Bot username at top right corner
-    font_wm = _bj_get_font(16)
+    # ── TOP-RIGHT BOT USERNAME ──────────────────────────────
+    font_bot = _bj_get_font(28)
     wm_text = f"@{bot_username}" if not bot_username.startswith("@") else bot_username
-    wm_w = draw.textlength(wm_text, font=font_wm)
-    draw.text((W - wm_w - 15, 18), wm_text, font=font_wm, fill=BJ_ACCENT)
+    wm_w = draw.textlength(wm_text, font=font_bot)
+    draw.text((W - wm_w - 30, 30), wm_text, font=font_bot, fill=(90, 200, 255))
 
-    # Decorative divider line below header
-    draw.line([(15, header_y + 5), (W - 15, header_y + 5)], fill=BJ_BORDER, width=1)
+    # ── DEALER PILL ─────────────────────────────────────────
+    font_pill = _bj_get_font(22)
+    dealer_lbl = "DEALER"
+    dlw = draw.textlength(dealer_lbl, font=font_pill)
+    pill_w = int(dlw + 70)
+    pill_h = 44
+    pill_x = (W - pill_w) // 2
+    pill_y = 50
+    draw.rounded_rectangle(
+        [pill_x, pill_y, pill_x + pill_w, pill_y + pill_h],
+        radius=20, fill=(28, 18, 8), outline=BJ_TEXT_GOLD, width=2,
+    )
+    draw.text((pill_x + (pill_w - dlw) / 2, pill_y + 8),
+              dealer_lbl, font=font_pill, fill=BJ_TEXT_GOLD)
 
-    # Divider line between dealer and player sections
-    draw.line([(30, H // 2 + 10), (W - 30, H // 2 + 10)], fill=BJ_BORDER, width=1)
-
-    font_label  = _bj_get_font(18)
-    font_value  = _bj_get_font(20)
-    font_result = _bj_get_font(32)
-    font_info   = _bj_get_font(15)
-    font_small  = _bj_get_font(13)
-
-    # Offset content below header
-    content_offset = header_y + 15
-
-    # DEALER section
-    draw.text((40, content_offset), "DEALER", font=font_label, fill=BJ_TEXT_GOLD)
-
-    # Calculate dealer display value
-    if show_dealer_hole:
-        d_val_str = f"Value: {dealer_value}" if dealer_value else ""
+    # Dealer value text below pill.
+    font_val = _bj_get_font(22)
+    if show_dealer_hole and dealer_value is not None:
+        dv_str = f"Value: {dealer_value}"
+    elif dealer_value is not None and len(dealer_hand or []) > 0:
+        dv_str = f"Value: ?"
     else:
-        # Only show value of the visible card
-        if dealer_hand:
-            rank0, _ = _bj_parse_card(dealer_hand[0])
-            if rank0 in ('J', 'Q', 'K'):
-                visible_val = 10
-            elif rank0 == 'A':
-                visible_val = 11
-            else:
-                try:
-                    visible_val = int(rank0)
-                except ValueError:
-                    visible_val = 0
-            d_val_str = f"Shows: {visible_val}"
-        else:
-            d_val_str = ""
+        dv_str = ""
+    if dv_str:
+        dvw = draw.textlength(dv_str, font=font_val)
+        draw.text(((W - dvw) / 2, pill_y + pill_h + 6),
+                  dv_str, font=font_val, fill=BJ_TEXT_WHITE)
 
-    draw.text((40, content_offset + 20), d_val_str, font=font_value, fill=BJ_TEXT_LIGHT)
+    # ── DEALER CARDS ────────────────────────────────────────
+    dealer_cards = list(dealer_hand or [])
+    n_dealer = len(dealer_cards)
+    # Larger card size for visual presence.
+    CARD_W2 = int(BJ_CARD_W * 1.4)
+    CARD_H2 = int(BJ_CARD_H * 1.4)
+    card_gap = 10
+    dealer_row_w = n_dealer * CARD_W2 + (n_dealer - 1) * card_gap if n_dealer else 0
+    dealer_x0 = (W - dealer_row_w) // 2
+    dealer_y0 = pill_y + pill_h + 50
 
-    # Draw dealer cards starting x=40, y=content_offset + 45
-    dx, dy = 40, content_offset + 45
-    for i, card_str in enumerate(dealer_hand):
-        rank, suit = _bj_parse_card(card_str)
+    # Save current image temporarily as RGB for card drawing helpers, then we
+    # composite back. Use an RGB buffer to leverage the existing helpers.
+    rgb_img = img.convert("RGB")
+    rgb_draw = ImageDraw.Draw(rgb_img)
+
+    def _draw_card_scaled(rgb_draw_, x, y, rank, suit, scale=1.4):
+        """Draw a single face-up card scaled up from the base 78x110 template."""
+        cw = int(BJ_CARD_W * scale)
+        ch = int(BJ_CARD_H * scale)
+        # Shadow.
+        rgb_draw_.rounded_rectangle([x + 3, y + 3, x + cw + 3, y + ch + 3],
+                                     radius=BJ_CARD_RADIUS + 2,
+                                     fill=(0, 0, 0))
+        rgb_draw_.rounded_rectangle([x, y, x + cw, y + ch],
+                                     radius=BJ_CARD_RADIUS + 2,
+                                     fill=BJ_CARD_BG,
+                                     outline=(180, 180, 180), width=1)
+        color = BJ_RED if suit in ('♥', '♦') else BJ_BLACK_SUIT
+        f_rank = _bj_get_font(int(28 * scale / 1.4))
+        f_suit_corner = _bj_get_font(int(24 * scale / 1.4))
+        f_suit_center = _bj_get_font(int(54 * scale / 1.4))
+        # Top-left rank + suit.
+        rgb_draw_.text((x + 8, y + 6), rank, font=f_rank, fill=color)
+        rgb_draw_.text((x + 8, y + 6 + int(28 * scale / 1.4)), suit,
+                       font=f_suit_corner, fill=color)
+        # Center suit pip.
+        cx = x + cw // 2
+        cy = y + ch // 2
+        sw = rgb_draw_.textlength(suit, font=f_suit_center)
+        rgb_draw_.text((cx - sw / 2, cy - int(36 * scale / 1.4)),
+                       suit, font=f_suit_center, fill=color)
+        # Bottom-right (rotated-feel) rank + suit.
+        rgb_draw_.text((x + cw - 22, y + ch - int(60 * scale / 1.4)),
+                       rank, font=f_rank, fill=color)
+        rgb_draw_.text((x + cw - 22, y + ch - int(34 * scale / 1.4)),
+                       suit, font=f_suit_corner, fill=color)
+
+    def _draw_hidden_scaled(rgb_draw_, x, y, scale=1.4):
+        cw = int(BJ_CARD_W * scale)
+        ch = int(BJ_CARD_H * scale)
+        rgb_draw_.rounded_rectangle([x + 3, y + 3, x + cw + 3, y + ch + 3],
+                                     radius=BJ_CARD_RADIUS + 2,
+                                     fill=(0, 0, 0))
+        rgb_draw_.rounded_rectangle([x, y, x + cw, y + ch],
+                                     radius=BJ_CARD_RADIUS + 2,
+                                     fill=BJ_CARD_BACK,
+                                     outline=(80, 80, 160), width=2)
+        for i in range(-ch, cw, 14):
+            rgb_draw_.line([(x + i, y), (x + i + ch, y + ch)],
+                            fill=(40, 60, 140), width=1)
+        f = _bj_get_font(int(28 * scale / 1.4))
+        rgb_draw_.text((x + cw // 2 - 10, y + ch // 2 - 16),
+                       "?", font=f, fill=(100, 120, 220))
+
+    for i, c in enumerate(dealer_cards):
+        cx = dealer_x0 + i * (CARD_W2 + card_gap)
         if i == 1 and not show_dealer_hole:
-            _bj_draw_hidden_card(draw, dx, dy)
+            _draw_hidden_scaled(rgb_draw, cx, dealer_y0)
         else:
-            _bj_draw_card(draw, dx, dy, rank, suit)
-        dx += BJ_CARD_W + 12
+            rank, suit = _bj_parse_card(c)
+            _draw_card_scaled(rgb_draw, cx, dealer_y0, rank, suit)
 
-    # PLAYER section (below divider)
-    player_section_y = H // 2 + 25 if not is_split else 280
-    draw.text((40, player_section_y), "PLAYER", font=font_label, fill=BJ_TEXT_GOLD)
+    # Re-composite RGB image back into our RGBA workspace.
+    img = rgb_img.convert("RGBA")
+    draw = ImageDraw.Draw(img)
+
+    # ── RESULT BAND (only when result_text is provided) ─────
+    if result_text:
+        is_win = result_color == BJ_WIN_COLOR or (result_color and result_color[1] > 200 and result_color[0] < 200)
+        is_push = result_color == BJ_PUSH_COLOR or (result_color and result_color[0] > 200 and result_color[1] > 150 and result_color[2] < 100)
+        if is_win:
+            band_color = (60, 235, 130)
+            band_inner = (8, 36, 22)
+        elif is_push:
+            band_color = (240, 200, 60)
+            band_inner = (40, 30, 8)
+        else:
+            band_color = (255, 70, 80)
+            band_inner = (50, 8, 16)
+
+        band_w = int(W * 0.65)
+        band_h = 110
+        band_x = (W - band_w) // 2
+        band_y = dealer_y0 + CARD_H2 - 30  # overlap the bottom of dealer cards
+        # Soft outer glow.
+        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow)
+        for k, (alpha, pad) in enumerate([(140, 18), (90, 12), (60, 6)]):
+            gd.rounded_rectangle(
+                [band_x - pad, band_y - pad, band_x + band_w + pad, band_y + band_h + pad],
+                radius=18,
+                fill=(band_color[0], band_color[1], band_color[2], alpha),
+            )
+        glow = glow.filter(_ImgFilter.GaussianBlur(radius=14))
+        img.alpha_composite(glow)
+        draw = ImageDraw.Draw(img)
+        # Band fill.
+        draw.rounded_rectangle(
+            [band_x, band_y, band_x + band_w, band_y + band_h],
+            radius=18, fill=band_inner, outline=band_color, width=3,
+        )
+        # Highlight.
+        draw.rounded_rectangle(
+            [band_x + 6, band_y + 6, band_x + band_w - 6, band_y + 16],
+            radius=6, fill=(band_color[0] // 4, band_color[1] // 4, band_color[2] // 4),
+        )
+        # Result text.
+        f_result = _bj_get_font(46)
+        rw = draw.textlength(result_text, font=f_result)
+        draw.text(
+            (band_x + (band_w - rw) / 2, band_y + (band_h - 50) / 2),
+            result_text, font=f_result, fill=BJ_TEXT_WHITE,
+        )
+        result_band_bottom = band_y + band_h
+    else:
+        result_band_bottom = dealer_y0 + CARD_H2
+
+    # ── PLAYER LABEL ────────────────────────────────────────
+    player_label = "PLAYER"
+    f_player_lbl = _bj_get_font(26)
+    plw = draw.textlength(player_label, font=f_player_lbl)
+    player_lbl_y = result_band_bottom + 18
+    draw.text(((W - plw) / 2, player_lbl_y),
+              player_label, font=f_player_lbl, fill=BJ_TEXT_GOLD)
+
+    # ── PLAYER CARDS ────────────────────────────────────────
+    rgb_img = img.convert("RGB")
+    rgb_draw = ImageDraw.Draw(rgb_img)
+    cards_top = player_lbl_y + 40
+    f_handlbl = _bj_get_font(20)
+    f_handval = _bj_get_font(22)
 
     if is_split:
-        # Split mode: draw two hands side by side horizontally
-        hand_spacing = 380  # Space between the two hand groups
-        hand_start_x = [40, 40 + hand_spacing]  # X positions for each hand
-
-        for hand_idx, hand in enumerate(split_hands[:2]):  # Max 2 hands
-            hand_x = hand_start_x[hand_idx]
-            hand_y = player_section_y + 25
-            hand_label = f"Hand {hand_idx + 1}"
-            is_active = (hand_idx == split_active_hand)
-
-            # Check if this hand is already resolved
-            hand_result = None
-            if split_results:
-                for r in split_results:
-                    if r["hand"] == hand_idx:
-                        hand_result = r
-                        break
-
-            # Draw hand label with highlight for active hand
-            label_color = BJ_ACCENT if is_active else BJ_TEXT_LIGHT
-            if hand_result and hand_result["status"] == "bust":
-                label_color = BJ_RED
-            elif hand_result and hand_result["status"] in ("stand", "21", "doubled"):
-                label_color = BJ_WIN_COLOR
-
-            draw.text((hand_x, hand_y), hand_label, font=font_label, fill=label_color)
-
-            # Hand value
-            h_value = calculate_hand_value(hand)
-            draw.text((hand_x, hand_y + 20), f"Value: {h_value}", font=font_value, fill=BJ_TEXT_LIGHT)
-
-            # Draw hand cards with blue highlight border if active
-            px, py = hand_x, hand_y + 45
-            if is_active and not hand_result:
-                # Draw blue highlight box around cards area
-                card_count = len(hand)
-                box_width = card_count * (BJ_CARD_W + 12) + 10
-                draw.rounded_rectangle(
-                    [px - 5, py - 5, px + box_width, py + BJ_CARD_H + 5],
-                    radius=8,
-                    outline=BJ_ACCENT,
-                    width=3
+        # Two hands side-by-side; each hand is its own card row centred in
+        # one half of the canvas.
+        for hi, hand in enumerate(split_hands[:2]):
+            n = max(2, len(hand))
+            row_w = n * CARD_W2 + (n - 1) * card_gap
+            # Box bounds.
+            x_center = int(W * (0.30 if hi == 0 else 0.70))
+            row_x0 = x_center - row_w // 2
+            for j, c in enumerate(hand):
+                rank, suit = _bj_parse_card(c)
+                _draw_card_scaled(rgb_draw, row_x0 + j * (CARD_W2 + card_gap),
+                                  cards_top, rank, suit)
+            # Hand label (Hand 1 left of cards, Hand 2 right of cards).
+            is_active = (split_active_hand == hi)
+            hand_color = BJ_TEXT_GOLD if hi == 0 else BJ_LOSE_COLOR
+            label_str = f"Hand {hi + 1}"
+            value_str = ""
+            if split_results and hi < len(split_results):
+                v = split_results[hi].get("value")
+                value_str = f"Value: {v}" if v is not None else ""
+            else:
+                # Fallback: compute from hand using calculate_hand_value when present.
+                try:
+                    v = calculate_hand_value(hand)
+                    value_str = f"Value: {v}"
+                except Exception:
+                    value_str = ""
+            label_x = (row_x0 - 110) if hi == 0 else (row_x0 + row_w + 30)
+            rgb_draw.text((label_x, cards_top + 10), label_str,
+                           font=f_handlbl, fill=hand_color)
+            if value_str:
+                rgb_draw.text((label_x, cards_top + 40), value_str,
+                               font=f_handval, fill=BJ_TEXT_WHITE)
+            # Active-hand outline (subtle red glow stroke).
+            if is_active and not split_results:
+                rgb_draw.rounded_rectangle(
+                    [row_x0 - 6, cards_top - 6,
+                     row_x0 + row_w + 6, cards_top + CARD_H2 + 6],
+                    radius=14, outline=BJ_LOSE_COLOR, width=2,
                 )
-
-            for card_str in hand:
-                rank, suit = _bj_parse_card(card_str)
-                _bj_draw_card(draw, px, py, rank, suit)
-                px += BJ_CARD_W + 12
-
-            # Bet amount for this hand
-            if split_bets and hand_idx < len(split_bets):
-                draw.text((hand_x, hand_y + BJ_CARD_H + 50), f"Bet: ${split_bets[hand_idx]:.2f}", font=font_small, fill=BJ_TEXT_LIGHT)
-
-            # Result status if resolved
-            if hand_result:
-                status_text = hand_result["status"].upper()
-                status_color = BJ_RED if hand_result["status"] == "bust" else BJ_WIN_COLOR
-                draw.text((hand_x + len(hand) * (BJ_CARD_W + 12) + 10, hand_y + 5), f"[{status_text}]", font=font_small, fill=status_color)
     else:
-        # Normal mode: single player hand
-        p_val_str = f"Value: {player_value}" if player_value else ""
-        draw.text((40, player_section_y + 20), p_val_str, font=font_value, fill=BJ_TEXT_LIGHT)
+        n = max(2, len(player_hand or []))
+        row_w = n * CARD_W2 + (n - 1) * card_gap
+        row_x0 = (W - row_w) // 2
+        for j, c in enumerate(player_hand or []):
+            rank, suit = _bj_parse_card(c)
+            _draw_card_scaled(rgb_draw, row_x0 + j * (CARD_W2 + card_gap),
+                              cards_top, rank, suit)
+        # Player value bottom-centered.
+        if player_value is not None:
+            pv_str = f"Value: {player_value}"
+            pvw = rgb_draw.textlength(pv_str, font=f_handval)
+            rgb_draw.text(((W - pvw) / 2, cards_top + CARD_H2 + 14),
+                           pv_str, font=f_handval, fill=BJ_TEXT_WHITE)
 
-        # Draw player cards
-        px, py = 40, player_section_y + 45
-        for card_str in player_hand:
-            rank, suit = _bj_parse_card(card_str)
-            _bj_draw_card(draw, px, py, rank, suit)
-            px += BJ_CARD_W + 12
+    img = rgb_img.convert("RGBA")
+    draw = ImageDraw.Draw(img)
 
-    # Result overlay (if game finished)
-    if result_text:
-        rc = result_color or BJ_WIN_COLOR
-        # Semi-transparent overlay band across center
-        overlay = Image.new("RGBA", (W, 60), (*rc, 160))
-        img_rgba = img.convert("RGBA")
-        img_rgba.paste(overlay, (0, H // 2 - 10), overlay)
-        img = img_rgba.convert("RGB")
-        draw = ImageDraw.Draw(img)
-        rw = draw.textlength(result_text, font=font_result)
-        draw.text(((W - rw) // 2, H // 2 - 22), result_text, font=font_result, fill=(255, 255, 255))
+    # ── BOTTOM INFO BAR ────────────────────────────────────
+    bar_h = 56
+    bar_y = H - bar_h - 26
+    draw.rounded_rectangle(
+        [16, bar_y, W - 16, bar_y + bar_h],
+        radius=14, fill=(14, 22, 50), outline=BJ_TEXT_GOLD, width=2,
+    )
+    # Bet (left).
+    bet_str = f"Bet: ${bet_amount:.2f}" if bet_amount is not None else "Bet: —"
+    f_bar = _bj_get_font(22)
+    draw.text((38, bar_y + (bar_h - 26) / 2), bet_str,
+              font=f_bar, fill=BJ_TEXT_WHITE)
+    # Center hint with dice glyph.
+    if is_split:
+        hint = "BLACKJACK SPLIT — ACTIVE HAND HIGHLIGHTED"
+    else:
+        hint = "BLACKJACK ALSO SUPPORTS SPLIT"
+    f_hint = _bj_get_font(18)
+    hw = draw.textlength(hint, font=f_hint)
+    # Dice glyph (small two-rect motif).
+    glyph_x = (W - hw) // 2 - 38
+    glyph_y = bar_y + (bar_h - 24) // 2
+    draw.rounded_rectangle([glyph_x, glyph_y, glyph_x + 22, glyph_y + 22],
+                           radius=4, fill=(220, 180, 80))
+    draw.rounded_rectangle([glyph_x + 8, glyph_y - 6,
+                             glyph_x + 30, glyph_y + 16],
+                           radius=4, fill=(180, 130, 40))
+    draw.text(((W - hw) / 2, bar_y + (bar_h - 22) / 2),
+              hint, font=f_hint, fill=BJ_TEXT_GOLD)
+    # Right "BLACKJACK" + diamond.
+    bj_lbl = "BLACKJACK"
+    f_bj = _bj_get_font(22)
+    bw2 = draw.textlength(bj_lbl, font=f_bj)
+    draw.text((W - bw2 - 60, bar_y + (bar_h - 26) / 2),
+              bj_lbl, font=f_bj, fill=BJ_TEXT_GOLD)
+    dx, dy = W - 38, bar_y + bar_h // 2
+    draw.polygon([(dx, dy - 10), (dx + 10, dy), (dx, dy + 10), (dx - 10, dy)],
+                 fill=(90, 200, 255))
 
-    # Bottom info bar
-    bar_y = H - 28
-    # Left: bet amount
-    left_text = ""
-    if bet_amount is not None:
-        left_text += f"Bet: ${bet_amount:.2f}"
-    if left_text:
-        draw.text((14, bar_y), left_text, font=font_info, fill=BJ_TEXT_LIGHT)
+    # ── FOOTER LINE ───────────────────────────────────────
+    footer = "Play Responsibly  •  Telegram Casino  •  blackjack"
+    f_footer = _bj_get_font(14)
+    fw = draw.textlength(footer, font=f_footer)
+    draw.text(((W - fw) // 2, H - 22), footer,
+              font=f_footer, fill=BJ_TEXT_DIM)
 
-    # Right: Game ID or subtle watermark
-    draw.text((W - 80, bar_y + 2), "BLACKJACK", font=font_small, fill=BJ_TEXT_DIM)
-
-    # Save to BytesIO
+    # ── PNG OUT ───────────────────────────────────────────
+    out = img.convert("RGB")
     buf = BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    out.save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf
 
 async def async_generate_bj_image(*args, **kwargs) -> BytesIO:
     """Async wrapper for generate_bj_image to avoid blocking the event loop."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: generate_bj_image(*args, **kwargs))
+    return await loop.run_in_executor(_image_executor, lambda: generate_bj_image(*args, **kwargs))
 
 
 # ============================================================
@@ -13823,7 +15182,7 @@ def generate_dice_rush_image() -> BytesIO:
 async def async_generate_dice_rush_image() -> BytesIO:
     """Async wrapper for generate_dice_rush_image to avoid blocking the event loop."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: generate_dice_rush_image())
+    return await loop.run_in_executor(_image_executor, lambda: generate_dice_rush_image())
 
 
 # ============================================================
@@ -13885,158 +15244,370 @@ def generate_limbo_image(
     bot_username: str = "Casino",
     game_id: str = None,
     currency: str = "USDT",
+    player_profile_pic = None,  # PIL Image or None
+    recent_players=None,  # list[{"name": str, "pic": PIL.Image|None}]
 ) -> BytesIO:
+    """Render the Limbo result image — retro perspective grid + neon green glow.
+
+    Mirrors ``example_designs/limbo_pil_image_template_design.png``.
+    Layout:
+      - Wide canvas, dark navy gradient with a retro vanishing-point grid
+        floor + side perspective rails (purple/magenta).
+      - Wireframe-mesh head avatar in the top-left.
+      - Top-right: '@bot_username' large + '@player_username' small.
+      - Two columns near the top:
+          • TARGET (blue label) + a thin gold-bordered pill with the
+            target multiplier and the game ID below it.
+          • OUTCOME (green/red label) + the outcome multiplier (no pill)
+            and the game ID below it.
+      - Center: massive radial green/red glow with the outcome
+        multiplier (e.g. ``3.00x``) huge in the middle.
+      - Below the glow: a rounded green/red-bordered card with
+        ``YOU WIN!`` / ``YOU LOSE`` + ``+/-$amount`` + ``Payout: $X``.
+      - Recent-players rail: a rounded gray-bordered card listing up
+        to three (avatar + display name) pairs from this chat's
+        recent limbo plays.
+      - Bottom info bar: ``Bet: $X CCY`` left, mountain glyph + ``LIMBO``
+        center, ``@bot_username`` right.
+      - Footer hairline ``Play Responsibly • Telegram Casino • limbo``.
+
+    ``recent_players`` is an optional list of dicts with keys
+    ``{"name": str, "pic": PIL.Image|None}`` describing the most recent
+    limbo plays in the same chat (max 3). When ``None``, the rail just
+    shows the current player.
     """
-    Render a 800x600 Limbo game result image with neon bluish-black theme.
-    
-    Shows:
-    - Target multiplier (top center)
-    - Outcome multiplier (center, large)
-    - Win/Loss result
-    - Player username + bet amount (bottom left)
-    - Bot username watermark (bottom right)
-    - Game ID (subtle)
-    
-    Returns a BytesIO PNG buffer.
-    """
-    W, H = 800, 600
-    img = Image.new("RGB", (W, H), LIMBO_BG_COLOR)
+    from PIL import ImageFilter as _ImgFilter
+
+    W, H = 1062, 980
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    
-    # Background gradient effect (subtle radial glow)
-    center_x, center_y = W // 2, H // 2 - 40
-    for radius in range(200, 0, -10):
-        alpha = int(15 * (radius / 200))
-        glow_color = (8 + alpha, 12 + alpha // 2, 28 + alpha)
-        draw.ellipse(
-            [center_x - radius, center_y - radius, center_x + radius, center_y + radius],
-            fill=glow_color
-        )
-    
-    # Grid lines (subtle)
-    for gx in range(0, W, 50):
-        draw.line([(gx, 0), (gx, H)], fill=(20, 35, 70, 40), width=1)
-    for gy in range(0, H, 50):
-        draw.line([(0, gy), (W, gy)], fill=(20, 35, 70, 40), width=1)
-    
-    # Top decorative line
-    draw.line([(40, 60), (W - 40, 60)], fill=LIMBO_ACCENT, width=2)
-    
-    # Title: LIMBO
-    font_title = _limbo_get_font(28)
-    title_text = "LIMBO"
-    title_w = draw.textlength(title_text, font=font_title)
-    draw.text(((W - title_w) // 2, 18), title_text, font=font_title, fill=LIMBO_ACCENT)
-    
-    # Game ID (top right, small)
-    font_game_id = _limbo_get_font(12)
-    if game_id:
-        gid_text = f"ID: {game_id}"
-        gid_w = draw.textlength(gid_text, font=font_game_id)
-        draw.text((W - gid_w - 40, 22), gid_text, font=font_game_id, fill=LIMBO_TEXT_DIM)
-    
-    # Fonts
-    font_label = _limbo_get_font(20)
-    font_target = _limbo_get_font(56)
-    font_outcome = _limbo_get_font(72)
-    font_result = _limbo_get_font(36)
-    font_info = _limbo_get_font(18)
-    font_small = _limbo_get_font(14)
-    font_wm = _limbo_get_font(13)
-    
-    # TARGET section (top center)
-    target_label = "TARGET"
-    target_label_w = draw.textlength(target_label, font=font_label)
-    draw.text(((W - target_label_w) // 2, 80), target_label, font=font_label, fill=LIMBO_TEXT_DIM)
-    
-    target_str = f"{target_multiplier:.2f}x"
-    target_w = draw.textlength(target_str, font=font_target)
-    draw.text(((W - target_w) // 2, 110), target_str, font=font_target, fill=LIMBO_GOLD)
-    
-    # Divider
-    div_y = 190
-    draw.line([(100, div_y), (W - 100, div_y)], fill=LIMBO_BORDER, width=1)
-    
-    # OUTCOME section (center, large)
-    outcome_label = "OUTCOME"
-    outcome_label_w = draw.textlength(outcome_label, font=font_label)
-    draw.text(((W - outcome_label_w) // 2, 210), outcome_label, font=font_label, fill=LIMBO_TEXT_DIM)
-    
-    outcome_str = f"{outcome:.2f}x"
-    outcome_w = draw.textlength(outcome_str, font=font_outcome)
-    outcome_color = LIMBO_GREEN if win else LIMBO_LOSE
-    draw.text(((W - outcome_w) // 2, 250), outcome_str, font=font_outcome, fill=outcome_color)
-    
-    # RESULT box (below outcome)
-    result_y = 350
-    box_h = 80
-    box_w = 400
-    box_x = (W - box_w) // 2
-    
-    # Background box
-    box_color = LIMBO_WIN if win else LIMBO_LOSE
-    # Draw box with rounded corners effect
-    draw.rounded_rectangle(
-        [box_x, result_y, box_x + box_w, result_y + box_h],
-        radius=12,
-        fill=(box_color[0] // 5, box_color[1] // 5, box_color[2] // 5),
-        outline=box_color,
-        width=2
-    )
-    
-    result_text = "YOU WIN!" if win else "YOU LOSE"
-    result_w = draw.textlength(result_text, font=font_result)
-    draw.text(((W - result_w) // 2, result_y + 8), result_text, font=font_result, fill=box_color)
-    
-    # Profit/Loss amount
-    if win:
-        amount_text = f"+${profit:.2f}"
-        amount_color = LIMBO_GREEN
-    else:
-        amount_text = f"-${bet_amount:.2f}"
-        amount_color = LIMBO_LOSE
-    
-    amount_w = draw.textlength(amount_text, font=font_info)
-    draw.text(((W - amount_w) // 2, result_y + 50), amount_text, font=font_info, fill=amount_color)
-    
-    # PAYOUT info (if win)
-    if win:
-        payout = bet_amount * target_multiplier
-        payout_text = f"Payout: ${payout:.2f}"
-        payout_w = draw.textlength(payout_text, font=font_small)
-        draw.text(((W - payout_w) // 2, result_y + box_h + 12), payout_text, font=font_small, fill=LIMBO_TEXT_DIM)
-    
-    # Bottom info bar
-    bar_y = H - 40
-    
-    # Left: player username + bet
-    left_text = ""
+
+    # ── PALETTE ─────────────────────────────────────────────
+    BG_TOP = (4, 8, 28)
+    BG_BOT = (10, 8, 36)
+    GRID_COLOR = (40, 30, 100)
+    GRID_HOT = (140, 60, 200)
+    HEAD_COLOR = (140, 200, 240)
+    GREEN = (90, 240, 130)
+    GREEN_DIM = (40, 130, 70)
+    RED = (255, 70, 80)
+    GOLD = LIMBO_GOLD
+    WHITE = LIMBO_TEXT_WHITE
+    DIM = LIMBO_TEXT_DIM
+    BLUE = (90, 200, 255)
+
+    # ── BACKGROUND ──────────────────────────────────────────
+    for yy in range(H):
+        t = yy / H
+        r = int(BG_TOP[0] + t * (BG_BOT[0] - BG_TOP[0]))
+        g = int(BG_TOP[1] + t * (BG_BOT[1] - BG_TOP[1]))
+        b = int(BG_TOP[2] + t * (BG_BOT[2] - BG_TOP[2]))
+        draw.line([(0, yy), (W, yy)], fill=(r, g, b))
+
+    # ── PERSPECTIVE GRID FLOOR ─────────────────────────────
+    horizon_y = int(H * 0.30)
+    vp_x = W // 2
+    floor_top = horizon_y + 40
+    floor_bot = H - 40
+    # Vertical rails fanning out from the vanishing point.
+    n_rails = 14
+    for i in range(-n_rails, n_rails + 1):
+        if i == 0:
+            continue
+        end_x = vp_x + i * (W // n_rails)
+        col = GRID_HOT if abs(i) <= 2 else GRID_COLOR
+        draw.line([(vp_x, horizon_y + 30), (end_x, floor_bot)],
+                  fill=col, width=1)
+    # Horizontal grid lines (perspective).
+    n_horiz = 22
+    for i in range(1, n_horiz + 1):
+        # exponential perspective y so lines bunch up near horizon.
+        u = i / n_horiz
+        ly = int(floor_top + (floor_bot - floor_top) * (u ** 1.6))
+        # x-extent grows with distance from horizon.
+        extent = int((ly - floor_top) / (floor_bot - floor_top + 1) * (W // 2 + 200))
+        x0 = max(0, vp_x - extent - 200)
+        x1 = min(W, vp_x + extent + 200)
+        col = GRID_HOT if i % 6 == 0 else GRID_COLOR
+        draw.line([(x0, ly), (x1, ly)], fill=col, width=1)
+
+    # Side wall lines (rough trapezoidal perspective).
+    for off in range(0, 14):
+        # left wall
+        x_top = 40 + off * 12
+        y_top = horizon_y + 20 + off * 6
+        x_bot = 0 - off * 30
+        y_bot = floor_bot
+        draw.line([(x_top, y_top), (x_bot, y_bot)], fill=GRID_COLOR, width=1)
+        # right wall
+        x_top_r = W - 40 - off * 12
+        x_bot_r = W + off * 30
+        draw.line([(x_top_r, y_top), (x_bot_r, y_bot)], fill=GRID_COLOR, width=1)
+
+    # Sparkles.
+    rng = random.Random(123)
+    for _ in range(80):
+        sx, sy = rng.randint(0, W), rng.randint(0, H)
+        br = rng.randint(40, 140)
+        draw.ellipse([sx - 1, sy - 1, sx + 1, sy + 1], fill=(br, br, br + 25))
+
+    # ── WIREFRAME HEAD (top-left) ──────────────────────────
+    head_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    head_draw = ImageDraw.Draw(head_layer)
+    h_cx, h_cy, h_rx, h_ry = 105, 130, 70, 90
+    head_draw.ellipse([h_cx - h_rx, h_cy - h_ry, h_cx + h_rx, h_cy + h_ry],
+                      outline=HEAD_COLOR + (220,), width=2)
+    for ang in range(-80, 81, 14):
+        rad = math.radians(ang)
+        x = h_cx + math.sin(rad) * h_rx
+        head_draw.line([(int(x), h_cy - h_ry), (int(x), h_cy + h_ry)],
+                       fill=HEAD_COLOR + (110,), width=1)
+    for ang in range(-70, 71, 14):
+        rad = math.radians(ang)
+        yy = h_cy + math.sin(rad) * h_ry
+        head_draw.line([(h_cx - h_rx, int(yy)), (h_cx + h_rx, int(yy))],
+                       fill=HEAD_COLOR + (90,), width=1)
+    head_draw.ellipse([h_cx - 3, h_cy - 4, h_cx + 3, h_cy + 2],
+                      fill=(220, 240, 255, 255))
+    head_layer = head_layer.filter(_ImgFilter.GaussianBlur(radius=0.5))
+    img.alpha_composite(head_layer)
+
+    # ── TOP-RIGHT: bot username + player username ──────────
+    f_bot = _limbo_get_font(28)
+    f_user = _limbo_get_font(20)
+    wm_text = f"@{bot_username}" if not bot_username.startswith("@") else bot_username
+    wmw = draw.textlength(wm_text, font=f_bot)
+    draw.text((W - wmw - 30, 28), wm_text, font=f_bot, fill=BLUE)
     if player_username:
-        left_text += f"@{player_username}"
-    left_text += f"  •  Bet: ${bet_amount:.2f} {currency}"
-    
-    draw.text((20, bar_y), left_text, font=font_info, fill=LIMBO_TEXT_DIM)
-    
-    # Right: bot username watermark
-    wm_text = f"@{bot_username}"
-    wm_w = draw.textlength(wm_text, font=font_wm)
-    draw.text((W - wm_w - 20, bar_y + 4), wm_text, font=font_wm, fill=(60, 90, 140))
-    
-    # Side decorative lines
-    draw.line([(20, 80), (20, H - 60)], fill=LIMBO_ACCENT, width=1)
-    draw.line([(W - 20, 80), (W - 20, H - 60)], fill=LIMBO_ACCENT, width=1)
-    
-    # Save to BytesIO
+        pu = f"@{player_username}" if not player_username.startswith("@") else player_username
+        puw = draw.textlength(pu, font=f_user)
+        draw.text((W - puw - 30, 70), pu, font=f_user, fill=DIM)
+
+    # ── TARGET / OUTCOME COLUMNS ───────────────────────────
+    f_lbl = _limbo_get_font(26)
+    f_target_val = _limbo_get_font(40)
+    f_outcome_val = _limbo_get_font(80)
+    f_gid = _limbo_get_font(13)
+
+    target_col_x = W // 2 - 160
+    outcome_col_x = W // 2 + 160
+    col_y = 90
+    # TARGET label.
+    tl = "TARGET"
+    tlw = draw.textlength(tl, font=f_lbl)
+    draw.text((target_col_x - tlw / 2, col_y), tl, font=f_lbl, fill=BLUE)
+    # TARGET pill.
+    tgt_str = f"{target_multiplier:.2f}x"
+    tgw = draw.textlength(tgt_str, font=f_target_val)
+    pill_w = max(int(tgw + 60), 200)
+    pill_h = 56
+    px0 = int(target_col_x - pill_w / 2)
+    py0 = col_y + 36
+    draw.rounded_rectangle([px0, py0, px0 + pill_w, py0 + pill_h],
+                            radius=14, fill=(14, 22, 50),
+                            outline=GOLD, width=2)
+    draw.text((px0 + (pill_w - tgw) / 2, py0 + 4),
+              tgt_str, font=f_target_val, fill=GOLD)
+    # OUTCOME label.
+    ol_color = GREEN if win else RED
+    ol = "OUTCOME"
+    olw = draw.textlength(ol, font=f_lbl)
+    draw.text((outcome_col_x - olw / 2, col_y), ol, font=f_lbl, fill=ol_color)
+    # OUTCOME value (top column, no pill).
+    out_str = f"{outcome:.2f}x"
+    outw = draw.textlength(out_str, font=f_outcome_val)
+    draw.text((outcome_col_x - outw / 2, col_y + 24),
+              out_str, font=f_outcome_val, fill=ol_color)
+    # Game ID below both columns.
+    if game_id:
+        gid_str = str(game_id)
+        gidw = draw.textlength(gid_str, font=f_gid)
+        draw.text((target_col_x - gidw / 2, py0 + pill_h + 10),
+                  gid_str, font=f_gid, fill=DIM)
+        draw.text((outcome_col_x - gidw / 2, py0 + pill_h + 10),
+                  gid_str, font=f_gid, fill=DIM)
+
+    # ── CENTER GLOW + HUGE MULTIPLIER ──────────────────────
+    glow_cx = W // 2
+    glow_cy = int(H * 0.46)
+    glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow_layer)
+    glow_color = GREEN if win else RED
+    # Three layered ellipses with falling alpha.
+    for r, alpha in [(280, 160), (220, 110), (160, 80)]:
+        gd.ellipse(
+            [glow_cx - int(r * 1.15), glow_cy - r,
+             glow_cx + int(r * 1.15), glow_cy + r],
+            fill=(glow_color[0], glow_color[1], glow_color[2], alpha),
+        )
+    glow_layer = glow_layer.filter(_ImgFilter.GaussianBlur(radius=24))
+    img.alpha_composite(glow_layer)
+    draw = ImageDraw.Draw(img)
+    # Huge outcome text in the center of the glow.
+    f_huge = _limbo_get_font(150)
+    big_str = f"{outcome:.2f}x"
+    bsw = draw.textlength(big_str, font=f_huge)
+    # subtle text-glow underlay.
+    text_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    tgd = ImageDraw.Draw(text_glow)
+    tgd.text((glow_cx - bsw / 2, glow_cy - 110), big_str,
+             font=f_huge, fill=(glow_color[0], glow_color[1], glow_color[2], 220))
+    text_glow = text_glow.filter(_ImgFilter.GaussianBlur(radius=8))
+    img.alpha_composite(text_glow)
+    draw = ImageDraw.Draw(img)
+    draw.text((glow_cx - bsw / 2, glow_cy - 110), big_str,
+              font=f_huge, fill=WHITE)
+
+    # ── RESULT CARD (YOU WIN/LOSE) ─────────────────────────
+    rcw = 460
+    rch = 130
+    rcx0 = (W - rcw) // 2
+    rcy0 = glow_cy + 90
+    # outer subtle glow.
+    rg = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    rgd = ImageDraw.Draw(rg)
+    rgd.rounded_rectangle([rcx0 - 8, rcy0 - 8, rcx0 + rcw + 8, rcy0 + rch + 8],
+                          radius=18, outline=(glow_color[0], glow_color[1], glow_color[2], 150), width=4)
+    rg = rg.filter(_ImgFilter.GaussianBlur(radius=6))
+    img.alpha_composite(rg)
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([rcx0, rcy0, rcx0 + rcw, rcy0 + rch],
+                            radius=16, fill=(8, 20, 14) if win else (28, 10, 12),
+                            outline=glow_color, width=2)
+    # YOU WIN / YOU LOSE
+    f_rh = _limbo_get_font(34)
+    title = "YOU WIN!" if win else "YOU LOSE"
+    titw = draw.textlength(title, font=f_rh)
+    draw.text((rcx0 + (rcw - titw) / 2, rcy0 + 14),
+              title, font=f_rh, fill=WHITE)
+    # +/- amount
+    f_ra = _limbo_get_font(34)
+    if win:
+        amt_str = f"+${profit:,.2f}"
+        amt_color = GREEN
+    else:
+        amt_str = f"-${bet_amount:,.2f}"
+        amt_color = RED
+    aw = draw.textlength(amt_str, font=f_ra)
+    draw.text((rcx0 + (rcw - aw) / 2, rcy0 + 54),
+              amt_str, font=f_ra, fill=amt_color)
+    # Payout (only when win)
+    f_pp = _limbo_get_font(18)
+    if win:
+        payout = bet_amount + profit
+        pp_str = f"Payout: ${payout:,.2f}"
+        ppw = draw.textlength(pp_str, font=f_pp)
+        # coin glyph.
+        cglyph_x = rcx0 + (rcw + ppw) / 2 + 14
+        cglyph_y = rcy0 + 96 + 4
+        draw.ellipse([cglyph_x, cglyph_y, cglyph_x + 18, cglyph_y + 18],
+                     fill=GREEN_DIM, outline=GREEN, width=1)
+        f_cg = _limbo_get_font(13)
+        draw.text((cglyph_x + 5, cglyph_y + 1), "$", font=f_cg, fill=WHITE)
+        draw.text((rcx0 + (rcw - ppw) / 2 - 14, rcy0 + 96),
+                  pp_str, font=f_pp, fill=DIM)
+
+    # ── RECENT PLAYERS RAIL ────────────────────────────────
+    rail_w = 580
+    rail_h = 110
+    rail_x0 = (W - rail_w) // 2
+    rail_y0 = rcy0 + rch + 36
+    draw.rounded_rectangle([rail_x0, rail_y0, rail_x0 + rail_w, rail_y0 + rail_h],
+                            radius=18, fill=(18, 22, 48), outline=(60, 70, 110), width=2)
+    # Build rail entries from recent_players (or fallback to single current player).
+    if recent_players:
+        entries = list(recent_players)[:3]
+    else:
+        entries = [{
+            "name": player_username or "Player",
+            "pic": player_profile_pic,
+        }]
+    f_pname = _limbo_get_font(20)
+    av_r = 22
+    # Place 2 entries on the first row, 1 on the second when 3 are present.
+    pad_x = rail_x0 + 18
+    pad_y = rail_y0 + 14
+    cell_w = (rail_w - 36) // 2
+    for idx, ent in enumerate(entries):
+        col = idx % 2
+        row = idx // 2
+        cx0 = pad_x + col * cell_w
+        cy0 = pad_y + row * 42
+        avx = cx0 + 4
+        avy = cy0 + 4
+        # Avatar circle.
+        if ent.get("pic") and isinstance(ent["pic"], Image.Image):
+            try:
+                sz = av_r * 2
+                src = ent["pic"].convert("RGBA").resize((sz, sz), Image.Resampling.LANCZOS)
+                mask = Image.new("L", (sz, sz), 0)
+                ImageDraw.Draw(mask).ellipse([0, 0, sz - 1, sz - 1], fill=255)
+                img.paste(src, (avx, avy), mask)
+                draw.ellipse([avx, avy, avx + sz, avy + sz],
+                             outline=GOLD if idx == 0 else (110, 130, 170), width=2)
+            except Exception:
+                draw.ellipse([avx, avy, avx + av_r * 2, avy + av_r * 2],
+                             fill=(20, 28, 50), outline=(110, 130, 170), width=2)
+        else:
+            draw.ellipse([avx, avy, avx + av_r * 2, avy + av_r * 2],
+                         fill=(20, 28, 50), outline=(110, 130, 170), width=2)
+        # Name.
+        nm = (ent.get("name") or "Player")
+        nm = nm if not nm.startswith("@") else nm[1:]
+        nm = nm[:14] + ".." if len(nm) > 14 else nm
+        draw.text((avx + av_r * 2 + 14, avy + 8),
+                  nm, font=f_pname, fill=WHITE)
+
+    # ── BOTTOM INFO BAR ────────────────────────────────────
+    bar_y = H - 80
+    bar_h = 50
+    draw.rounded_rectangle([16, bar_y, W - 16, bar_y + bar_h],
+                            radius=12, fill=(10, 16, 36), outline=(40, 50, 90), width=1)
+    f_bar = _limbo_get_font(20)
+    # Bet (left).
+    bet_str = f"Bet: ${bet_amount:.2f} {currency}"
+    draw.text((36, bar_y + (bar_h - 24) / 2),
+              bet_str, font=f_bar, fill=WHITE)
+    # Center: mountain glyph + LIMBO.
+    lbl = "LIMBO"
+    lw = draw.textlength(lbl, font=f_bar)
+    glyph_x = (W - lw) // 2 - 32
+    glyph_y = bar_y + bar_h // 2
+    # tiny mountain (triangle).
+    draw.polygon(
+        [(glyph_x, glyph_y + 12),
+         (glyph_x + 12, glyph_y - 10),
+         (glyph_x + 24, glyph_y + 12)],
+        fill=GOLD,
+    )
+    draw.text(((W - lw) / 2, bar_y + (bar_h - 24) / 2),
+              lbl, font=f_bar, fill=GOLD)
+    # Right: bot username + diamond.
+    rt = f"@{bot_username}" if not bot_username.startswith("@") else bot_username
+    rtw = draw.textlength(rt, font=f_bar)
+    draw.text((W - rtw - 60, bar_y + (bar_h - 24) / 2),
+              rt, font=f_bar, fill=BLUE)
+    dx, dy = W - 38, bar_y + bar_h // 2
+    draw.polygon([(dx, dy - 9), (dx + 9, dy), (dx, dy + 9), (dx - 9, dy)],
+                 fill=BLUE)
+
+    # ── FOOTER LINE ────────────────────────────────────────
+    f_foot = _limbo_get_font(14)
+    foot = "Play Responsibly  •  Telegram Casino  •  limbo"
+    fw = draw.textlength(foot, font=f_foot)
+    draw.text(((W - fw) / 2, H - 22), foot, font=f_foot, fill=DIM)
+
+    # Save
+    out = img.convert("RGB")
     buf = BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    out.save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf
-
 
 async def async_generate_limbo_image(*args, **kwargs) -> BytesIO:
     """Async wrapper for generate_limbo_image to avoid blocking the event loop."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: generate_limbo_image(*args, **kwargs))
+    return await loop.run_in_executor(_image_executor, lambda: generate_limbo_image(*args, **kwargs))
 
 def create_deck():
     """Create and cryptographically securely shuffle a 52-card deck."""
@@ -18680,16 +20251,8 @@ async def create_reply_pvp_challenge(update: Update, context: ContextTypes.DEFAU
         reply_markup=keyboard
     )
 
-    # Try to pin
-    try:
-        await context.bot.pin_chat_message(
-            chat_id=update.effective_chat.id,
-            message_id=sent_message.message_id,
-            disable_notification=True
-        )
-        game_sessions[match_id]['pinned_message_id'] = sent_message.message_id
-    except Exception as e:
-        logging.warning(f"Could not pin reply challenge message: {e}")
+    # Pinning of PvP/PvB emoji game challenge messages is intentionally
+    # disabled (high-volume groups produced excessive pin churn).
 
 
 async def create_reply_pvp_challenge_xdxw(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str):
@@ -18800,16 +20363,7 @@ async def create_reply_pvp_challenge_xdxw(update: Update, context: ContextTypes.
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard
     )
-
-    try:
-        await context.bot.pin_chat_message(
-            chat_id=update.effective_chat.id,
-            message_id=sent_message.message_id,
-            disable_notification=True
-        )
-        game_sessions[match_id]['pinned_message_id'] = sent_message.message_id
-    except Exception as e:
-        logging.warning(f"Could not pin reply challenge message: {e}")
+    # Pinning of PvP/PvB emoji game challenge messages is intentionally disabled.
 
 
 # Callback: Challenged player confirms the reply-to PvP challenge
@@ -19320,12 +20874,8 @@ async def rpvp_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     match["status"] = "cancelled"
 
-    # Unpin if pinned
-    if 'pinned_message_id' in match:
-        try:
-            await context.bot.unpin_chat_message(match["chat_id"], match['pinned_message_id'])
-        except Exception:
-            pass
+    # PvP/PvB emoji game challenge messages are no longer pinned, so
+    # there is nothing to unpin here.
 
     await query.edit_message_text(
         f"{pe('cross')} Challenge cancelled by {user.mention_html()}.",
@@ -20398,11 +21948,7 @@ async def group_challenge_target_callback(update: Update, context: ContextTypes.
         ])
     )
 
-    # Try to pin the message
-    try:
-        await context.bot.pin_chat_message(update.effective_chat.id, challenge_msg.message_id)
-    except Exception as e:
-        logging.warning(f"Could not pin challenge message: {e}")
+    # Pinning of group emoji-game challenge messages is intentionally disabled.
 
     await query.edit_message_text(
         f"{pe('check')} Challenge created!\nMatch ID: <code>{match_id}</code>",
@@ -20520,12 +22066,7 @@ async def group_challenge_cancel_callback(update: Update, context: ContextTypes.
     except Exception as e:
         logging.warning(f"Failed to void sidebets on group cancel: {e}")
 
-    # Unpin if pinned
-    if 'pinned_message_id' in match:
-        try:
-            await context.bot.unpin_chat_message(match["chat_id"], match['pinned_message_id'])
-        except Exception:
-            pass
+    # Group emoji-game challenge messages are no longer pinned.
 
     await query.edit_message_text(
         f"{pe('cross')} Challenge cancelled by {user.mention_html()}.",
@@ -20561,12 +22102,7 @@ async def xdxw_cancel_match_callback(update: Update, context: ContextTypes.DEFAU
     except Exception as e:
         logging.warning(f"Failed to void sidebets on xdxw cancel: {e}")
 
-    # Unpin if pinned
-    if 'pinned_message_id' in match:
-        try:
-            await context.bot.unpin_chat_message(match["chat_id"], match['pinned_message_id'])
-        except Exception:
-            pass
+    # Emoji-game challenge messages are no longer pinned.
 
     try:
         await query.edit_message_text(
@@ -21200,6 +22736,31 @@ async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Generate Limbo template image
     active_currency = get_active_currency(user.id)
+    player_pic = await _get_cached_profile_picture(context, user.id)
+
+    # Track recent limbo players in this chat (newest first, max 3) so
+    # the limbo PIL can show a player rail at the bottom matching the
+    # template. Names only — no hardcoded examples.
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    cur_uid = user.id
+    cur_display = user.username or user.first_name or str(user.id)
+    bucket = _recent_limbo_players.setdefault(chat_id, [])
+    bucket = [(uid, nm) for (uid, nm) in bucket if uid != cur_uid]
+    bucket.insert(0, (cur_uid, cur_display))
+    bucket = bucket[:_RECENT_LIMBO_MAX]
+    _recent_limbo_players[chat_id] = bucket
+    # Build rail entries (best-effort avatars).
+    rail_entries = []
+    for uid, nm in bucket:
+        if uid == cur_uid:
+            pic = player_pic
+        else:
+            try:
+                pic = await _get_cached_profile_picture(context, uid)
+            except Exception:
+                pic = None
+        rail_entries.append({"name": nm, "pic": pic})
+
     limbo_image = await async_generate_limbo_image(
         target_multiplier=target_multiplier,
         outcome=outcome,
@@ -21210,6 +22771,8 @@ async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_username=await get_bot_username(context),
         game_id=game_id,
         currency=active_currency,
+        player_profile_pic=player_pic,
+        recent_players=rail_entries,
     )
 
     # Create keyboard with provably fair button only
@@ -23646,11 +25209,7 @@ async def pvp_timeout_finish_job(context: ContextTypes.DEFAULT_TYPE):
             user_stats[loser_id]['game_sessions'].append(match_id)
 
         text += f"{pe('trophy')} <b>{final_winner_mention} wins the match and earns ${winnings:.2f}!</b>"
-        if 'pinned_message_id' in match_data:
-            try:
-                await context.bot.unpin_chat_message(chat_id, match_data['pinned_message_id'])
-            except Exception as e:
-                logging.warning(f"Could not unpin message for match {match_id}: {e}")
+        # Emoji-game match messages are no longer pinned, so nothing to unpin.
     else:
         # Continue to next round - player who rolled (winner) rolls first
         match_data["last_roller"] = None
@@ -24318,12 +25877,7 @@ async def generic_emoji_game_command(update: Update, context: ContextTypes.DEFAU
         reply_markup=keyboard_styled,
         parse_mode=ParseMode.HTML
     )
-
-    try:
-        await context.bot.pin_chat_message(chat_id=update.effective_chat.id, message_id=sent_message.message_id, disable_notification=True)
-        match_data['pinned_message_id'] = sent_message.message_id
-    except BadRequest as e:
-        logging.warning(f"Failed to pin match message for match {match_id}: {e}")
+    # Emoji-game match messages are no longer pinned.
 
 @check_banned
 @check_maintenance
@@ -25997,10 +27551,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             final_winner_username = match_data.get('usernames', {}).get(final_winner, f"Player {final_winner}")
                             final_winner_mention = f'<a href="tg://user?id={final_winner}">{display_at(final_winner_username)}</a>'
                             text += f"\n\n{pe('trophy')} <b>{final_winner_mention} wins the match and earns ${winnings:.2f}!</b>"
-                            # Unpin the message
-                            if 'pinned_message_id' in match_data:
-                                try: await context.bot.unpin_chat_message(chat_id, match_data['pinned_message_id'])
-                                except Exception as e: logging.warning(f"Could not unpin message for match {match_id}: {e}")
+                            # Emoji-game match messages are no longer pinned.
                         else:
                             match_data["last_roller"] = None
                             match_data["player_rolls"] = {p1: [], p2: []}  # Reset rolls for next round
@@ -30421,8 +31972,9 @@ async def resetleaderboard_command(update: Update, context: ContextTypes.DEFAULT
     # Save all user data
     save_all_data()
 
-    # Rebuild empty leaderboards
-    _rebuild_leaderboards()
+    # Rebuild empty leaderboards (force-bypass cache after admin reset).
+    _invalidate_leaderboard_cache()
+    _rebuild_leaderboards(force=True)
 
     await update.message.reply_text(
         f"{pe('check')} <b>Leaderboard Reset Complete</b>\n\n"
@@ -31780,12 +33332,26 @@ async def post_init(application: Application):
             logging.info("PostgreSQL background flush task started")
         else:
             application.create_task(_flush_dirty_users())
-        
+        # Coalesced bot-state writer (replaces synchronous save_bot_state on
+        # event loop — handlers just flip a dirty flag now).
+        application.create_task(_flush_bot_state_loop())
+
         application.create_task(_cleanup_menu_owners())
         application.create_task(_cleanup_game_sessions())
         application.create_task(_cleanup_inflight_callbacks())
         application.create_task(_cleanup_rate_limit_timestamps())
         application.create_task(_cleanup_profile_pic_cache())
+
+        # Jackpot: load persisted state, then start the daily-draw scheduler
+        # and the periodic save loop. The scheduler sleeps until the next
+        # 5:30 PM IST and runs the draw automatically.
+        try:
+            _jackpot_load()
+        except Exception as e:
+            logging.error(f"Failed to load jackpot state in post_init: {e}")
+        application.create_task(_jackpot_scheduler_task(application))
+        application.create_task(_jackpot_save_loop())
+        logging.info("Jackpot scheduler + save loop started")
 
         # Register shutdown handler to save all data on stop
         # Note: add_shutdown_handler was removed in PTB 22.x
@@ -31836,6 +33402,11 @@ async def on_bot_shutdown(application: Application):
         # defensively in case any dirtied-but-not-marked records slipped
         # through the flush.
         save_bot_state_full()
+        # Persist jackpot state.
+        try:
+            _jackpot_save_now()
+        except Exception as _e:
+            logging.error(f"Failed to save jackpot state on shutdown: {_e}")
         logging.info("Bot shutdown save complete.")
     except Exception as e:
         logging.error(f"Error during bot shutdown: {e}", exc_info=True)
@@ -32342,7 +33913,7 @@ def check_7up_specific_combo(target_combo: list, dice_values: list) -> tuple:
 
 def generate_7up_help_image() -> BytesIO:
     """Generate PIL help image for 7Up7Down game."""
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
     W, H = 900, 1200
     BG = (15, 10, 35)  # Dark purple-black
@@ -33695,13 +35266,8 @@ async def pvb_cashout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     house_profit = bet_amount - cashout_amount
     bot_settings["house_balance"] = bot_settings.get("house_balance", 0) + house_profit
 
-    # Unpin if pinned
     chat_id = match_data.get("chat_id")
-    if 'pinned_message_id' in match_data and chat_id:
-        try:
-            await context.bot.unpin_chat_message(chat_id, match_data['pinned_message_id'])
-        except Exception:
-            pass
+    # Emoji-game match messages are no longer pinned.
 
     # Send cashout confirmation
     try:
@@ -34190,6 +35756,7 @@ def main():
     app.add_handler(CommandHandler(["br", "blazerush"], blaze_rush_command, block=False))
     app.add_handler(CommandHandler("sl", slots_command, block=False)); app.add_handler(CommandHandler("bank", bank_command, block=False)); app.add_handler(CommandHandler("hb", bank_command, block=False)) # hb is alias for bank
     app.add_handler(CommandHandler("rain", rain_command, block=False)); app.add_handler(CommandHandler("stats", stats_command, block=False))
+    app.add_handler(CommandHandler("jackpot", jackpot_command, block=False))  # Daily jackpot status / owner controls
     app.add_handler(CommandHandler("limits", limits_command, block=False)) # NEW - Game limits display
     app.add_handler(CommandHandler("users", users_command, block=False))
     # dice/darts/goal/bowl handlers are now registered via game_toggle_wrappers above
