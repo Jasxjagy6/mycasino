@@ -9553,10 +9553,13 @@ def _render_stats_sync(text_data, game_list, pvp_entries, profile_pic_data):
         sub = "TELEGRAM CASINO  •  PLAYER STATS"
         sw = draw.textlength(sub, font=fTiny)
         draw.text(((W-sw)/2, 34), sub, fill=C_MUTED, font=fTiny)
-        # Member since — right
+        # Top-right: @bot_username (small) + "Since DD MMM YYYY"
+        rt_bot = f"@{text_data['bot_username']}"
+        rt_w = draw.textlength(rt_bot, font=fSmall)
+        draw.text((W-rt_w-16, 14), rt_bot, fill=C_GOLD, font=fSmall)
         ms = f"Since {text_data['member_since']}"
         msw = draw.textlength(ms, font=fTiny)
-        draw.text((W-msw-16, 44), ms, fill=C_MUTED, font=fTiny)
+        draw.text((W-msw-16, 38), ms, fill=C_MUTED, font=fTiny)
 
         y = 72  # cursor after header
 
@@ -9706,6 +9709,10 @@ def _render_stats_sync(text_data, game_list, pvp_entries, profile_pic_data):
         footer = "Play Responsibly  •  Gamble with Control"
         fw = draw.textlength(footer, font=fTiny)
         draw.text(((W-fw)//2, y+8), footer, fill=(60, 75, 100), font=fTiny)
+        # Bot watermark right
+        wm = f"@{text_data['bot_username']}"
+        wmw = draw.textlength(wm, font=fTiny)
+        draw.text((W-wmw-14, y+8), wm, fill=C_GOLD_DIM, font=fTiny)
 
         # ── SAVE ─────────────────────────────────────────────────
         buf = BytesIO()
@@ -9798,8 +9805,16 @@ async def generate_leaderboard_image(context, period='all_time', viewing_user_id
         return None
 
 
-def _render_leaderboard_sync(entries, bot_username, section_title, user_rank=None, user_wagered=0.0):
-    """Render leaderboard image - institutional premium casino design."""
+def _render_leaderboard_sync(entries, bot_username, section_title, user_rank=None, user_wagered=0.0,
+                             value_formatter=None, your_rank_label="YOUR POSITION",
+                             your_value_label="Total Wagered"):
+    """Render leaderboard image - institutional premium casino design.
+
+    `value_formatter`, when provided, takes a numeric `entry['value']` and
+    returns a display string (e.g. for referral counts). Defaults to USD.
+    """
+    if value_formatter is None:
+        value_formatter = lambda v: f"${v:,.2f}"
     try:
         W, H = 760, 1120
         img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -9872,11 +9887,13 @@ def _render_leaderboard_sync(entries, bot_username, section_title, user_rank=Non
             draw.line([(0,yy),(W,yy)], fill=(hb, hb+2, hb+16))
         draw.line([(0,y+62),(W,y+62)], fill=C_GOLD, width=2)
 
-        # Bot username top-right
+        # Bot username top-right with Telegram Casino subtitle
         bot_lbl = f"@{bot_username}"
         blw = draw.textlength(bot_lbl, font=fSmall)
         draw.text((W-blw-18, y+8), bot_lbl, fill=C_GOLD, font=fSmall)
-        draw.text((W-blw-18, y+26), "CASINO", fill=C_MUTED, font=fTiny)
+        sublbl = "Telegram Casino"
+        sblw = draw.textlength(sublbl, font=fTiny)
+        draw.text((W-sblw-18, y+26), sublbl, fill=C_MUTED, font=fTiny)
 
         # "LEADERBOARD" with shadow effect
         title = "LEADERBOARD"
@@ -9935,13 +9952,13 @@ def _render_leaderboard_sync(entries, bot_username, section_title, user_rank=Non
                 unw = draw.textlength(uname, font=fH3)
                 draw.text((cx_card-unw//2, cy+76), uname, fill=C_WHITE, font=fH3)
                 # Value
-                val_str = f"${entry['value']:,.2f}"
+                val_str = value_formatter(entry['value'])
                 vw = draw.textlength(val_str, font=fBody)
                 draw.text((cx_card-vw//2, cy+100), val_str, fill=C_GREEN, font=fBody)
             else:
                 unw = draw.textlength(uname, font=fSmall)
                 draw.text((cx_card-unw//2, cy+62), uname, fill=C_WHITE, font=fSmall)
-                val_str = f"${entry['value']:,.2f}"
+                val_str = value_formatter(entry['value'])
                 vw = draw.textlength(val_str, font=fSmall)
                 draw.text((cx_card-vw//2, cy+80), val_str, fill=C_GREEN, font=fSmall)
 
@@ -9988,7 +10005,7 @@ def _render_leaderboard_sync(entries, bot_username, section_title, user_rank=Non
             draw.text((72, y+13), uname, fill=C_WHITE, font=fBody)
 
             # Value — right aligned
-            val_str = f"${val:,.2f}"
+            val_str = value_formatter(val)
             vw = draw.textlength(val_str, font=fBody)
             draw.text((W-32, y+13), val_str, fill=C_GREEN, font=fBody, anchor="ra")
 
@@ -10006,7 +10023,7 @@ def _render_leaderboard_sync(entries, bot_username, section_title, user_rank=Non
         YR_H = 84
         draw.rounded_rectangle([18,y,W-18,y+YR_H], radius=14, fill=(10,22,46), outline=C_BLUE, width=2)
         # "YOUR RANK" label
-        draw.text((36, y+10), "YOUR POSITION", fill=C_MUTED, font=fSmall)
+        draw.text((36, y+10), your_rank_label, fill=C_MUTED, font=fSmall)
         draw.line([(36, y+24),(W-36, y+24)], fill=C_ACCENT, width=1)
 
         # Rank badge
@@ -10022,9 +10039,12 @@ def _render_leaderboard_sync(entries, bot_username, section_title, user_rank=Non
         draw.rounded_rectangle([36,y+30,36+rkw+26,y+68], radius=10, fill=rk_bg, outline=rk_color, width=2)
         draw.text((36+13, y+34), rk_str, fill=rk_color, font=fMed)
 
-        # Wagered amount
-        waged_lbl = "Total Wagered"
-        waged_val = f"${user_wagered:,.2f}" if user_wagered > 0 else "No wager yet"
+        # Wagered amount (or generic value)
+        waged_lbl = your_value_label
+        if user_wagered > 0:
+            waged_val = value_formatter(user_wagered)
+        else:
+            waged_val = "No data yet"
         draw.text((rkw+82, y+32), waged_lbl, fill=C_MUTED, font=fSmall)
         draw.text((rkw+82, y+48), waged_val, fill=C_GREEN, font=fH3)
 
@@ -10090,137 +10110,29 @@ async def generate_leaderboard_referral_image(context):
 
 
 def _render_leaderboard_referral_sync(entries, bot_username):
-    """Render referral leaderboard template."""
-    try:
-        W, H = 700, 750
-        img = Image.new("RGB", (W, H), (10, 28, 45))
-        draw = ImageDraw.Draw(img)
-
-        import random
-        rng = random.Random(42)
-        for _ in range(60):
-            sx = rng.randint(0, W)
-            sy = rng.randint(0, H)
-            sr = rng.randint(1, 2)
-            draw.ellipse([sx - sr, sy - sr, sx + sr, sy + sr], fill=(255, 255, 255, 150))
-
-        try:
-            f_title = ImageFont.truetype("bold.ttf", 26)
-            f_med = ImageFont.truetype("bold.ttf", 22)
-            f_reg = ImageFont.truetype("bold.ttf", 18)
-            f_small = ImageFont.truetype("bold.ttf", 15)
-            f_xsmall = ImageFont.truetype("bold.ttf", 12)
-            f_val = ImageFont.truetype("bold.ttf", 20)
-            f_section = ImageFont.truetype("bold.ttf", 18)
-            f_col_header = ImageFont.truetype("bold.ttf", 11)
-            f_big_rank = ImageFont.truetype("bold.ttf", 32)
-        except Exception:
-            f_title = f_med = f_reg = f_small = f_xsmall = f_val = f_section = f_col_header = f_big_rank = ImageFont.load_default()
-
-        y = 18
-
-        # Draw trophy icon using PIL shapes (emoji won't render in PIL)
-        trophy_cx, trophy_cy = W // 2, y + 12
-        # Trophy cup
-        draw.ellipse([trophy_cx - 14, trophy_cy - 14, trophy_cx + 14, trophy_cy + 8], outline=(255, 200, 100), width=2, fill=(60, 50, 20))
-        # Handles
-        draw.arc([trophy_cx - 22, trophy_cy - 10, trophy_cx - 6, trophy_cy + 8], 90, 270, fill=(255, 200, 100), width=2)
-        draw.arc([trophy_cx + 6, trophy_cy - 10, trophy_cx + 22, trophy_cy + 8], -90, 90, fill=(255, 200, 100), width=2)
-        # Base
-        draw.rectangle([trophy_cx - 6, trophy_cy + 8, trophy_cx + 6, trophy_cy + 16], fill=(255, 200, 100))
-        draw.rectangle([trophy_cx - 10, trophy_cy + 14, trophy_cx + 10, trophy_cy + 18], fill=(255, 200, 100))
-        y += 32
-
-        # Bot username (no tagline below)
-        bot_un = f"@{bot_username}"
-        bw = draw.textlength(bot_un, font=f_med)
-        draw.text((W - 15 - bw, y), bot_un, fill=(255, 200, 50), font=f_med)
-        y += 30
-
-        # Title
-        full_title = "PlayCasino Leaderboard"
-        ftw = draw.textlength(full_title, font=f_title)
-        title_x = (W - ftw) // 2
-        draw.line([(title_x - 60, y + 12), (title_x - 15, y + 12)], fill=(200, 100, 255), width=2)
-        draw.text((title_x, y), full_title, fill=(255, 255, 255), font=f_title)
-        draw.line([(title_x + ftw + 15, y + 12), (title_x + ftw + 60, y + 12)], fill=(200, 100, 255), width=2)
-        y += 42
-
-        # Section title
-        draw.rounded_rectangle([20, y, W - 20, y + 34], radius=8, outline=(200, 100, 255), width=2, fill=(35, 15, 50))
-        draw.text((40, y + 6), "🏆 Top Referrers", fill=(200, 100, 255), font=f_section)
-        y += 44
-
-        # Column headers
-        draw.text((50, y), "RANK", fill=(150, 150, 150), font=f_col_header)
-        draw.text((110, y), "PLAYER", fill=(150, 150, 150), font=f_col_header)
-        draw.text((W - 30, y), "REFERRALS", fill=(150, 150, 150), font=f_col_header, anchor="ra")
-        y += 20
-
-        medals = ["\U0001F947", "\U0001F948", "\U0001F949"]
-        medal_colors = [(255, 200, 50), (180, 180, 180), (205, 127, 50)]
-        medal_nums = ["1", "2", "3"]
-
-        for i, entry in enumerate(entries):
-            row_h = 42
-            rank = entry["rank"]
-            uname = entry["username"]
-            if len(uname) > 20:
-                uname = uname[:17] + "..."
-            ref_count = entry["referrals"]
-
-            if rank == 1:
-                row_color = (40, 25, 55)
-                draw.rounded_rectangle([20, y, W - 20, y + row_h], radius=10, outline=(200, 100, 255), width=2, fill=row_color)
-            elif rank <= 3:
-                row_color = (30, 20, 45)
-                draw.rounded_rectangle([20, y, W - 20, y + row_h], radius=10, fill=row_color)
-            else:
-                row_color = (22, 15, 35) if i % 2 == 0 else (18, 12, 30)
-                draw.rounded_rectangle([20, y, W - 20, y + row_h], radius=8, fill=row_color)
-
-            if rank <= 3:
-                # Draw colored medal circle with number
-                mc = medal_colors[rank - 1]
-                mx, my = 45, y + 12
-                draw.ellipse([mx - 10, my - 10, mx + 10, my + 10], fill=mc, outline=(255, 255, 255), width=1)
-                nw = draw.textlength(medal_nums[rank - 1], font=f_reg)
-                draw.text((mx - nw // 2, my - 9), medal_nums[rank - 1], fill=(30, 30, 30), font=f_reg)
-            else:
-                draw.text((38, y + 8), f"#{rank}", fill=(150, 150, 150), font=f_reg)
-
-            draw.text((110, y + 10), uname, fill=(255, 255, 255), font=f_reg)
-
-            val_str = str(ref_count)
-            vw = draw.textlength(val_str, font=f_val)
-            draw.text((W - 30, y + 10), val_str, fill=(200, 100, 255), font=f_val, anchor="ra")
-
-            y += row_h + 4
-
-        if not entries:
-            draw.text((W // 2 - 60, y), "No referrals yet", fill=(150, 150, 150), font=f_reg)
-            y += 30
-
-        # Your Rank box
-        y += 10
-        draw.rounded_rectangle([20, y, W - 20, y + 55], radius=12, outline=(200, 100, 255), width=2, fill=(35, 15, 50))
-        draw.rounded_rectangle([35, y + 10, 110, y + 45], radius=8, fill=(50, 20, 60), outline=(200, 100, 255), width=2)
-        draw.text((52, y + 13), "#---", fill=(255, 200, 50), font=f_big_rank)
-        draw.text((125, y + 10), "Your Rank", fill=(150, 200, 150), font=f_xsmall)
-        draw.text((125, y + 28), "0 referrals", fill=(200, 100, 255), font=f_small)
-
-        y += 70
-        draw.text(((W - 110) // 2, y), "Play responsibly", fill=(100, 100, 100), font=f_xsmall)
-
-        output = BytesIO()
-        img.save(output, format='JPEG', quality=92)
-        output.seek(0)
-        return output
-    except Exception as e:
-        logging.error(f"PIL referral leaderboard render error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+    """Render referral leaderboard with the same look as the main wagered
+    leaderboard. Re-uses ``_render_leaderboard_sync`` so the design stays in
+    sync with the example template (hex podium top-3, ranks 4-10, etc.).
+    """
+    converted = []
+    for e in (entries or []):
+        converted.append({
+            "rank": e.get("rank"),
+            "username": e.get("username", ""),
+            "value": int(e.get("referrals", 0) or 0),
+        })
+    return _render_leaderboard_sync(
+        entries=converted,
+        bot_username=bot_username,
+        section_title="All-Time Top Referrers",
+        user_rank=None,
+        user_wagered=0.0,
+        value_formatter=lambda v: (
+            f"{int(v):,} ref" if int(v) == 1 else f"{int(v):,} refs"
+        ),
+        your_rank_label="YOUR REFERRALS",
+        your_value_label="Total Referrals",
+    )
 
 
 # ============================================================
@@ -11375,12 +11287,810 @@ def calculate_required_wager(user_id):
 
     return total_needed, breakdown
 
+
+# ============================================================
+# JACKPOT MODULE
+# ------------------------------------------------------------
+# Daily prize pool that accumulates a small percentage of every
+# bet placed. A winner is drawn each day at 5:30 PM IST among
+# users whose 7-day wager meets the configured threshold; the
+# winner is picked weighted by their 7-day wager.
+#
+# State lives in ``jackpot.json`` (next to the other JSON state
+# files). Per-user 7-day wager tracking is bucketed by UTC day
+# so it stays compact (max 7 entries per user).
+#
+# All player names / amounts displayed by this module are
+# computed at runtime from the bot's data — nothing is
+# hard-coded. The example template usernames are illustrative.
+# ============================================================
+
+JACKPOT_FILE = os.path.join(DATA_DIR, "jackpot.json")
+JACKPOT_DEFAULT_THRESHOLD_USD = 100.0    # 7-day wager required to be eligible
+JACKPOT_DEFAULT_ACCUM_RATE = 0.002        # 0.2 % of every bet -> jackpot
+JACKPOT_DRAW_HOUR_IST = 17                # 5:30 PM IST
+JACKPOT_DRAW_MINUTE_IST = 30
+JACKPOT_ANNOUNCE_CHAT = os.environ.get("JACKPOT_ANNOUNCE_CHAT", "@PlayCasino")
+JACKPOT_HISTORY_LIMIT = 50
+
+# IST is UTC+5:30, no daylight savings.
+_JACKPOT_IST_OFFSET = timedelta(hours=5, minutes=30)
+_jackpot_lock = asyncio.Lock()
+_jackpot_dirty = False
+_jackpot_state = {
+    "pool": 0.0,
+    "wager_threshold": JACKPOT_DEFAULT_THRESHOLD_USD,
+    "accum_rate": JACKPOT_DEFAULT_ACCUM_RATE,
+    "user_wagers": {},          # str(user_id) -> {"YYYY-MM-DD": float}
+    "last_winner": None,        # {user_id, username, amount, draw_iso, pool}
+    "history": [],              # last N draws
+    "last_draw_iso": None,
+}
+_jackpot_loaded = False
+
+
+def _jackpot_today_utc_key(now=None):
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%d")
+
+
+def _jackpot_load():
+    """Load jackpot state from disk. Idempotent and safe to call early."""
+    global _jackpot_loaded
+    if _jackpot_loaded:
+        return
+    _jackpot_loaded = True
+    try:
+        if os.path.exists(JACKPOT_FILE):
+            with open(JACKPOT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k in ("pool", "wager_threshold", "accum_rate"):
+                if k in data:
+                    try:
+                        _jackpot_state[k] = float(data[k])
+                    except (TypeError, ValueError):
+                        pass
+            if isinstance(data.get("user_wagers"), dict):
+                _jackpot_state["user_wagers"] = data["user_wagers"]
+            if isinstance(data.get("last_winner"), dict):
+                _jackpot_state["last_winner"] = data["last_winner"]
+            if isinstance(data.get("history"), list):
+                _jackpot_state["history"] = data["history"][-JACKPOT_HISTORY_LIMIT:]
+            _jackpot_state["last_draw_iso"] = data.get("last_draw_iso")
+            logging.info(
+                "Jackpot loaded: pool=$%.2f threshold=$%.2f rate=%.4f users=%d",
+                _jackpot_state["pool"], _jackpot_state["wager_threshold"],
+                _jackpot_state["accum_rate"], len(_jackpot_state["user_wagers"]),
+            )
+    except Exception as e:
+        logging.error(f"Failed to load jackpot state: {e}")
+
+
+def _jackpot_mark_dirty():
+    global _jackpot_dirty
+    _jackpot_dirty = True
+
+
+def _jackpot_save_now():
+    """Synchronous save. Cheap (small JSON), safe to call from async via run_in_executor."""
+    global _jackpot_dirty
+    try:
+        tmp = JACKPOT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_jackpot_state, f, indent=2, default=str)
+        os.replace(tmp, JACKPOT_FILE)
+        _jackpot_dirty = False
+    except Exception as e:
+        logging.error(f"Failed to save jackpot state: {e}")
+
+
+def _jackpot_prune_user(user_id):
+    """Keep only the last 7 UTC-day buckets for this user."""
+    key = str(user_id)
+    bucket = _jackpot_state["user_wagers"].get(key)
+    if not isinstance(bucket, dict):
+        return
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+    pruned = {d: v for d, v in bucket.items() if d > cutoff}
+    if pruned:
+        _jackpot_state["user_wagers"][key] = pruned
+    else:
+        _jackpot_state["user_wagers"].pop(key, None)
+
+
+def _jackpot_user_7d_wager(user_id) -> float:
+    _jackpot_load()
+    _jackpot_prune_user(user_id)
+    bucket = _jackpot_state["user_wagers"].get(str(user_id))
+    if not bucket:
+        return 0.0
+    try:
+        return float(sum(float(v) for v in bucket.values()))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _jackpot_credit(user_id: int, bet_amount_usd: float):
+    """Hook called from ``update_stats_on_bet``. Adds the configured
+    percentage of ``bet_amount_usd`` to the pool and records the bet
+    against the user's 7-day wager bucket."""
+    if bet_amount_usd is None or bet_amount_usd <= 0:
+        return
+    _jackpot_load()
+    rate = float(_jackpot_state.get("accum_rate", JACKPOT_DEFAULT_ACCUM_RATE) or 0.0)
+    contribution = float(bet_amount_usd) * rate
+    if contribution > 0:
+        _jackpot_state["pool"] = float(_jackpot_state.get("pool", 0.0)) + contribution
+    key = str(user_id)
+    bucket = _jackpot_state["user_wagers"].setdefault(key, {})
+    today = _jackpot_today_utc_key()
+    bucket[today] = float(bucket.get(today, 0.0)) + float(bet_amount_usd)
+    _jackpot_prune_user(user_id)
+    _jackpot_mark_dirty()
+
+
+def _jackpot_eligible_entries():
+    """Return list of (user_id_int, weight_float, username_str) for users
+    whose 7-day wager >= threshold."""
+    _jackpot_load()
+    threshold = float(_jackpot_state.get("wager_threshold", JACKPOT_DEFAULT_THRESHOLD_USD))
+    out = []
+    for key, bucket in list(_jackpot_state["user_wagers"].items()):
+        try:
+            uid = int(key)
+        except (TypeError, ValueError):
+            continue
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+        total = 0.0
+        if isinstance(bucket, dict):
+            for d, v in bucket.items():
+                if d > cutoff:
+                    try:
+                        total += float(v)
+                    except (TypeError, ValueError):
+                        pass
+        if total >= threshold:
+            uname = ""
+            try:
+                uname = (user_stats.get(uid, {}).get("userinfo", {}) or {}).get("username") or ""
+            except Exception:
+                uname = ""
+            out.append((uid, total, uname))
+    return out
+
+
+def _jackpot_pick_winner(entries):
+    """Weighted random pick. Returns (uid, weight, username) or None."""
+    if not entries:
+        return None
+    total_w = sum(e[1] for e in entries)
+    if total_w <= 0:
+        return None
+    r = random.uniform(0, total_w)
+    upto = 0.0
+    for entry in entries:
+        upto += entry[1]
+        if r <= upto:
+            return entry
+    return entries[-1]
+
+
+def _jackpot_next_draw_dt(now_utc=None):
+    """Return the next 5:30 PM IST datetime (UTC) at or after ``now_utc``."""
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc + _JACKPOT_IST_OFFSET
+    target_ist = now_ist.replace(
+        hour=JACKPOT_DRAW_HOUR_IST, minute=JACKPOT_DRAW_MINUTE_IST,
+        second=0, microsecond=0,
+    )
+    if target_ist <= now_ist:
+        target_ist = target_ist + timedelta(days=1)
+    return target_ist - _JACKPOT_IST_OFFSET
+
+
+async def _jackpot_run_draw(application):
+    """Perform the daily jackpot draw. Awards the pool to the winner,
+    resets the pool to zero, announces in the configured group."""
+    async with _jackpot_lock:
+        _jackpot_load()
+        pool = float(_jackpot_state.get("pool", 0.0) or 0.0)
+        threshold = float(_jackpot_state.get("wager_threshold", JACKPOT_DEFAULT_THRESHOLD_USD))
+        entries = _jackpot_eligible_entries()
+        now_utc = datetime.now(timezone.utc)
+        draw_iso = now_utc.isoformat()
+
+        if not entries or pool <= 0:
+            logging.info(
+                "Jackpot draw skipped: pool=$%.2f eligible=%d threshold=$%.2f",
+                pool, len(entries), threshold,
+            )
+            _jackpot_state["last_draw_iso"] = draw_iso
+            _jackpot_mark_dirty()
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, _jackpot_save_now)
+            except Exception:
+                pass
+            return None
+
+        winner = _jackpot_pick_winner(entries)
+        if winner is None:
+            return None
+        uid, weight, uname = winner
+        amount_won = pool
+
+        # Credit the winner.
+        try:
+            credit_wallet_safe(uid, amount_won)
+            try:
+                save_user_data(uid)
+            except Exception:
+                pass
+        except Exception as e:
+            logging.error(f"Failed to credit jackpot winner {uid}: {e}")
+            return None
+
+        # Reset the pool.
+        _jackpot_state["pool"] = 0.0
+        winner_record = {
+            "user_id": uid,
+            "username": uname,
+            "amount": amount_won,
+            "pool": amount_won,
+            "draw_iso": draw_iso,
+            "weight": weight,
+        }
+        _jackpot_state["last_winner"] = winner_record
+        _jackpot_state["last_draw_iso"] = draw_iso
+        history = _jackpot_state.setdefault("history", [])
+        history.append(winner_record)
+        if len(history) > JACKPOT_HISTORY_LIMIT:
+            del history[: -JACKPOT_HISTORY_LIMIT]
+        _jackpot_mark_dirty()
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, _jackpot_save_now)
+        except Exception:
+            pass
+
+        # Announce the winner in @PlayCasino.
+        try:
+            bot_uname = await get_bot_username(type("ctx", (), {"bot": application.bot})())
+        except Exception:
+            bot_uname = "Casino"
+        try:
+            winner_pic = await _get_cached_profile_picture(
+                type("ctx", (), {"bot": application.bot})(), uid
+            )
+        except Exception:
+            winner_pic = None
+
+        try:
+            loop = asyncio.get_running_loop()
+            img_buf = await loop.run_in_executor(
+                None,
+                generate_jackpot_winner_image,
+                uname or f"User-{uid}",
+                amount_won,
+                bot_uname,
+                winner_pic,
+                draw_iso,
+            )
+        except Exception as e:
+            logging.error(f"Failed to render jackpot winner image: {e}")
+            img_buf = None
+
+        caption = (
+            f"\U0001F389 <b>JACKPOT WINNER!</b>\n\n"
+            f"@{uname} just won <b>${amount_won:,.2f}</b> from the daily jackpot!\n\n"
+            f"Play more, wager more, and you could be next."
+        )
+
+        try:
+            if img_buf is not None:
+                await application.bot.send_photo(
+                    chat_id=JACKPOT_ANNOUNCE_CHAT,
+                    photo=img_buf,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await application.bot.send_message(
+                    chat_id=JACKPOT_ANNOUNCE_CHAT,
+                    text=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception as e:
+            logging.error(f"Failed to announce jackpot winner in {JACKPOT_ANNOUNCE_CHAT}: {e}")
+
+        # Best-effort DM to the winner.
+        try:
+            await application.bot.send_message(
+                chat_id=uid,
+                text=(
+                    f"\U0001F389 You just won the daily jackpot — "
+                    f"<b>${amount_won:,.2f}</b> has been credited to your wallet."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+        logging.info(
+            "Jackpot drawn: winner=%s amount=$%.2f eligible=%d",
+            uname or uid, amount_won, len(entries),
+        )
+        return winner_record
+
+
+async def _jackpot_scheduler_task(application):
+    """Sleeps until the next 5:30 PM IST, runs the draw, repeats. Runs as a
+    long-lived task started from ``post_init``."""
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            next_dt = _jackpot_next_draw_dt(now_utc)
+            wait_s = max(1.0, (next_dt - now_utc).total_seconds())
+            logging.info(
+                "Jackpot scheduler: next draw at %s UTC (%.0fs)",
+                next_dt.isoformat(timespec="seconds"), wait_s,
+            )
+            await asyncio.sleep(wait_s)
+            try:
+                await _jackpot_run_draw(application)
+            except Exception as e:
+                logging.error(f"Jackpot draw error: {e}", exc_info=True)
+            # Small buffer so we don't immediately re-trigger if the draw
+            # finishes within the same minute.
+            await asyncio.sleep(65)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logging.error(f"Jackpot scheduler crashed: {e}", exc_info=True)
+            await asyncio.sleep(60)
+
+
+async def _jackpot_save_loop():
+    """Background loop that persists jackpot state when dirty (every 30s)."""
+    while True:
+        try:
+            await asyncio.sleep(30)
+            if _jackpot_dirty:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(None, _jackpot_save_now)
+                except Exception as e:
+                    logging.error(f"Jackpot background save failed: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logging.error(f"Jackpot save loop error: {e}")
+
+
+# ----- Jackpot PIL renderers (status + winner) -----
+
+def _jackpot_get_font(size: int):
+    paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for p in paths:
+        try:
+            if os.path.exists(p):
+                return ImageFont.truetype(p, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _jackpot_paste_circle_avatar(img, avatar, x, y, size, ring_color):
+    """Paste a circular avatar onto ``img`` at (x, y). Returns possibly
+    converted RGB ``img`` and a fresh ``ImageDraw``."""
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([x - 2, y - 2, x + size + 2, y + size + 2],
+                 outline=ring_color, width=2)
+    if avatar is None:
+        draw.ellipse([x, y, x + size, y + size], fill=(20, 30, 60))
+        return img, draw
+    try:
+        a = avatar.resize((size, size), Image.LANCZOS)
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).ellipse([0, 0, size, size], fill=255)
+        rgba = img.convert("RGBA")
+        a_rgba = a.convert("RGBA")
+        a_rgba.putalpha(mask)
+        rgba.paste(a_rgba, (x, y), a_rgba)
+        img = rgba.convert("RGB")
+        return img, ImageDraw.Draw(img)
+    except Exception:
+        draw.ellipse([x, y, x + size, y + size], fill=(20, 30, 60))
+        return img, draw
+
+
+def generate_jackpot_status_image(
+    pool_amount: float,
+    wager_threshold: float,
+    user_7d_wager: float,
+    next_draw_in_seconds: float,
+    last_winner: dict | None,
+    bot_username: str,
+    player_username: str | None = None,
+    player_profile_pic=None,
+) -> BytesIO:
+    """Render the /jackpot status card. All player names / amounts are
+    runtime values — nothing is hard-coded."""
+    W, H = 800, 700
+    BG = (8, 12, 28)
+    GOLD = (255, 215, 80)
+    GOLD_DIM = (160, 120, 30)
+    GREEN = (0, 220, 130)
+    RED = (255, 80, 80)
+    BLUE = (0, 180, 255)
+    TXT = (240, 244, 255)
+    DIM = (140, 160, 200)
+    BORDER = (28, 60, 120)
+
+    img = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+
+    # Subtle radial glow + grid background.
+    cx, cy = W // 2, 260
+    for r in range(280, 0, -14):
+        a = int(14 * (r / 280))
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                     fill=(8 + a, 12 + a // 2, 28 + a))
+    for gx in range(0, W, 50):
+        draw.line([(gx, 0), (gx, H)], fill=(20, 35, 70), width=1)
+    for gy in range(0, H, 50):
+        draw.line([(0, gy), (W, gy)], fill=(20, 35, 70), width=1)
+
+    # Header bar.
+    f_title = _jackpot_get_font(34)
+    f_sub   = _jackpot_get_font(14)
+    f_lbl   = _jackpot_get_font(16)
+    f_pool  = _jackpot_get_font(72)
+    f_body  = _jackpot_get_font(16)
+    f_small = _jackpot_get_font(13)
+    f_tiny  = _jackpot_get_font(11)
+
+    # Top-left avatar + player username.
+    img, draw = _jackpot_paste_circle_avatar(img, player_profile_pic, 18, 14, 56, BLUE)
+    if player_username:
+        plabel = f"@{player_username}" if not player_username.startswith("@") else player_username
+        draw.text((86, 22), plabel, font=f_lbl, fill=TXT)
+        draw.text((86, 44), "Jackpot status", font=f_small, fill=DIM)
+
+    # Top-right bot watermark.
+    bot_lbl = f"@{bot_username}" if not bot_username.startswith("@") else bot_username
+    bw = draw.textlength(bot_lbl, font=f_lbl)
+    draw.text((W - bw - 18, 18), bot_lbl, font=f_lbl, fill=GOLD)
+    sub_brand = "Telegram Casino"
+    sbw = draw.textlength(sub_brand, font=f_tiny)
+    draw.text((W - sbw - 18, 44), sub_brand, font=f_tiny, fill=DIM)
+
+    # Title strip.
+    draw.line([(20, 86), (W - 20, 86)], fill=GOLD, width=2)
+    title = "DAILY JACKPOT"
+    tw = draw.textlength(title, font=f_title)
+    draw.text(((W - tw) // 2, 100), title, font=f_title, fill=GOLD)
+
+    # Pool amount (huge).
+    pool_str = f"${pool_amount:,.2f}"
+    pw = draw.textlength(pool_str, font=f_pool)
+    draw.text(((W - pw) // 2, 150), pool_str, font=f_pool, fill=GREEN)
+
+    pool_lbl = "current pool"
+    plw = draw.textlength(pool_lbl, font=f_small)
+    draw.text(((W - plw) // 2, 240), pool_lbl, font=f_small, fill=DIM)
+
+    # Countdown card.
+    card_y = 280
+    draw.rounded_rectangle([40, card_y, W - 40, card_y + 90], radius=16,
+                           fill=(12, 22, 50), outline=BORDER, width=2)
+    secs = max(0, int(next_draw_in_seconds))
+    hours = secs // 3600
+    mins = (secs % 3600) // 60
+    cd_str = f"{hours:02d}h {mins:02d}m"
+    draw.text((60, card_y + 14), "NEXT DRAW IN", font=f_lbl, fill=DIM)
+    draw.text((60, card_y + 40), cd_str, font=f_title, fill=GOLD)
+    rt = "Daily at 5:30 PM IST"
+    rtw = draw.textlength(rt, font=f_small)
+    draw.text((W - rtw - 60, card_y + 50), rt, font=f_small, fill=DIM)
+
+    # Eligibility / progress card.
+    elig_y = card_y + 110
+    draw.rounded_rectangle([40, elig_y, W - 40, elig_y + 130], radius=16,
+                           fill=(10, 18, 38), outline=BORDER, width=2)
+    draw.text((60, elig_y + 14), "YOUR 7-DAY WAGER", font=f_lbl, fill=DIM)
+    progress = 0.0 if wager_threshold <= 0 else min(1.0, user_7d_wager / wager_threshold)
+    eligible = user_7d_wager >= wager_threshold and wager_threshold > 0
+    bar_x0, bar_x1 = 60, W - 60
+    bar_y0 = elig_y + 50
+    bar_y1 = elig_y + 70
+    draw.rounded_rectangle([bar_x0, bar_y0, bar_x1, bar_y1], radius=10,
+                           fill=(18, 28, 56))
+    fill_w = int((bar_x1 - bar_x0) * progress)
+    if fill_w > 0:
+        bar_color = GREEN if eligible else BLUE
+        draw.rounded_rectangle(
+            [bar_x0, bar_y0, bar_x0 + fill_w, bar_y1], radius=10, fill=bar_color,
+        )
+    progress_text = f"${user_7d_wager:,.2f} / ${wager_threshold:,.2f}"
+    pw2 = draw.textlength(progress_text, font=f_body)
+    draw.text(((W - pw2) // 2, bar_y1 + 10), progress_text, font=f_body, fill=TXT)
+    if eligible:
+        status = "You are eligible for tonight's draw."
+        scolor = GREEN
+    else:
+        needed = max(0.0, wager_threshold - user_7d_wager)
+        status = f"Wager ${needed:,.2f} more in the next 7 days to qualify."
+        scolor = RED
+    sw = draw.textlength(status, font=f_small)
+    draw.text(((W - sw) // 2, bar_y1 + 32), status, font=f_small, fill=scolor)
+
+    # Last winner card.
+    lw_y = elig_y + 150
+    draw.rounded_rectangle([40, lw_y, W - 40, lw_y + 80], radius=16,
+                           fill=(20, 14, 4), outline=GOLD_DIM, width=2)
+    draw.text((60, lw_y + 12), "LAST WINNER", font=f_lbl, fill=GOLD_DIM)
+    if last_winner:
+        wn = last_winner.get("username") or f"User-{last_winner.get('user_id', '')}"
+        wn_lbl = f"@{wn}" if wn and not wn.startswith("@") else (wn or "")
+        draw.text((60, lw_y + 36), wn_lbl, font=f_lbl, fill=TXT)
+        amt_str = f"+${float(last_winner.get('amount', 0)):,.2f}"
+        aw = draw.textlength(amt_str, font=f_lbl)
+        draw.text((W - aw - 60, lw_y + 36), amt_str, font=f_lbl, fill=GREEN)
+    else:
+        draw.text((60, lw_y + 36), "No winners yet — be the first!", font=f_body, fill=DIM)
+
+    # Footer line.
+    foot = "0.2% of every bet feeds the pool  •  Play Responsibly  •  Telegram Casino"
+    fw = draw.textlength(foot, font=f_tiny)
+    draw.text(((W - fw) // 2, H - 22), foot, font=f_tiny, fill=(70, 95, 140))
+
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
+
+
+def generate_jackpot_winner_image(
+    winner_username: str,
+    amount_won: float,
+    bot_username: str,
+    winner_profile_pic=None,
+    draw_iso: str = None,
+) -> BytesIO:
+    """Render the @PlayCasino winner-announcement card."""
+    W, H = 900, 560
+    BG = (8, 12, 28)
+    GOLD = (255, 215, 80)
+    GOLD_DIM = (160, 120, 30)
+    GREEN = (0, 220, 130)
+    BLUE = (0, 180, 255)
+    TXT = (245, 248, 255)
+    DIM = (150, 170, 210)
+    BORDER = (40, 70, 130)
+
+    img = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+
+    # Big radial glow centred on the avatar.
+    cx, cy = W // 2, 250
+    for r in range(360, 0, -16):
+        a = int(20 * (r / 360))
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                     fill=(10 + a, 14 + a // 2, 32 + a))
+    for gx in range(0, W, 50):
+        draw.line([(gx, 0), (gx, H)], fill=(22, 38, 72), width=1)
+    for gy in range(0, H, 50):
+        draw.line([(0, gy), (W, gy)], fill=(22, 38, 72), width=1)
+
+    f_title = _jackpot_get_font(40)
+    f_sub   = _jackpot_get_font(18)
+    f_lbl   = _jackpot_get_font(16)
+    f_amt   = _jackpot_get_font(80)
+    f_body  = _jackpot_get_font(20)
+    f_tiny  = _jackpot_get_font(12)
+
+    # Top-right bot label.
+    bot_lbl = f"@{bot_username}" if not bot_username.startswith("@") else bot_username
+    bw = draw.textlength(bot_lbl, font=f_lbl)
+    draw.text((W - bw - 18, 18), bot_lbl, font=f_lbl, fill=GOLD)
+    brand = "Telegram Casino"
+    bsw = draw.textlength(brand, font=f_tiny)
+    draw.text((W - bsw - 18, 40), brand, font=f_tiny, fill=DIM)
+
+    # Header strip.
+    draw.line([(20, 70), (W - 20, 70)], fill=GOLD, width=2)
+    title = "JACKPOT WINNER"
+    tw = draw.textlength(title, font=f_title)
+    draw.text(((W - tw) // 2, 86), title, font=f_title, fill=GOLD)
+
+    # Big avatar centred.
+    av_size = 130
+    av_x = (W - av_size) // 2
+    av_y = 150
+    img, draw = _jackpot_paste_circle_avatar(img, winner_profile_pic, av_x, av_y, av_size, GOLD)
+
+    # Winner username.
+    wn = winner_username or "Player"
+    wn_lbl = f"@{wn}" if not wn.startswith("@") else wn
+    nw = draw.textlength(wn_lbl, font=f_body)
+    draw.text(((W - nw) // 2, av_y + av_size + 14), wn_lbl, font=f_body, fill=TXT)
+
+    # Amount.
+    amt_str = f"${amount_won:,.2f}"
+    aw = draw.textlength(amt_str, font=f_amt)
+    draw.text(((W - aw) // 2, av_y + av_size + 50), amt_str, font=f_amt, fill=GREEN)
+
+    # Sub-line.
+    sub = "won the daily jackpot"
+    sw = draw.textlength(sub, font=f_sub)
+    draw.text(((W - sw) // 2, av_y + av_size + 142), sub, font=f_sub, fill=DIM)
+
+    # Footer.
+    foot = "Play Responsibly  •  Telegram Casino  •  jackpot"
+    fw = draw.textlength(foot, font=f_tiny)
+    draw.text(((W - fw) // 2, H - 24), foot, font=f_tiny, fill=(70, 95, 140))
+
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
+
+
+@check_banned
+@check_maintenance
+async def jackpot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """``/jackpot`` — show jackpot status (any user).
+
+    ``/jackpot <amount>`` — owner-only, sets the 7-day wager threshold.
+    ``/jackpot rate <0..1>`` — owner-only, sets the accumulator rate.
+    """
+    user = update.effective_user
+    if not user:
+        return
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    _jackpot_load()
+
+    args = context.args or []
+
+    # --- Owner controls ---
+    if args and is_admin(user.id):
+        first = args[0].lower()
+        if first in ("rate",) and len(args) >= 2:
+            try:
+                new_rate = float(args[1])
+            except ValueError:
+                await update.message.reply_text("Usage: /jackpot rate <0..1>")
+                return
+            if new_rate < 0 or new_rate > 0.5:
+                await update.message.reply_text(
+                    "Rate must be between 0 and 0.5 (i.e. 0%–50%)."
+                )
+                return
+            async with _jackpot_lock:
+                _jackpot_state["accum_rate"] = new_rate
+                _jackpot_mark_dirty()
+                await asyncio.get_running_loop().run_in_executor(None, _jackpot_save_now)
+            await update.message.reply_text(
+                f"Jackpot accumulator rate set to {new_rate*100:.2f}% per bet.")
+            return
+        if first in ("draw",):
+            await update.message.reply_text("Triggering jackpot draw…")
+            try:
+                rec = await _jackpot_run_draw(context.application)
+                if rec is None:
+                    await update.message.reply_text(
+                        "Draw skipped — no eligible users or empty pool.")
+                else:
+                    await update.message.reply_text(
+                        f"Drew jackpot: @{rec.get('username') or rec.get('user_id')} "
+                        f"won ${rec.get('amount', 0):,.2f}."
+                    )
+            except Exception as e:
+                await update.message.reply_text(f"Draw failed: {e}")
+            return
+        # Otherwise treat first arg as new threshold amount.
+        try:
+            new_thr = float(args[0].replace("$", "").replace(",", ""))
+        except ValueError:
+            await update.message.reply_text(
+                "Usage:\n"
+                "  /jackpot              — view jackpot status\n"
+                "  /jackpot <amount>     — (owner) set 7-day wager threshold\n"
+                "  /jackpot rate <0..1>  — (owner) set accumulator rate\n"
+                "  /jackpot draw         — (owner) trigger an immediate draw"
+            )
+            return
+        if new_thr < 0:
+            await update.message.reply_text("Threshold must be >= 0.")
+            return
+        async with _jackpot_lock:
+            _jackpot_state["wager_threshold"] = new_thr
+            _jackpot_mark_dirty()
+            await asyncio.get_running_loop().run_in_executor(None, _jackpot_save_now)
+        await update.message.reply_text(
+            f"Jackpot wager threshold set to ${new_thr:,.2f} (7-day wager)."
+        )
+        return
+
+    # --- Player view ---
+    pool = float(_jackpot_state.get("pool", 0.0))
+    threshold = float(_jackpot_state.get("wager_threshold", JACKPOT_DEFAULT_THRESHOLD_USD))
+    user_w = _jackpot_user_7d_wager(user.id)
+    last_winner = _jackpot_state.get("last_winner")
+
+    now_utc = datetime.now(timezone.utc)
+    next_dt = _jackpot_next_draw_dt(now_utc)
+    secs = max(0, int((next_dt - now_utc).total_seconds()))
+
+    bot_uname = await get_bot_username(context)
+    profile_pic = await _get_cached_profile_picture(context, user.id)
+
+    try:
+        loop = asyncio.get_running_loop()
+        img_buf = await loop.run_in_executor(
+            None,
+            generate_jackpot_status_image,
+            pool, threshold, user_w, secs, last_winner,
+            bot_uname, user.username, profile_pic,
+        )
+    except Exception as e:
+        logging.error(f"Jackpot status render failed: {e}")
+        img_buf = None
+
+    rate_pct = float(_jackpot_state.get("accum_rate", JACKPOT_DEFAULT_ACCUM_RATE)) * 100
+    eligible = user_w >= threshold
+    elig_line = (
+        "\u2705 You are eligible for tonight's draw."
+        if eligible
+        else f"Wager ${max(0.0, threshold - user_w):,.2f} more in the next 7 days to qualify."
+    )
+    last_line = ""
+    if isinstance(last_winner, dict) and last_winner.get("username"):
+        last_line = (
+            f"\nLast winner: @{last_winner['username']} "
+            f"won ${float(last_winner.get('amount', 0)):,.2f}"
+        )
+    caption = (
+        f"\U0001F4B0 <b>Daily Jackpot</b>\n"
+        f"Pool: <b>${pool:,.2f}</b>\n"
+        f"Your 7-day wager: ${user_w:,.2f} / ${threshold:,.2f}\n"
+        f"Each bet contributes {rate_pct:.2f}% to the pool.\n"
+        f"Draw: 5:30 PM IST daily.\n"
+        f"{elig_line}{last_line}"
+    )
+
+    try:
+        if img_buf is not None:
+            await update.message.reply_photo(
+                photo=img_buf, caption=caption, parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.message.reply_text(caption, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logging.error(f"Failed to send jackpot status: {e}")
+
+
+# ============================================================
+# END JACKPOT MODULE
+# ============================================================
+
+
 async def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False,
                                multiplier=0, context=None, game_type=None):
     """OPTIMIZED ASYNC version. Fast in-memory mutations only. Defers all heavy work."""
     stats = user_stats[user_id]
     stats["bets"]["count"] += 1
     stats["bets"]["amount"] += amount
+    # Jackpot accumulator hook: 0.2% of every bet feeds the pool, and the
+    # bet contributes to the user's 7-day eligibility wager.
+    try:
+        _jackpot_credit(user_id, amount)
+    except Exception as _e:
+        logging.error(f"Jackpot credit hook failed: {_e}")
 
     reduce_unwagered_amounts(user_id, amount)
 
@@ -13442,7 +14152,8 @@ def generate_bj_image(
     - Returns a BytesIO PNG buffer.
     """
     is_split = split_hands is not None and len(split_hands) >= 2
-    W, H = (800, 600) if is_split else (800, 500)
+    # Slightly taller canvas to leave room for the new info bar + footer.
+    W, H = (800, 640) if is_split else (800, 540)
     img = Image.new("RGB", (W, H), BJ_TABLE_COLOR)
     draw = ImageDraw.Draw(img)
 
@@ -13500,11 +14211,15 @@ def generate_bj_image(
         display_name = f"@{player_username}" if not player_username.startswith("@") else player_username
         draw.text((profile_pic_x + profile_pic_size + 10, profile_pic_y + 12), display_name, font=font_player, fill=BJ_TEXT_WHITE)
 
-    # Bot username at top right corner
+    # Bot username at top right corner + Telegram Casino subtitle
     font_wm = _bj_get_font(16)
+    font_wm_sub = _bj_get_font(11)
     wm_text = f"@{bot_username}" if not bot_username.startswith("@") else bot_username
     wm_w = draw.textlength(wm_text, font=font_wm)
-    draw.text((W - wm_w - 15, 18), wm_text, font=font_wm, fill=BJ_ACCENT)
+    draw.text((W - wm_w - 15, 14), wm_text, font=font_wm, fill=BJ_ACCENT)
+    sub_label = "Telegram Casino"
+    sub_w = draw.textlength(sub_label, font=font_wm_sub)
+    draw.text((W - sub_w - 15, 34), sub_label, font=font_wm_sub, fill=BJ_TEXT_LIGHT)
 
     # Decorative divider line below header
     draw.line([(15, header_y + 5), (W - 15, header_y + 5)], fill=BJ_BORDER, width=1)
@@ -13644,16 +14359,35 @@ def generate_bj_image(
         draw.text(((W - rw) // 2, H // 2 - 22), result_text, font=font_result, fill=(255, 255, 255))
 
     # Bottom info bar
-    bar_y = H - 28
+    bar_y = H - 36
+    # Translucent bottom band for legibility
+    band = Image.new("RGBA", (W, 36), (4, 8, 22, 220))
+    img_rgba2 = img.convert("RGBA")
+    img_rgba2.paste(band, (0, bar_y), band)
+    img = img_rgba2.convert("RGB")
+    draw = ImageDraw.Draw(img)
     # Left: bet amount
     left_text = ""
     if bet_amount is not None:
         left_text += f"Bet: ${bet_amount:.2f}"
     if left_text:
-        draw.text((14, bar_y), left_text, font=font_info, fill=BJ_TEXT_LIGHT)
+        draw.text((14, bar_y + 8), left_text, font=font_info, fill=BJ_TEXT_GOLD)
 
-    # Right: Game ID or subtle watermark
-    draw.text((W - 80, bar_y + 2), "BLACKJACK", font=font_small, fill=BJ_TEXT_DIM)
+    # Center hint: BLACKJACK ALSO SUPPORTS SPLIT
+    if not is_split:
+        hint = "BLACKJACK ALSO SUPPORTS SPLIT"
+        hint_w = draw.textlength(hint, font=font_small)
+        draw.text(((W - hint_w) // 2, bar_y + 11), hint, font=font_small, fill=BJ_TEXT_GOLD)
+
+    # Right: BLACKJACK label
+    label = "BLACKJACK"
+    lw = draw.textlength(label, font=font_info)
+    draw.text((W - lw - 14, bar_y + 8), label, font=font_info, fill=BJ_ACCENT)
+
+    # Soft footer line below the info bar
+    footer = "Play Responsibly  •  Telegram Casino  •  blackjack"
+    fw = draw.textlength(footer, font=font_small)
+    draw.text(((W - fw) // 2, H - 14), footer, font=font_small, fill=(60, 80, 120))
 
     # Save to BytesIO
     buf = BytesIO()
@@ -13885,6 +14619,7 @@ def generate_limbo_image(
     bot_username: str = "Casino",
     game_id: str = None,
     currency: str = "USDT",
+    player_profile_pic = None,  # PIL Image or None
 ) -> BytesIO:
     """
     Render a 800x600 Limbo game result image with neon bluish-black theme.
@@ -13920,20 +14655,56 @@ def generate_limbo_image(
         draw.line([(0, gy), (W, gy)], fill=(20, 35, 70, 40), width=1)
     
     # Top decorative line
-    draw.line([(40, 60), (W - 40, 60)], fill=LIMBO_ACCENT, width=2)
-    
-    # Title: LIMBO
+    draw.line([(40, 70), (W - 40, 70)], fill=LIMBO_ACCENT, width=2)
+
+    # Player profile pic (top-left, circle, like the example template).
+    pp_size = 56
+    pp_x, pp_y = 18, 12
+    draw.ellipse(
+        [pp_x, pp_y, pp_x + pp_size, pp_y + pp_size],
+        fill=(15, 25, 55), outline=LIMBO_ACCENT, width=2,
+    )
+    if player_profile_pic is not None:
+        try:
+            pp_resized = player_profile_pic.resize((pp_size - 4, pp_size - 4), Image.LANCZOS)
+            mask = Image.new("L", (pp_size - 4, pp_size - 4), 0)
+            ImageDraw.Draw(mask).ellipse([0, 0, pp_size - 4, pp_size - 4], fill=255)
+            img_rgba = img.convert("RGBA")
+            pp_rgba = pp_resized.convert("RGBA")
+            pp_rgba.putalpha(mask)
+            img_rgba.paste(pp_rgba, (pp_x + 2, pp_y + 2), pp_rgba)
+            img = img_rgba.convert("RGB")
+            draw = ImageDraw.Draw(img)
+        except Exception:
+            pass
+
+    # Title: LIMBO (next to profile pic, left side)
     font_title = _limbo_get_font(28)
     title_text = "LIMBO"
-    title_w = draw.textlength(title_text, font=font_title)
-    draw.text(((W - title_w) // 2, 18), title_text, font=font_title, fill=LIMBO_ACCENT)
-    
-    # Game ID (top right, small)
-    font_game_id = _limbo_get_font(12)
+    draw.text((pp_x + pp_size + 12, 22), title_text, font=font_title, fill=LIMBO_ACCENT)
+
+    # Top-right: @bot_username + Telegram Casino subtitle
+    font_wm_top = _limbo_get_font(15)
+    font_wm_sub = _limbo_get_font(11)
+    wm_top = f"@{bot_username}" if not bot_username.startswith("@") else bot_username
+    wmt_w = draw.textlength(wm_top, font=font_wm_top)
+    draw.text((W - wmt_w - 18, 14), wm_top, font=font_wm_top, fill=LIMBO_GOLD)
+    sub_brand = "Telegram Casino"
+    sub_w = draw.textlength(sub_brand, font=font_wm_sub)
+    draw.text((W - sub_w - 18, 34), sub_brand, font=font_wm_sub, fill=LIMBO_TEXT_DIM)
+
+    # Game ID (subtle, below the top decorative line)
+    font_game_id = _limbo_get_font(11)
     if game_id:
         gid_text = f"ID: {game_id}"
         gid_w = draw.textlength(gid_text, font=font_game_id)
-        draw.text((W - gid_w - 40, 22), gid_text, font=font_game_id, fill=LIMBO_TEXT_DIM)
+        draw.text((W - gid_w - 18, 76), gid_text, font=font_game_id, fill=LIMBO_TEXT_DIM)
+
+    # Player username under the LIMBO title (if provided)
+    if player_username:
+        font_pu = _limbo_get_font(12)
+        pu_label = f"@{player_username}" if not player_username.startswith("@") else player_username
+        draw.text((pp_x + pp_size + 12, 56), pu_label, font=font_pu, fill=LIMBO_TEXT_DIM)
     
     # Fonts
     font_label = _limbo_get_font(20)
@@ -14006,21 +14777,28 @@ def generate_limbo_image(
         payout_w = draw.textlength(payout_text, font=font_small)
         draw.text(((W - payout_w) // 2, result_y + box_h + 12), payout_text, font=font_small, fill=LIMBO_TEXT_DIM)
     
-    # Bottom info bar
-    bar_y = H - 40
-    
-    # Left: player username + bet
-    left_text = ""
-    if player_username:
-        left_text += f"@{player_username}"
-    left_text += f"  •  Bet: ${bet_amount:.2f} {currency}"
-    
-    draw.text((20, bar_y), left_text, font=font_info, fill=LIMBO_TEXT_DIM)
-    
-    # Right: bot username watermark
+    # Bottom info strip (bet | LIMBO | @bot_username)
+    bar_y = H - 56
+    draw.rounded_rectangle(
+        [14, bar_y, W - 14, bar_y + 30],
+        radius=8,
+        fill=(10, 18, 38),
+        outline=LIMBO_BORDER,
+        width=1,
+    )
+    bet_text = f"Bet: ${bet_amount:.2f} {currency}"
+    draw.text((28, bar_y + 7), bet_text, font=font_info, fill=LIMBO_GOLD)
+    center_lbl = "LIMBO"
+    cw = draw.textlength(center_lbl, font=font_info)
+    draw.text(((W - cw) // 2, bar_y + 7), center_lbl, font=font_info, fill=LIMBO_ACCENT)
     wm_text = f"@{bot_username}"
     wm_w = draw.textlength(wm_text, font=font_wm)
-    draw.text((W - wm_w - 20, bar_y + 4), wm_text, font=font_wm, fill=(60, 90, 140))
+    draw.text((W - wm_w - 28, bar_y + 9), wm_text, font=font_wm, fill=LIMBO_TEXT_WHITE)
+
+    # Soft footer line
+    footer_text = "Play Responsibly  •  Telegram Casino  •  limbo"
+    fw = draw.textlength(footer_text, font=font_small)
+    draw.text(((W - fw) // 2, H - 22), footer_text, font=font_small, fill=(60, 90, 140))
     
     # Side decorative lines
     draw.line([(20, 80), (20, H - 60)], fill=LIMBO_ACCENT, width=1)
@@ -18680,16 +19458,8 @@ async def create_reply_pvp_challenge(update: Update, context: ContextTypes.DEFAU
         reply_markup=keyboard
     )
 
-    # Try to pin
-    try:
-        await context.bot.pin_chat_message(
-            chat_id=update.effective_chat.id,
-            message_id=sent_message.message_id,
-            disable_notification=True
-        )
-        game_sessions[match_id]['pinned_message_id'] = sent_message.message_id
-    except Exception as e:
-        logging.warning(f"Could not pin reply challenge message: {e}")
+    # Pinning of PvP/PvB emoji game challenge messages is intentionally
+    # disabled (high-volume groups produced excessive pin churn).
 
 
 async def create_reply_pvp_challenge_xdxw(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str):
@@ -18800,16 +19570,7 @@ async def create_reply_pvp_challenge_xdxw(update: Update, context: ContextTypes.
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard
     )
-
-    try:
-        await context.bot.pin_chat_message(
-            chat_id=update.effective_chat.id,
-            message_id=sent_message.message_id,
-            disable_notification=True
-        )
-        game_sessions[match_id]['pinned_message_id'] = sent_message.message_id
-    except Exception as e:
-        logging.warning(f"Could not pin reply challenge message: {e}")
+    # Pinning of PvP/PvB emoji game challenge messages is intentionally disabled.
 
 
 # Callback: Challenged player confirms the reply-to PvP challenge
@@ -19320,12 +20081,8 @@ async def rpvp_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     match["status"] = "cancelled"
 
-    # Unpin if pinned
-    if 'pinned_message_id' in match:
-        try:
-            await context.bot.unpin_chat_message(match["chat_id"], match['pinned_message_id'])
-        except Exception:
-            pass
+    # PvP/PvB emoji game challenge messages are no longer pinned, so
+    # there is nothing to unpin here.
 
     await query.edit_message_text(
         f"{pe('cross')} Challenge cancelled by {user.mention_html()}.",
@@ -20398,11 +21155,7 @@ async def group_challenge_target_callback(update: Update, context: ContextTypes.
         ])
     )
 
-    # Try to pin the message
-    try:
-        await context.bot.pin_chat_message(update.effective_chat.id, challenge_msg.message_id)
-    except Exception as e:
-        logging.warning(f"Could not pin challenge message: {e}")
+    # Pinning of group emoji-game challenge messages is intentionally disabled.
 
     await query.edit_message_text(
         f"{pe('check')} Challenge created!\nMatch ID: <code>{match_id}</code>",
@@ -20520,12 +21273,7 @@ async def group_challenge_cancel_callback(update: Update, context: ContextTypes.
     except Exception as e:
         logging.warning(f"Failed to void sidebets on group cancel: {e}")
 
-    # Unpin if pinned
-    if 'pinned_message_id' in match:
-        try:
-            await context.bot.unpin_chat_message(match["chat_id"], match['pinned_message_id'])
-        except Exception:
-            pass
+    # Group emoji-game challenge messages are no longer pinned.
 
     await query.edit_message_text(
         f"{pe('cross')} Challenge cancelled by {user.mention_html()}.",
@@ -20561,12 +21309,7 @@ async def xdxw_cancel_match_callback(update: Update, context: ContextTypes.DEFAU
     except Exception as e:
         logging.warning(f"Failed to void sidebets on xdxw cancel: {e}")
 
-    # Unpin if pinned
-    if 'pinned_message_id' in match:
-        try:
-            await context.bot.unpin_chat_message(match["chat_id"], match['pinned_message_id'])
-        except Exception:
-            pass
+    # Emoji-game challenge messages are no longer pinned.
 
     try:
         await query.edit_message_text(
@@ -21200,6 +21943,7 @@ async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Generate Limbo template image
     active_currency = get_active_currency(user.id)
+    player_pic = await _get_cached_profile_picture(context, user.id)
     limbo_image = await async_generate_limbo_image(
         target_multiplier=target_multiplier,
         outcome=outcome,
@@ -21210,6 +21954,7 @@ async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_username=await get_bot_username(context),
         game_id=game_id,
         currency=active_currency,
+        player_profile_pic=player_pic,
     )
 
     # Create keyboard with provably fair button only
@@ -23646,11 +24391,7 @@ async def pvp_timeout_finish_job(context: ContextTypes.DEFAULT_TYPE):
             user_stats[loser_id]['game_sessions'].append(match_id)
 
         text += f"{pe('trophy')} <b>{final_winner_mention} wins the match and earns ${winnings:.2f}!</b>"
-        if 'pinned_message_id' in match_data:
-            try:
-                await context.bot.unpin_chat_message(chat_id, match_data['pinned_message_id'])
-            except Exception as e:
-                logging.warning(f"Could not unpin message for match {match_id}: {e}")
+        # Emoji-game match messages are no longer pinned, so nothing to unpin.
     else:
         # Continue to next round - player who rolled (winner) rolls first
         match_data["last_roller"] = None
@@ -24318,12 +25059,7 @@ async def generic_emoji_game_command(update: Update, context: ContextTypes.DEFAU
         reply_markup=keyboard_styled,
         parse_mode=ParseMode.HTML
     )
-
-    try:
-        await context.bot.pin_chat_message(chat_id=update.effective_chat.id, message_id=sent_message.message_id, disable_notification=True)
-        match_data['pinned_message_id'] = sent_message.message_id
-    except BadRequest as e:
-        logging.warning(f"Failed to pin match message for match {match_id}: {e}")
+    # Emoji-game match messages are no longer pinned.
 
 @check_banned
 @check_maintenance
@@ -25997,10 +26733,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             final_winner_username = match_data.get('usernames', {}).get(final_winner, f"Player {final_winner}")
                             final_winner_mention = f'<a href="tg://user?id={final_winner}">{display_at(final_winner_username)}</a>'
                             text += f"\n\n{pe('trophy')} <b>{final_winner_mention} wins the match and earns ${winnings:.2f}!</b>"
-                            # Unpin the message
-                            if 'pinned_message_id' in match_data:
-                                try: await context.bot.unpin_chat_message(chat_id, match_data['pinned_message_id'])
-                                except Exception as e: logging.warning(f"Could not unpin message for match {match_id}: {e}")
+                            # Emoji-game match messages are no longer pinned.
                         else:
                             match_data["last_roller"] = None
                             match_data["player_rolls"] = {p1: [], p2: []}  # Reset rolls for next round
@@ -31787,6 +32520,17 @@ async def post_init(application: Application):
         application.create_task(_cleanup_rate_limit_timestamps())
         application.create_task(_cleanup_profile_pic_cache())
 
+        # Jackpot: load persisted state, then start the daily-draw scheduler
+        # and the periodic save loop. The scheduler sleeps until the next
+        # 5:30 PM IST and runs the draw automatically.
+        try:
+            _jackpot_load()
+        except Exception as e:
+            logging.error(f"Failed to load jackpot state in post_init: {e}")
+        application.create_task(_jackpot_scheduler_task(application))
+        application.create_task(_jackpot_save_loop())
+        logging.info("Jackpot scheduler + save loop started")
+
         # Register shutdown handler to save all data on stop
         # Note: add_shutdown_handler was removed in PTB 22.x
         # Shutdown is now handled via app.add_error_handler and context managers
@@ -31836,6 +32580,11 @@ async def on_bot_shutdown(application: Application):
         # defensively in case any dirtied-but-not-marked records slipped
         # through the flush.
         save_bot_state_full()
+        # Persist jackpot state.
+        try:
+            _jackpot_save_now()
+        except Exception as _e:
+            logging.error(f"Failed to save jackpot state on shutdown: {_e}")
         logging.info("Bot shutdown save complete.")
     except Exception as e:
         logging.error(f"Error during bot shutdown: {e}", exc_info=True)
@@ -33695,13 +34444,8 @@ async def pvb_cashout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     house_profit = bet_amount - cashout_amount
     bot_settings["house_balance"] = bot_settings.get("house_balance", 0) + house_profit
 
-    # Unpin if pinned
     chat_id = match_data.get("chat_id")
-    if 'pinned_message_id' in match_data and chat_id:
-        try:
-            await context.bot.unpin_chat_message(chat_id, match_data['pinned_message_id'])
-        except Exception:
-            pass
+    # Emoji-game match messages are no longer pinned.
 
     # Send cashout confirmation
     try:
@@ -34190,6 +34934,7 @@ def main():
     app.add_handler(CommandHandler(["br", "blazerush"], blaze_rush_command, block=False))
     app.add_handler(CommandHandler("sl", slots_command, block=False)); app.add_handler(CommandHandler("bank", bank_command, block=False)); app.add_handler(CommandHandler("hb", bank_command, block=False)) # hb is alias for bank
     app.add_handler(CommandHandler("rain", rain_command, block=False)); app.add_handler(CommandHandler("stats", stats_command, block=False))
+    app.add_handler(CommandHandler("jackpot", jackpot_command, block=False))  # Daily jackpot status / owner controls
     app.add_handler(CommandHandler("limits", limits_command, block=False)) # NEW - Game limits display
     app.add_handler(CommandHandler("users", users_command, block=False))
     # dice/darts/goal/bowl handlers are now registered via game_toggle_wrappers above
