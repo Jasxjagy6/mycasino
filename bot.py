@@ -11957,7 +11957,7 @@ async def _jackpot_run_draw(application):
             _jackpot_state["last_draw_iso"] = draw_iso
             _jackpot_mark_dirty()
             try:
-                await asyncio.get_running_loop().run_in_executor(None, _jackpot_save_now)
+                await asyncio.get_running_loop().run_in_executor(_save_executor, _jackpot_save_now)
             except Exception:
                 pass
             return None
@@ -11997,7 +11997,7 @@ async def _jackpot_run_draw(application):
             del history[: -JACKPOT_HISTORY_LIMIT]
         _jackpot_mark_dirty()
         try:
-            await asyncio.get_running_loop().run_in_executor(None, _jackpot_save_now)
+            await asyncio.get_running_loop().run_in_executor(_save_executor, _jackpot_save_now)
         except Exception:
             pass
 
@@ -12456,7 +12456,7 @@ async def jackpot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with _jackpot_lock:
                 _jackpot_state["accum_rate"] = new_rate
                 _jackpot_mark_dirty()
-                await asyncio.get_running_loop().run_in_executor(None, _jackpot_save_now)
+                await asyncio.get_running_loop().run_in_executor(_save_executor, _jackpot_save_now)
             await update.message.reply_text(
                 f"Jackpot accumulator rate set to {new_rate*100:.2f}% per bet.")
             return
@@ -12493,7 +12493,7 @@ async def jackpot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with _jackpot_lock:
             _jackpot_state["wager_threshold"] = new_thr
             _jackpot_mark_dirty()
-            await asyncio.get_running_loop().run_in_executor(None, _jackpot_save_now)
+            await asyncio.get_running_loop().run_in_executor(_save_executor, _jackpot_save_now)
         await update.message.reply_text(
             f"Jackpot wager threshold set to ${new_thr:,.2f} (7-day wager)."
         )
@@ -15182,7 +15182,7 @@ def generate_dice_rush_image() -> BytesIO:
 async def async_generate_dice_rush_image() -> BytesIO:
     """Async wrapper for generate_dice_rush_image to avoid blocking the event loop."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: generate_dice_rush_image())
+    return await loop.run_in_executor(_image_executor, lambda: generate_dice_rush_image())
 
 
 # ============================================================
