@@ -1712,6 +1712,71 @@ def _resolve_dashboard_font():
 DASHBOARD_FONT_PATH = _resolve_dashboard_font()
 DASHBOARD_FONT_FALLBACK = None  # Will use PIL default if custom font not found
 
+
+def _paste_avatar_in_circle(base, draw, cx, cy, rx, ry, pic,
+                            accent_rgba=(70, 200, 255, 255),
+                            mesh_overlay=True):
+    """Composite a circular Telegram avatar into ``base`` at the given
+    centre + radii, with a neon ring and optional faint wireframe-mesh
+    overlay so it still reads as the template's "wireframe head" cell.
+    Falls back to drawing the wireframe head when ``pic`` is None or
+    invalid.
+
+    base: PIL.Image RGBA
+    draw: ImageDraw of base (caller still has it; we just need it for
+          the fallback path)
+    """
+    from PIL import Image as _Img, ImageDraw as _ImgDraw, ImageFilter as _ImgF
+    import math as _math
+
+    W, H = base.size
+    # Render avatar (or fallback wireframe).
+    if pic is not None:
+        try:
+            sw = max(2, rx * 2)
+            sh = max(2, ry * 2)
+            src = pic.convert("RGBA").resize((sw, sh), _Img.Resampling.LANCZOS)
+            mask = _Img.new("L", (sw, sh), 0)
+            _ImgDraw.Draw(mask).ellipse([0, 0, sw - 1, sh - 1], fill=255)
+            base.paste(src, (cx - rx, cy - ry, cx - rx + sw, cy - ry + sh), mask)
+            # Neon ring + soft outer glow.
+            ring_layer = _Img.new("RGBA", (W, H), (0, 0, 0, 0))
+            rd = _ImgDraw.Draw(ring_layer)
+            rd.ellipse([cx - rx - 2, cy - ry - 2, cx + rx + 2, cy + ry + 2],
+                       outline=accent_rgba, width=3)
+            ring_layer = ring_layer.filter(_ImgF.GaussianBlur(radius=1.5))
+            base.alpha_composite(ring_layer)
+            draw_b = _ImgDraw.Draw(base)
+            draw_b.ellipse([cx - rx, cy - ry, cx + rx, cy + ry],
+                           outline=accent_rgba, width=2)
+            return True
+        except Exception:
+            pass
+
+    # Fallback: original wireframe head.
+    head_layer = _Img.new("RGBA", (W, H), (0, 0, 0, 0))
+    hd = _ImgDraw.Draw(head_layer)
+    hd.ellipse([cx - rx, cy - ry, cx + rx, cy + ry],
+               outline=accent_rgba, width=2)
+    for ang in range(-80, 81, 14):
+        rad = _math.radians(ang)
+        x = cx + _math.sin(rad) * rx
+        hd.line([(int(x), cy - ry), (int(x), cy + ry)],
+                fill=(accent_rgba[0], accent_rgba[1], accent_rgba[2], 110),
+                width=1)
+    for ang in range(-70, 71, 14):
+        rad = _math.radians(ang)
+        yy = cy + _math.sin(rad) * ry
+        hd.line([(cx - rx, int(yy)), (cx + rx, int(yy))],
+                fill=(accent_rgba[0], accent_rgba[1], accent_rgba[2], 90),
+                width=1)
+    hd.ellipse([cx - 3, cy - 5, cx + 3, cy + 1],
+               fill=(accent_rgba[0] + 100, accent_rgba[1] + 30,
+                     min(255, accent_rgba[2] + 30), 255))
+    head_layer = head_layer.filter(_ImgF.GaussianBlur(radius=0.5))
+    base.alpha_composite(head_layer)
+    return False
+
 # Dashboard text configuration: coordinates (X, Y), font size, and color (R, G, B)
 DASHBOARD_CONFIG = {
     "profile_picture": {
@@ -9716,38 +9781,18 @@ def _render_stats_sync(text_data, game_list, pvp_entries, profile_pic_data):
         # Hairline under header.
         draw.line([(0, 92), (W, 92)], fill=C_GOLD_DIM, width=1)
 
-        # ── WIREFRAME HEAD AVATAR (top-left) ─────────────────────
+        # ── PROFILE AVATAR (top-left) ────────────────────────────
+        # Composite the player's Telegram avatar into a circular cell
+        # with a neon ring + faint mesh overlay so it still reads as
+        # the template's "wireframe head" position. Falls back to the
+        # wireframe head if no profile pic is available.
         head_cx, head_cy = 110, 165
         head_rx, head_ry = 80, 100
-        head_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        head_draw = ImageDraw.Draw(head_layer)
-        # Outline ellipse + inner mesh.
-        head_draw.ellipse(
-            [head_cx - head_rx, head_cy - head_ry, head_cx + head_rx, head_cy + head_ry],
-            outline=(70, 200, 255, 200), width=2,
+        _paste_avatar_in_circle(
+            img, draw, head_cx, head_cy, head_rx, head_ry,
+            profile_pic_data, accent_rgba=(70, 200, 255, 220),
         )
-        # Vertical mesh lines.
-        for ang in range(-80, 81, 14):
-            rad = math.radians(ang)
-            x = head_cx + math.sin(rad) * head_rx
-            head_draw.line(
-                [(int(x), head_cy - head_ry), (int(x), head_cy + head_ry)],
-                fill=(60, 170, 230, 110), width=1,
-            )
-        # Horizontal arcs (as lines for simplicity).
-        for ang in range(-70, 71, 14):
-            rad = math.radians(ang)
-            yy = head_cy + math.sin(rad) * head_ry
-            head_draw.line(
-                [(head_cx - head_rx, int(yy)), (head_cx + head_rx, int(yy))],
-                fill=(60, 170, 230, 90), width=1,
-            )
-        # A small bright "third-eye" dot.
-        head_draw.ellipse(
-            [head_cx - 3, head_cy - 6, head_cx + 3, head_cy], fill=(180, 230, 255, 255),
-        )
-        head_layer = head_layer.filter(ImageFilter.GaussianBlur(radius=0.6))
-        img.alpha_composite(head_layer)
+        draw = ImageDraw.Draw(img)
 
         # ── NAME CARD (centre, glass blue glow) ──────────────────
         NC_X0 = 220
@@ -14710,26 +14755,15 @@ def generate_bj_image(
         br = rng.randint(40, 130)
         draw.ellipse([sx - 1, sy - 1, sx + 1, sy + 1], fill=(br, br, br + 20))
 
-    # ── WIREFRAME HEAD (top-left) ───────────────────────────
-    head_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    head_draw = ImageDraw.Draw(head_layer)
+    # ── PROFILE AVATAR (top-left) ───────────────────────────
+    # Composite player's Telegram profile pic into the top-left cell;
+    # falls back to the wireframe head if no pic is available.
     h_cx, h_cy, h_rx, h_ry = 92, 100, 56, 70
-    head_draw.ellipse([h_cx - h_rx, h_cy - h_ry, h_cx + h_rx, h_cy + h_ry],
-                      outline=(70, 200, 255, 220), width=2)
-    for ang in range(-80, 81, 18):
-        rad = math.radians(ang)
-        x = h_cx + math.sin(rad) * h_rx
-        head_draw.line([(int(x), h_cy - h_ry), (int(x), h_cy + h_ry)],
-                       fill=(60, 170, 230, 110), width=1)
-    for ang in range(-70, 71, 18):
-        rad = math.radians(ang)
-        yy = h_cy + math.sin(rad) * h_ry
-        head_draw.line([(h_cx - h_rx, int(yy)), (h_cx + h_rx, int(yy))],
-                       fill=(60, 170, 230, 90), width=1)
-    head_draw.ellipse([h_cx - 3, h_cy - 5, h_cx + 3, h_cy + 1],
-                      fill=(180, 230, 255, 255))
-    head_layer = head_layer.filter(_ImgFilter.GaussianBlur(radius=0.5))
-    img.alpha_composite(head_layer)
+    _paste_avatar_in_circle(
+        img, draw, h_cx, h_cy, h_rx, h_ry,
+        player_profile_pic, accent_rgba=(70, 200, 255, 220),
+    )
+    draw = ImageDraw.Draw(img)
 
     # ── TOP-RIGHT BOT USERNAME ──────────────────────────────
     font_bot = _bj_get_font(28)
@@ -15351,26 +15385,15 @@ def generate_limbo_image(
         br = rng.randint(40, 140)
         draw.ellipse([sx - 1, sy - 1, sx + 1, sy + 1], fill=(br, br, br + 25))
 
-    # ── WIREFRAME HEAD (top-left) ──────────────────────────
-    head_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    head_draw = ImageDraw.Draw(head_layer)
+    # ── PROFILE AVATAR (top-left) ──────────────────────────
+    # Composite player's Telegram profile pic into the top-left cell;
+    # falls back to the wireframe head when no pic is available.
     h_cx, h_cy, h_rx, h_ry = 105, 130, 70, 90
-    head_draw.ellipse([h_cx - h_rx, h_cy - h_ry, h_cx + h_rx, h_cy + h_ry],
-                      outline=HEAD_COLOR + (220,), width=2)
-    for ang in range(-80, 81, 14):
-        rad = math.radians(ang)
-        x = h_cx + math.sin(rad) * h_rx
-        head_draw.line([(int(x), h_cy - h_ry), (int(x), h_cy + h_ry)],
-                       fill=HEAD_COLOR + (110,), width=1)
-    for ang in range(-70, 71, 14):
-        rad = math.radians(ang)
-        yy = h_cy + math.sin(rad) * h_ry
-        head_draw.line([(h_cx - h_rx, int(yy)), (h_cx + h_rx, int(yy))],
-                       fill=HEAD_COLOR + (90,), width=1)
-    head_draw.ellipse([h_cx - 3, h_cy - 4, h_cx + 3, h_cy + 2],
-                      fill=(220, 240, 255, 255))
-    head_layer = head_layer.filter(_ImgFilter.GaussianBlur(radius=0.5))
-    img.alpha_composite(head_layer)
+    _paste_avatar_in_circle(
+        img, draw, h_cx, h_cy, h_rx, h_ry,
+        player_profile_pic, accent_rgba=HEAD_COLOR + (220,),
+    )
+    draw = ImageDraw.Draw(img)
 
     # ── TOP-RIGHT: bot username + player username ──────────
     f_bot = _limbo_get_font(28)
