@@ -8834,21 +8834,49 @@ def save_all_gift_codes():
 
 atexit.register(save_bot_state_full)
 
+import signal
+
+
+_signal_received = False
+
+
 def _signal_handler(signum, frame):
-    """Handle SIGTERM/SIGINT for graceful shutdown."""
+    """Best-effort sync signal handler for environments where asyncio's
+    ``add_signal_handler`` isn't installed yet (e.g. before PTB / run_bots
+    takes over).
+
+    Critically, after saving we re-raise a ``KeyboardInterrupt`` so the
+    Python interpreter actually unwinds the stack. The previous version
+    just set ``bot_stopped = True`` and returned, which is why ``Ctrl+C``
+    only printed "saving data" and the polling loop kept running until the
+    user closed their terminal. ``KeyboardInterrupt`` propagates cleanly
+    through ``asyncio.run`` and ``app.run_polling``, both of which handle
+    it as graceful shutdown.
+
+    A second ``Ctrl+C`` always force-exits.
+    """
+    global _signal_received, bot_stopped
+    if _signal_received:
+        # Second signal — operator wants out NOW. Skip the slow save, just
+        # let Python exit. atexit will still try to flush.
+        logging.warning(
+            f"Received signal {signum} again — forcing immediate exit."
+        )
+        os._exit(130 if signum == signal.SIGINT else 143)
+    _signal_received = True
     logging.info(f"Received signal {signum}, saving data before exit...")
-    # Don't call sys.exit() during async startup - just set flag
-    global bot_stopped
     bot_stopped = True
-    # Save state but don't exit - let async code handle graceful shutdown.
-    # Full save here (signal path), because the write-behind flush won't
-    # drain if the process is being torn down.
     try:
         save_bot_state_full()
     except Exception:
         pass
+    # Propagate as KeyboardInterrupt so the running event loop / polling
+    # loop unwinds. SIGTERM also gets KeyboardInterrupt (rather than
+    # SystemExit) because PTB's run_polling and our run_bots both treat
+    # KeyboardInterrupt as the canonical "stop now" signal.
+    raise KeyboardInterrupt()
 
-import signal
+
 signal.signal(signal.SIGTERM, _signal_handler)
 signal.signal(signal.SIGINT, _signal_handler)
 
@@ -20941,8 +20969,14 @@ async def dice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await create_xdxw_challenge(update, context, "dice")
         return
 
-    # Check if in a group and has bet amount
-    if update.effective_chat.type in ['group', 'supergroup'] and len(message_text) == 2:
+    # `/dice <amount>` (and the other emoji-game equivalents) used to
+    # require a group/supergroup chat. In DMs it fell through to the
+    # PvP usage handler and just printed help text, which surprised
+    # users. Now we route the same single-amount form through the
+    # group_challenge flow in private chats too — the resulting
+    # mode/rolls/target setup ends with the same Play-with-Bot button
+    # the user already knows from groups.
+    if len(message_text) == 2:
         await create_group_challenge(update, context, "dice")
         return
 
@@ -21003,8 +21037,14 @@ async def darts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await create_xdxw_challenge(update, context, "darts")
         return
 
-    # Check if in a group and has bet amount
-    if update.effective_chat.type in ['group', 'supergroup'] and len(message_text) == 2:
+    # `/dice <amount>` (and the other emoji-game equivalents) used to
+    # require a group/supergroup chat. In DMs it fell through to the
+    # PvP usage handler and just printed help text, which surprised
+    # users. Now we route the same single-amount form through the
+    # group_challenge flow in private chats too — the resulting
+    # mode/rolls/target setup ends with the same Play-with-Bot button
+    # the user already knows from groups.
+    if len(message_text) == 2:
         await create_group_challenge(update, context, "darts")
         return
 
@@ -21065,8 +21105,14 @@ async def football_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await create_xdxw_challenge(update, context, "goal")
         return
 
-    # Check if in a group and has bet amount
-    if update.effective_chat.type in ['group', 'supergroup'] and len(message_text) == 2:
+    # `/dice <amount>` (and the other emoji-game equivalents) used to
+    # require a group/supergroup chat. In DMs it fell through to the
+    # PvP usage handler and just printed help text, which surprised
+    # users. Now we route the same single-amount form through the
+    # group_challenge flow in private chats too — the resulting
+    # mode/rolls/target setup ends with the same Play-with-Bot button
+    # the user already knows from groups.
+    if len(message_text) == 2:
         await create_group_challenge(update, context, "goal")
         return
 
@@ -21127,8 +21173,14 @@ async def bowling_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await create_xdxw_challenge(update, context, "bowl")
         return
 
-    # Check if in a group and has bet amount
-    if update.effective_chat.type in ['group', 'supergroup'] and len(message_text) == 2:
+    # `/dice <amount>` (and the other emoji-game equivalents) used to
+    # require a group/supergroup chat. In DMs it fell through to the
+    # PvP usage handler and just printed help text, which surprised
+    # users. Now we route the same single-amount form through the
+    # group_challenge flow in private chats too — the resulting
+    # mode/rolls/target setup ends with the same Play-with-Bot button
+    # the user already knows from groups.
+    if len(message_text) == 2:
         await create_group_challenge(update, context, "bowl")
         return
 
@@ -27054,16 +27106,19 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Check if user has completed all rolls
             if len(game['user_rolls']) < game_rolls:
-                # Mid-round partial roll: re-render the existing cashout button
-                # with an updated match-win multiplier so the label reflects the
-                # new state (player already committed some dice). Don't spam a
-                # new message — just edit the old keyboard.
-                await _refresh_pvb_cashout_button(context, active_pvb_game_id, game, user.id)
+                # Mid-round partial roll: schedule a throttled, fire-and-forget
+                # refresh of the existing cashout button so the label catches
+                # up with the new state without awaiting a Telegram round trip
+                # inside the dice handler. Awaiting an edit_message_reply_markup
+                # here used to serialise concurrent PvB matches behind the per-
+                # chat rate limiter.
+                _schedule_pvb_cashout_refresh(context, active_pvb_game_id, game, user.id)
                 return
 
             # Round will now resolve — invalidate the cashout button so the
             # player can't cash out after already locking in all their rolls.
             _active_cashout_buttons.pop(active_pvb_game_id, None)
+            _cashout_refresh_last.pop(active_pvb_game_id, None)
 
             # User finished rolling
             user_rolls = game['user_rolls']
@@ -27111,13 +27166,17 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.HTML
                 )
             else:
-                # Show user's result first
+                # PERFORMANCE: We used to send a "{user} rolled X. Bot is
+                # rolling..." ack message here, *then* the bot's dice, *then*
+                # the consolidated result. With AIORateLimiter that's three
+                # messages-per-round serialised on the same chat's rate
+                # window — ~3s of waiting before the result is visible. With
+                # 2 players in the same group running PvB matches it doubles
+                # to ~6s and feels like the bot has crashed. Skip the ack:
+                # the bot's dice that's about to be sent is itself the "I'm
+                # rolling now" indicator, and the consolidated result message
+                # below repeats both the user's and bot's rolls.
                 username_display = user.first_name if user.first_name else "Player"
-                await update.message.reply_text(
-                    f"{username_display} rolled: [{user_rolls_text}] = <b>{user_total}</b>\n\n"
-                    f"Bot is rolling...",
-                    parse_mode=ParseMode.HTML
-                )
 
                 # Check if bot already rolled (via "Bot rolls first" button or timeout job)
                 pre_rolled_values = context.user_data.get('pre_rolled_bot_values') or game.get('pre_rolled_bot_values')
@@ -27213,7 +27272,9 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Resolve side bets - user (p1) wins
                 asyncio.ensure_future(resolve_sidebets_for_match(active_pvb_game_id, "p1", context))
                 await update_stats_on_bet(user.id, game['id'], game['bet_amount'], True, multiplier=1.96, context=context)
-                await asyncio.sleep(0.5)  # Rate limit protection
+                # No manual sleep — AIORateLimiter already paces outbound
+                # messages per chat. Sleeping here just stretched concurrent
+                # PvB matches' total wall-clock time without buying anything.
                 await update.message.reply_text(f"{pe('trophy')} {user.mention_html()}, Congratulations! You beat the bot ({game['user_score']}-{game['bot_score']}) and win ${winnings:.2f}!", parse_mode=ParseMode.HTML)
                 context.chat_data.pop(f"active_pvb_game_{user.id}", None)
                 if user.id in active_pvb_games:
@@ -27227,14 +27288,14 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Resolve side bets - bot (p2) wins
                 asyncio.ensure_future(resolve_sidebets_for_match(active_pvb_game_id, "p2", context))
                 await update_stats_on_bet(user.id, game['id'], game['bet_amount'], False, context=context)
-                await asyncio.sleep(0.5)  # Rate limit protection
+                # AIORateLimiter handles per-chat pacing; manual sleep removed.
                 await update.message.reply_text(f"{pe('lose')} {user.mention_html()}, Bot wins the match ({game['bot_score']}-{game['user_score']}). You lost ${game['bet_amount']:.2f}.", parse_mode=ParseMode.HTML)
                 context.chat_data.pop(f"active_pvb_game_{user.id}", None)
                 if user.id in active_pvb_games:
                     del active_pvb_games[user.id]
                 _unindex_user_game(user.id, active_pvb_game_id)
             else: # Continue game - next round
-                await asyncio.sleep(0.5)  # Rate limit protection
+                # AIORateLimiter handles per-chat pacing; manual sleep removed.
 
                 if bot_rolls_first:
                     # Bot rolls first for next round
@@ -33570,6 +33631,7 @@ async def _cleanup_game_sessions():
             _game_locks.pop(game_id, None)
             # Remove cashout button tracking
             _active_cashout_buttons.pop(game_id, None)
+            _cashout_refresh_last.pop(game_id, None)
             # Remove session
             game_sessions.pop(game_id, None)
 
@@ -33596,6 +33658,7 @@ async def _cleanup_game_sessions():
         stale_co = [mid for mid, co in list(_active_cashout_buttons.items()) if mid not in game_sessions]
         for mid in stale_co:
             _active_cashout_buttons.pop(mid, None)
+            _cashout_refresh_last.pop(mid, None)
 
         # Clean up active games index for stale entries
         for uid in list(_user_active_games_index.keys()):
@@ -35249,6 +35312,41 @@ async def _refresh_pvb_cashout_button(context, match_id: str, game: dict,
         pass
 
 
+# PERFORMANCE: per-match throttle for partial-roll cashout-button refreshes.
+# When 2+ players are mid-match in the same group, every partial roll used to
+# fire a synchronous edit_message_reply_markup awaited inside message_listener.
+# That serialised the user's dice handler behind Telegram's per-chat rate
+# limiter and made the whole bot feel sluggish. Now we (a) fire-and-forget
+# the edit so the user's handler returns immediately after the partial roll,
+# and (b) cap refresh frequency to once per match in any 1.0s window.
+_cashout_refresh_last: dict = {}
+_CASHOUT_REFRESH_MIN_INTERVAL = 1.0  # seconds
+
+
+def _schedule_pvb_cashout_refresh(context, match_id: str, game: dict, user_id: int) -> None:
+    """Throttled, fire-and-forget wrapper around `_refresh_pvb_cashout_button`.
+
+    The refresh is purely cosmetic (keeps the cashout multiplier label live);
+    awaiting it inside the dice-roll handler is what made concurrent PvB
+    matches in the same chat lag.
+    """
+    info = _active_cashout_buttons.get(match_id)
+    if not info or not info.get("message_id") or not info.get("chat_id"):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    now = loop.time()
+    last = _cashout_refresh_last.get(match_id, 0.0)
+    if now - last < _CASHOUT_REFRESH_MIN_INTERVAL:
+        return
+    _cashout_refresh_last[match_id] = now
+    asyncio.create_task(
+        _refresh_pvb_cashout_button(context, match_id, game, user_id)
+    )
+
+
 def is_pvb_game(match_data: dict) -> bool:
     """Check if a game session is a PvB (Player vs Bot) game."""
     players = match_data.get("players", [])
@@ -36288,7 +36386,47 @@ def main():
     # Run both main and helper bot applications concurrently
     if helper_app:
         async def run_bots():
-            """Run both main and helper bot applications concurrently"""
+            """Run both main and helper bot applications concurrently.
+
+            Ctrl+C handling: We deliberately replace the module-level
+            ``signal.signal(SIGINT, _signal_handler)`` with a loop-aware
+            ``add_signal_handler`` here. The module-level sync handler just
+            sets ``bot_stopped`` and returns — it never raises, so Python
+            never converts SIGINT into a KeyboardInterrupt that the
+            ``await stop_event.wait()`` could observe. In the
+            ``app.run_polling()`` branch PTB installs its own loop-aware
+            handler so this isn't an issue, but in the helper_app branch we
+            drive the event loop manually and have to do it ourselves —
+            otherwise Ctrl+C just logs "saving data" and the bot keeps
+            polling.
+            """
+            stop_event = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def _request_stop(signum):
+                # Idempotent. Loop-thread safe (called from the loop's signal
+                # handler dispatcher, not from a signal context).
+                if not stop_event.is_set():
+                    logging.info(
+                        f"Received signal {signum}, initiating graceful shutdown..."
+                    )
+                    global bot_stopped
+                    bot_stopped = True
+                    stop_event.set()
+
+            try:
+                for _sig in (signal.SIGINT, signal.SIGTERM):
+                    try:
+                        loop.add_signal_handler(_sig, _request_stop, _sig)
+                    except NotImplementedError:
+                        # Windows / restricted environments — fall back to
+                        # signal.signal which at least sets the flag.
+                        pass
+            except Exception as _sig_e:
+                logging.warning(
+                    f"Could not install loop signal handlers: {_sig_e}"
+                )
+
             try:
                 await app.initialize()
                 await app.start()
@@ -36307,30 +36445,44 @@ def main():
                     drop_pending_updates=True,
                 )
 
-                # Keep both running using an event
-                stop_event = asyncio.Event()
-                try:
-                    await stop_event.wait()
-                except (KeyboardInterrupt, SystemExit):
-                    pass
-                finally:
-                    # Shutdown helper bot
-                    try:
-                        await helper_app.updater.stop()
-                        await helper_app.stop()
-                        await helper_app.shutdown()
-                    except Exception as e:
-                        logging.warning(f"Helper app shutdown error: {e}")
-
-                    # Shutdown main bot
-                    try:
-                        await app.updater.stop()
-                        await app.stop()
-                        await app.shutdown()
-                    except Exception as e:
-                        logging.warning(f"Main app shutdown error: {e}")
+                # Keep both running until SIGINT/SIGTERM sets the event.
+                # The earlier `except KeyboardInterrupt` clause around this
+                # await never actually fired — KeyboardInterrupt is raised
+                # at the bottom of asyncio.run, not inside the awaiting
+                # coroutine, so the explicit signal handler above is what
+                # makes Ctrl+C stop the bot in this branch.
+                await stop_event.wait()
+            except (KeyboardInterrupt, SystemExit):
+                pass
             except Exception as e:
-                logging.critical(f"Bot runtime error: {e}")
+                logging.critical(f"Bot runtime error: {e}", exc_info=True)
+            finally:
+                # Shutdown helper bot
+                try:
+                    if helper_app.updater.running:
+                        await helper_app.updater.stop()
+                    await helper_app.stop()
+                    await helper_app.shutdown()
+                except Exception as e:
+                    logging.warning(f"Helper app shutdown error: {e}")
+
+                # Shutdown main bot
+                try:
+                    if app.updater.running:
+                        await app.updater.stop()
+                    await app.stop()
+                    await app.shutdown()
+                except Exception as e:
+                    logging.warning(f"Main app shutdown error: {e}")
+
+                # Drop the loop signal handlers so the second Ctrl+C (or any
+                # late-arriving SIGTERM) gets the interpreter's default
+                # behaviour and we don't end up wedged here.
+                for _sig in (signal.SIGINT, signal.SIGTERM):
+                    try:
+                        loop.remove_signal_handler(_sig)
+                    except (NotImplementedError, ValueError):
+                        pass
 
         asyncio.run(run_bots())
     else:
