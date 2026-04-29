@@ -21588,7 +21588,7 @@ async def xdxw_bot_first_callback(update: Update, context: ContextTypes.DEFAULT_
         await context.bot.send_message(chat_id=chat_id, text=f"{pe('cross')} An error occurred. Game terminated.")
         match['status'] = 'error'
         match.pop('bot_is_rolling', None)
-        del context.chat_data[f"active_pvb_game_{user.id}"]
+        context.chat_data.pop(f"active_pvb_game_{user.id}", None)
         if user.id in active_pvb_games:
             del active_pvb_games[user.id]
         refund_amount = match.get('bet_amount', 0)
@@ -21801,6 +21801,12 @@ async def create_group_challenge(update: Update, context: ContextTypes.DEFAULT_T
         await send_insufficient_balance_message(update)
         return
 
+    # Remember the original /dice <amount> command message id so the bot's
+    # subsequent dice rolls can reply-tag the user (parity with /dice <amount>
+    # XdX'w mode, which already does this). Without this, group-challenge PvB
+    # bot rolls fall back to context.bot.send_dice(..., reply_to_message_id=None).
+    context.user_data[f"gc_cmd_msg_{game_type}_{int(bet_amount_usd*100)}"] = update.message.message_id
+
     # Show mode and rolls selection with styled buttons
     gc_normal_btn = apply_button_style(
         InlineKeyboardButton("Normal Mode", callback_data=f"gc_mode_{game_type}_normal_{bet_amount_usd}_{bet_amount_currency}_{currency}"),
@@ -21945,7 +21951,11 @@ async def group_challenge_target_callback(update: Update, context: ContextTypes.
         "status": "pending",
         "timestamp": str(datetime.now(timezone.utc)),
         "round_timeout": default_round_timeout,  # Store timeout at creation time
-        "command_message_id": update.message.message_id if hasattr(update, 'message') and update.message else None  # For tagging in groups
+        # `update.message` is None inside callback queries, so we recover the
+        # original /dice <amount> message id stashed by create_group_challenge.
+        "command_message_id": context.user_data.pop(
+            f"gc_cmd_msg_{game_type}_{int(bet_amount_usd*100)}", None
+        ),
     }
 
     currency_symbol = CURRENCY_SYMBOLS.get(currency, "$")
@@ -22454,7 +22464,7 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
             await update.message.reply_text(f"{pe('cross')} An error occurred. Game terminated.")
             game_sessions[game_id].pop('bot_is_rolling', None)
             game_sessions[game_id]['status'] = 'error'
-            del context.chat_data[f"active_pvb_game_{user.id}"]
+            context.chat_data.pop(f"active_pvb_game_{user.id}", None)
             if user.id in active_pvb_games:
                 del active_pvb_games[user.id]
             credit_wallet(user.id, bet_amount)
@@ -27001,9 +27011,16 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_matched_pvb and active_pvb_game_id and active_pvb_game_id in game_sessions:
         game = game_sessions[active_pvb_game_id]
 
-        # CRITICAL FIX: Check if it's actually the user's turn before accepting their roll
-        # If bot is currently rolling (waiting_for == "bot"), silently ignore user input
-        if game.get("waiting_for") == "bot":
+        # CRITICAL FIX: Check if it's actually the user's turn before accepting their roll.
+        # Two flags can mean "bot is rolling right now":
+        #   - waiting_for == "bot"  (set explicitly when the bot owns the round)
+        #   - bot_is_rolling        (set around multi_roll_parallel calls)
+        # The user-rolls-first flow only sets bot_is_rolling, so without this
+        # second check, dice the user spams during the bot's animation get
+        # appended as extra "user rolls" and trigger overlapping round
+        # resolutions — causing the lag, duplicate bot rolls, and unusual
+        # behavior reported for /dice <amount> PvB matches.
+        if game.get("waiting_for") == "bot" or game.get("bot_is_rolling"):
             if DEBUG_EMOJI_GAMES:
                 logging.info(f"PVB IGNORED: user={user.id} tried to roll during bot's turn (game={active_pvb_game_id})")
             return
@@ -27113,8 +27130,11 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     game.pop('pre_rolled_bot_values', None)
                 else:
                     # Bot hasn't rolled yet - roll now using multi_roll_parallel for lightning-fast speed
-                    # Set flag to prevent user from sending more emojis during bot's rolling
+                    # Set flags to prevent user from sending more emojis during bot's rolling.
+                    # Both `bot_is_rolling` and `waiting_for='bot'` are set so any
+                    # consumer that only knows about one flag still bails correctly.
                     game['bot_is_rolling'] = True
+                    game['waiting_for'] = 'bot'
                     bot_rolls = []
                     command_msg_id = game.get('command_message_id')
                     try:
@@ -27126,14 +27146,17 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await update.message.reply_text(f"{pe('cross')} An error occurred. Game terminated.")
                         game['status'] = 'error'
                         game.pop('bot_is_rolling', None)
-                        del context.chat_data[f"active_pvb_game_{user.id}"]
+                        game.pop('waiting_for', None)
+                        context.chat_data.pop(f"active_pvb_game_{user.id}", None)
                         if user.id in active_pvb_games:
                             del active_pvb_games[user.id]
+                        _unindex_user_game(user.id, active_pvb_game_id)
                         credit_wallet(user.id, game['bet_amount'])
                         update_pnl(user.id)
                         save_user_data(user.id)
                         return
                     game.pop('bot_is_rolling', None)
+                    game['waiting_for'] = 'user'
 
                 game["bot_rolls"] = bot_rolls
                 bot_total = sum(bot_rolls)
@@ -27192,9 +27215,10 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update_stats_on_bet(user.id, game['id'], game['bet_amount'], True, multiplier=1.96, context=context)
                 await asyncio.sleep(0.5)  # Rate limit protection
                 await update.message.reply_text(f"{pe('trophy')} {user.mention_html()}, Congratulations! You beat the bot ({game['user_score']}-{game['bot_score']}) and win ${winnings:.2f}!", parse_mode=ParseMode.HTML)
-                del context.chat_data[f"active_pvb_game_{user.id}"]
+                context.chat_data.pop(f"active_pvb_game_{user.id}", None)
                 if user.id in active_pvb_games:
                     del active_pvb_games[user.id]
+                _unindex_user_game(user.id, active_pvb_game_id)
             elif game["bot_score"] >= game["target_score"]:
                 # Cancel any pending timeout
                 _cancel_pvb_timeout_jobs(context, user.id, active_pvb_game_id)
@@ -27205,9 +27229,10 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update_stats_on_bet(user.id, game['id'], game['bet_amount'], False, context=context)
                 await asyncio.sleep(0.5)  # Rate limit protection
                 await update.message.reply_text(f"{pe('lose')} {user.mention_html()}, Bot wins the match ({game['bot_score']}-{game['user_score']}). You lost ${game['bet_amount']:.2f}.", parse_mode=ParseMode.HTML)
-                del context.chat_data[f"active_pvb_game_{user.id}"]
+                context.chat_data.pop(f"active_pvb_game_{user.id}", None)
                 if user.id in active_pvb_games:
                     del active_pvb_games[user.id]
+                _unindex_user_game(user.id, active_pvb_game_id)
             else: # Continue game - next round
                 await asyncio.sleep(0.5)  # Rate limit protection
 
@@ -27236,9 +27261,10 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         game['status'] = 'error'
                         game.pop('bot_is_rolling', None)
                         game.pop('waiting_for', None)
-                        del context.chat_data[f"active_pvb_game_{user.id}"]
+                        context.chat_data.pop(f"active_pvb_game_{user.id}", None)
                         if user.id in active_pvb_games:
                             del active_pvb_games[user.id]
+                        _unindex_user_game(user.id, active_pvb_game_id)
                         credit_wallet(user.id, game['bet_amount'])
                         update_pnl(user.id)
                         save_user_data(user.id)
@@ -27365,6 +27391,12 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not match_data:
                     continue
                 if (match_data.get("chat_id") == chat_id and match_data.get("status") == 'active' and user.id in match_data.get("players", [])):
+                    # Silently swallow user dice that arrive while the bot is
+                    # rolling — same rationale as the PvB block above. Without
+                    # this, spamming dice during multi_roll_parallel triggers
+                    # overlapping round resolutions.
+                    if match_data.get("bot_is_rolling"):
+                        return
                     # Auto-index for subsequent rolls on the fast path.
                     if not _indexed_ids:
                         _index_user_game(user.id, match_id)
@@ -27433,9 +27465,11 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     is_bot_game = match_data.get("opponent_id") == 0
 
                     if is_bot_game and user.id == p1 and len(p1_rolls) == game_rolls and len(p2_rolls) < game_rolls:
-                        # User (host) completed rolls, now bot should roll using multi_roll_parallel
-                        # Set flag to prevent user from sending more emojis during bot's rolling
+                        # User (host) completed rolls, now bot should roll using multi_roll_parallel.
+                        # Set both bot_is_rolling and waiting_for so any other handler
+                        # that re-enters during the await silently skips additional dice.
                         match_data['bot_is_rolling'] = True
+                        match_data['waiting_for'] = 'bot'
                         await asyncio.sleep(1)
                         await update.message.reply_text(f"Bot is rolling...")
 
@@ -27450,6 +27484,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             bot_rolls = [0] * game_rolls  # Fallback
 
                         match_data.pop('bot_is_rolling', None)
+                        match_data['waiting_for'] = 'user'
                         match_data["player_rolls"][p2] = bot_rolls
                         p2_rolls = bot_rolls
 
@@ -35320,7 +35355,7 @@ async def pvb_cashout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     # Clean up active-game indices so the player can start a new game
     try:
         if context.chat_data.get(f"active_pvb_game_{user.id}") == match_id:
-            del context.chat_data[f"active_pvb_game_{user.id}"]
+            context.chat_data.pop(f"active_pvb_game_{user.id}", None)
     except Exception:
         pass
     if active_pvb_games.get(user.id) == match_id:
@@ -36774,7 +36809,7 @@ async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TY
             logging.error(f"Error sending dice in PvB game: {e}")
             await context.bot.send_message(chat_id=chat_id, text=f"{pe('cross')} An error occurred. Game terminated.")
             game_sessions[game_id]['status'] = 'error'
-            del context.chat_data[f"active_pvb_game_{user.id}"]
+            context.chat_data.pop(f"active_pvb_game_{user.id}", None)
             if user.id in active_pvb_games:
                 del active_pvb_games[user.id]
             credit_wallet(user.id, bet_amount)
