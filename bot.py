@@ -1381,7 +1381,7 @@ _dirty_lock = asyncio.Lock()
 # saves, 8 was too tight; 16 keeps the flush queue from backing up under
 # bursty load (raffle finalisation, surprise drop, broadcast handlers).
 _save_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=16, thread_name_prefix="disk_writer"
+    max_workers=32, thread_name_prefix="disk_writer"
 )
 
 # -- Global Callback Deduplication ------------------------------------------
@@ -8459,18 +8459,31 @@ def _sync_save_bot_state_json():
         logging.error(f"Failed to save bot state JSON: {e}")
 
 
+# Bot state write-behind: 17 handlers call ``save_bot_state()`` synchronously
+# from async contexts. Each call serialises the whole state dict + writes the
+# file synchronously inline on the event loop. At 5k+ users that's tens of MB
+# of JSON encoding per click. We instead flip a dirty flag and let a 5 s
+# background loop coalesce all dirty writes onto ``_save_executor``.
+_bot_state_dirty: bool = False
+_bot_state_extras_dirty: bool = False  # escrow / groups / recovery / gift codes
+_bot_state_dirty_lock = asyncio.Lock()
+
+
 def save_bot_state():
     """Persist non-user-data ("bot state") — called from many admin handlers.
 
-    PERFORMANCE: This used to blast every user's record to disk (thousands of
-    json files) and ``concurrent.futures.wait(... timeout=30)`` *inside the
-    event loop*, which froze every handler for up to 30 s on a single admin
-    click. User data is already persisted continuously via the write-behind
-    ``_dirty_users`` flush task — we only need to save the truly global
-    state here (withdrawals, settings, group/escrow/raffle registries).
-    ``save_bot_state_full()`` below still does the fat shutdown save; call
-    that path only from actual shutdown.
+    Now non-blocking: flips a dirty flag and lets ``_flush_bot_state_loop``
+    coalesce writes to ``_save_executor``. Worst-case staleness on crash:
+    one ``BOT_STATE_FLUSH_INTERVAL`` window. Synchronous shutdown still
+    forces an immediate flush via ``save_bot_state_full()``.
     """
+    global _bot_state_dirty, _bot_state_extras_dirty
+    _bot_state_dirty = True
+    _bot_state_extras_dirty = True
+
+
+def save_bot_state_inline():
+    """Original blocking save — kept for shutdown / startup paths."""
     try:
         _sync_save_bot_state_json()
         save_all_escrow_deals()
@@ -8479,6 +8492,38 @@ def save_bot_state():
         save_all_gift_codes()
     except Exception as e:
         logging.error(f"save_bot_state partial failure: {e}")
+
+
+BOT_STATE_FLUSH_INTERVAL = 5  # seconds
+
+
+async def _flush_bot_state_loop():
+    """Background loop coalescing ``save_bot_state()`` writes off the event loop."""
+    global _bot_state_dirty, _bot_state_extras_dirty
+    while True:
+        try:
+            await asyncio.sleep(BOT_STATE_FLUSH_INTERVAL)
+            if not (_bot_state_dirty or _bot_state_extras_dirty):
+                continue
+            do_state = _bot_state_dirty
+            do_extras = _bot_state_extras_dirty
+            _bot_state_dirty = False
+            _bot_state_extras_dirty = False
+            loop = asyncio.get_running_loop()
+            try:
+                if do_state:
+                    await loop.run_in_executor(_save_executor, _sync_save_bot_state_json)
+                if do_extras:
+                    await loop.run_in_executor(_save_executor, save_all_escrow_deals)
+                    await loop.run_in_executor(_save_executor, save_all_group_settings)
+                    await loop.run_in_executor(_save_executor, save_all_recovery_data)
+                    await loop.run_in_executor(_save_executor, save_all_gift_codes)
+            except Exception as e:
+                logging.error(f"Bot state flush failed: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logging.error(f"_flush_bot_state_loop error: {e}")
 
 
 def save_bot_state_full():
@@ -14978,7 +15023,7 @@ def generate_bj_image(
 async def async_generate_bj_image(*args, **kwargs) -> BytesIO:
     """Async wrapper for generate_bj_image to avoid blocking the event loop."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: generate_bj_image(*args, **kwargs))
+    return await loop.run_in_executor(_image_executor, lambda: generate_bj_image(*args, **kwargs))
 
 
 # ============================================================
@@ -15562,7 +15607,7 @@ def generate_limbo_image(
 async def async_generate_limbo_image(*args, **kwargs) -> BytesIO:
     """Async wrapper for generate_limbo_image to avoid blocking the event loop."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: generate_limbo_image(*args, **kwargs))
+    return await loop.run_in_executor(_image_executor, lambda: generate_limbo_image(*args, **kwargs))
 
 def create_deck():
     """Create and cryptographically securely shuffle a 52-card deck."""
@@ -33287,7 +33332,10 @@ async def post_init(application: Application):
             logging.info("PostgreSQL background flush task started")
         else:
             application.create_task(_flush_dirty_users())
-        
+        # Coalesced bot-state writer (replaces synchronous save_bot_state on
+        # event loop — handlers just flip a dirty flag now).
+        application.create_task(_flush_bot_state_loop())
+
         application.create_task(_cleanup_menu_owners())
         application.create_task(_cleanup_game_sessions())
         application.create_task(_cleanup_inflight_callbacks())
