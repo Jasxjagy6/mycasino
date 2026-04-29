@@ -84,7 +84,7 @@ else:
     USE_POSTGRES_FOR_ALL = False
 import qrcode
 from io import BytesIO
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # Blockchain-specific libraries for non-EVM chains
 try:
@@ -1261,8 +1261,38 @@ def _get_cached_wagered_rank(user_id: int) -> int | None:
     return _wagered_rank_cache.get(user_id)
 
 
-def _rebuild_leaderboards():
-    """Rebuild all leaderboard caches from user_stats data."""
+# -- Leaderboard rebuild cache ------------------------------------------------
+# `_rebuild_leaderboards` walks the entire `user_stats` dict (one full O(N)
+# pass + heap-select). With several thousand users this is non-trivial work
+# and the previous code path called it twice on every `/leaderboard` invocation
+# (once in `leaderboard_command`, once in `generate_leaderboard_image`). We
+# memoise the rebuild for 60 s so the per-command cost stops scaling with user
+# count. Mutating commands (`/resetleaderboard`, weekly/monthly resets) call
+# `_invalidate_leaderboard_cache()` to force a fresh rebuild on next access.
+_leaderboard_rebuilt_at: float = 0.0
+_LEADERBOARD_REBUILD_TTL = 60.0  # seconds
+
+
+def _invalidate_leaderboard_cache():
+    """Force the next `_rebuild_leaderboards` call to do real work."""
+    global _leaderboard_rebuilt_at
+    _leaderboard_rebuilt_at = 0.0
+
+
+def _rebuild_leaderboards(force: bool = False):
+    """Rebuild all leaderboard caches from user_stats data.
+
+    Cached for `_LEADERBOARD_REBUILD_TTL` seconds — pass `force=True` from
+    invalidation paths (admin reset, weekly/monthly rollover) to bypass the
+    cache.
+    """
+    global _leaderboard_rebuilt_at
+    import time as _time_lb
+    if not force:
+        now_mono = _time_lb.monotonic()
+        if (_leaderboard_rebuilt_at and
+                now_mono - _leaderboard_rebuilt_at < _LEADERBOARD_REBUILD_TTL):
+            return  # cached result is still fresh
     now = datetime.now(timezone.utc)
     week_start = now - timedelta(days=now.weekday())  # Monday
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -1331,6 +1361,7 @@ def _rebuild_leaderboards():
     leaderboard_data["weekly"] = _heapq_rl.nlargest(10, weekly, key=lambda x: x[2])
     leaderboard_data["monthly"] = _heapq_rl.nlargest(10, monthly, key=lambda x: x[2])
     leaderboard_data["highest_wins"] = _heapq_rl.nlargest(10, highest_wins, key=lambda x: x[2])
+    _leaderboard_rebuilt_at = _time_lb.monotonic()
 
 # --- Global Control Flag ---
 bot_stopped = False
@@ -1344,8 +1375,13 @@ active_manual_scans: dict = {}
 # Write-Behind Save System
 _dirty_users: set = set()
 _dirty_lock = asyncio.Lock()
+# PERFORMANCE: 16 workers. Disk writes are atomic (tmp+rename) and small,
+# so the bottleneck is fsync / dentry update — not CPU. With 5000+ users
+# and a steady stream of dirty-user flushes plus on-demand profile/state
+# saves, 8 was too tight; 16 keeps the flush queue from backing up under
+# bursty load (raffle finalisation, surprise drop, broadcast handlers).
 _save_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=8, thread_name_prefix="disk_writer"
+    max_workers=16, thread_name_prefix="disk_writer"
 )
 
 # -- Global Callback Deduplication ------------------------------------------
@@ -1450,9 +1486,13 @@ _MENU_OWNER_TTL = 3600          # 1 hour
 _leaderboard_buffer: list = []
 _leaderboard_buffer_lock = asyncio.Lock()
 
-# Image generation executor and caches
+# Image generation executor and caches.
+# PERFORMANCE: 16 workers. PIL rendering is CPU-bound but releases the GIL
+# during compression (PNG/JPEG encode). With many concurrent emoji-game
+# results and stats requests, 8 was a visible queueing point under burst
+# load — bumped to 16 so renderer fan-out stops queueing at the executor.
 _image_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=8, thread_name_prefix="image_gen"
+    max_workers=16, thread_name_prefix="image_gen"
 )
 _profile_pic_cache: dict = {}       # user_id -> (PIL.Image, timestamp)
 _PROFILE_PIC_CACHE_TTL = 300        # 5 minutes
@@ -1645,7 +1685,26 @@ DASHBOARD_TEMPLATE_PATH = "clean_template.jpg"
 
 # Font configuration (use a TTF font for better quality)
 # You can replace this with any .ttf font file path
-DASHBOARD_FONT_PATH = "bold.ttf"  # Default system font
+# Resolve a real bold font from common system locations so the PIL renderers
+# don't silently fall back to ImageFont.load_default() (a tiny 8px bitmap).
+def _resolve_dashboard_font():
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+        "bold.ttf",
+    ]
+    for p in candidates:
+        try:
+            if os.path.exists(p):
+                return p
+        except Exception:
+            pass
+    return "bold.ttf"
+
+DASHBOARD_FONT_PATH = _resolve_dashboard_font()
 DASHBOARD_FONT_FALLBACK = None  # Will use PIL default if custom font not found
 
 # Dashboard text configuration: coordinates (X, Y), font size, and color (R, G, B)
@@ -9049,7 +9108,7 @@ def _render_dashboard_sync(text_data: dict, profile_pic):
     """
     try:
         import random as _rand
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw, ImageFont, ImageFilter
         from io import BytesIO
 
         W, H = 1000, 560
@@ -9752,12 +9811,26 @@ async def generate_leaderboard_image(context, period='all_time', viewing_user_id
         data = leaderboard_data.get(data_key, [])
 
         entries = []
+        top_uids = []
         if data_key == 'highest_wins':
             for i, (uid, uname, wamt, gtype, ts) in enumerate(data[:10]):
                 entries.append({"rank": i + 1, "username": get_privacy_display_name(uid, uname), "value": wamt})
+                top_uids.append(uid)
         else:
             for i, (uid, uname, wagered) in enumerate(data[:10]):
                 entries.append({"rank": i + 1, "username": get_privacy_display_name(uid, uname), "value": wagered})
+                top_uids.append(uid)
+
+        # Fetch real Telegram avatars for the top-3 (best-effort) so the
+        # hexagonal podium circles aren't all blank/wireframe placeholders.
+        top_avatars = {}
+        for rank_idx, uid in enumerate(top_uids[:3], start=1):
+            try:
+                pic = await _get_cached_profile_picture(context, uid)
+                if pic is not None:
+                    top_avatars[rank_idx] = pic
+            except Exception:
+                pass
 
         # Calculate viewing user's rank and wagered amount
         user_rank = None
@@ -9790,14 +9863,20 @@ async def generate_leaderboard_image(context, period='all_time', viewing_user_id
                 user_rank = rank
 
         loop = asyncio.get_running_loop()
+        # Use functools.partial so the kwargs (notably ``top_avatars``) are
+        # forwarded into the executor without relying on positional ordering.
+        from functools import partial as _lb_partial
         result = await loop.run_in_executor(
             _image_executor,
-            _render_leaderboard_sync,
-            entries,
-            bot_username,
-            section_title,
-            user_rank,
-            user_wagered,
+            _lb_partial(
+                _render_leaderboard_sync,
+                entries,
+                bot_username,
+                section_title,
+                user_rank,
+                user_wagered,
+                top_avatars=top_avatars,
+            ),
         )
         return result
     except Exception as e:
@@ -9807,253 +9886,407 @@ async def generate_leaderboard_image(context, period='all_time', viewing_user_id
 
 def _render_leaderboard_sync(entries, bot_username, section_title, user_rank=None, user_wagered=0.0,
                              value_formatter=None, your_rank_label="YOUR POSITION",
-                             your_value_label="Total Wagered"):
-    """Render leaderboard image - institutional premium casino design.
+                             your_value_label="Total Wagered",
+                             top_avatars=None):
+    """Render the leaderboard card — hexagonal-podium design that mirrors
+    ``example_designs/leaderboard_pil_design_template.png``.
 
-    `value_formatter`, when provided, takes a numeric `entry['value']` and
-    returns a display string (e.g. for referral counts). Defaults to USD.
+    Layout (top→bottom):
+      • Dark blue header strip with `LEADERBOARD` centered, `@bot_username`
+        + `CASINO` subtitle in the top-right.
+      • Section title pill (e.g. "All-Time Top Wagered").
+      • Three hexagonal pedestals in 3D perspective. #2 is left (silver),
+        #1 is center+taller (gold), #3 is right (bronze). Each pedestal has
+        a coloured light-beam shooting up, a circular avatar floating above
+        in the beam, and the user's name + value over the beam.
+      • "RANKS 4 — 10" separator.
+      • Left: "YOUR POSITION" card (rounded blue-bordered).
+      • Right: rows for ranks 4–10, alternating filled/empty.
+      • Footer: "Play Responsibly • Telegram Casino", diamond glyph
+        bottom-right.
+
+    `top_avatars` is an optional dict mapping ``rank → PIL.Image`` (1, 2 or 3)
+    so the top-3 podium circles can show real Telegram avatars. Falls back
+    to the wireframe-mask placeholder when an avatar is not provided.
+    `value_formatter` formats the numeric `entry['value']` (defaults to USD).
     """
     if value_formatter is None:
         value_formatter = lambda v: f"${v:,.2f}"
     try:
-        W, H = 760, 1120
+        # Larger canvas to fit the hexagonal podium + ranks 4-10 + your-position card.
+        W, H = 850, 1180
         img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
         # ── PALETTE ──────────────────────────────────────────────
-        C_BG_TOP    = (3,  8, 20)
-        C_BG_BOT    = (8, 16, 38)
+        C_BG_TOP    = (5,  8,  28)
+        C_BG_MID    = (10, 12, 36)
+        C_BG_BOT    = (18, 10, 42)
+        C_HEADER    = (10, 20, 56)
         C_CARD      = (10, 20, 44)
         C_CARD_ALT  = (7,  15, 34)
-        C_BORDER    = (22, 48, 90)
+        C_BORDER    = (28, 56, 110)
         C_GOLD      = (255, 200, 60)
         C_GOLD_DIM  = (160, 120, 20)
-        C_SILVER    = (200, 210, 230)
-        C_SILVER_DIM= (110, 120, 145)
-        C_BRONZE    = (210, 140, 70)
-        C_BRONZE_DIM= (120, 80, 35)
-        C_BLUE      = (70, 160, 255)
-        C_BLUE_DIM  = (35, 90, 180)
-        C_GREEN     = (0, 210, 110)
+        C_SILVER    = (210, 220, 235)
+        C_SILVER_DIM= (110, 125, 150)
+        C_BRONZE    = (220, 145, 80)
+        C_BRONZE_DIM= (130, 85,  40)
+        C_BLUE      = (90, 200, 255)
+        C_BLUE_DIM  = (35, 110, 200)
+        C_GREEN     = (60, 230, 130)
         C_WHITE     = (240, 245, 255)
-        C_MUTED     = (100, 120, 160)
+        C_MUTED     = (130, 145, 180)
         C_ACCENT    = (25, 60, 120)
 
         MEDAL = [C_GOLD, C_SILVER, C_BRONZE]
         MEDAL_DIM = [C_GOLD_DIM, C_SILVER_DIM, C_BRONZE_DIM]
-        MEDAL_BG = [(35,28,4), (22,26,36), (32,20,8)]
+        MEDAL_BG = [(35,28,4), (24,28,38), (32,22,10)]
 
-        # ── BACKGROUND ───────────────────────────────────────────
+        # ── BACKGROUND: dark navy → faint purple gradient ────────
         for yy in range(H):
             t = yy / H
-            r = int(C_BG_TOP[0] + t*(C_BG_BOT[0]-C_BG_TOP[0]))
-            g = int(C_BG_TOP[1] + t*(C_BG_BOT[1]-C_BG_TOP[1]))
-            b = int(C_BG_TOP[2] + t*(C_BG_BOT[2]-C_BG_TOP[2]))
-            draw.line([(0,yy),(W,yy)], fill=(r,g,b))
+            if t < 0.5:
+                u = t * 2
+                r = int(C_BG_TOP[0] + u * (C_BG_MID[0] - C_BG_TOP[0]))
+                g = int(C_BG_TOP[1] + u * (C_BG_MID[1] - C_BG_TOP[1]))
+                b = int(C_BG_TOP[2] + u * (C_BG_MID[2] - C_BG_TOP[2]))
+            else:
+                u = (t - 0.5) * 2
+                r = int(C_BG_MID[0] + u * (C_BG_BOT[0] - C_BG_MID[0]))
+                g = int(C_BG_MID[1] + u * (C_BG_BOT[1] - C_BG_MID[1]))
+                b = int(C_BG_MID[2] + u * (C_BG_BOT[2] - C_BG_MID[2]))
+            draw.line([(0, yy), (W, yy)], fill=(r, g, b))
 
-        # Subtle stars
-        _rng = random.Random(7)
+        # Subtle "circuit-board" lines on the left + right edges (decorative).
+        _rng = random.Random(11)
+        for _ in range(40):
+            sx0 = _rng.choice([_rng.randint(0, 80), _rng.randint(W - 80, W - 1)])
+            sy0 = _rng.randint(50, H - 50)
+            seg_len = _rng.randint(40, 110)
+            draw.line([(sx0, sy0), (sx0 + seg_len, sy0)], fill=(20, 30, 70), width=1)
+            draw.line([(sx0 + seg_len, sy0), (sx0 + seg_len, sy0 - 20)], fill=(20, 30, 70), width=1)
+            draw.ellipse([sx0 + seg_len - 2, sy0 - 22, sx0 + seg_len + 2, sy0 - 18], fill=(60, 130, 200))
+
+        # Decorative starfield.
         for _ in range(120):
-            sx,sy = _rng.randint(0,W), _rng.randint(0,H)
-            br = _rng.randint(30,120)
-            draw.ellipse([sx-1,sy-1,sx+1,sy+1], fill=(br,br,br+20))
-
-        # Double outer border
-        draw.rounded_rectangle([2,2,W-3,H-3], radius=22, outline=C_GOLD_DIM, width=2)
-        draw.rounded_rectangle([5,5,W-6,H-6], radius=20, outline=C_ACCENT, width=1)
+            sx, sy = _rng.randint(0, W), _rng.randint(0, H)
+            br = _rng.randint(40, 140)
+            draw.ellipse([sx - 1, sy - 1, sx + 1, sy + 1], fill=(br, br, br + 20))
 
         # ── FONTS ────────────────────────────────────────────────
         def _tf(size):
-            try: return ImageFont.truetype(DASHBOARD_FONT_PATH, size)
-            except: return ImageFont.load_default()
+            try:
+                return ImageFont.truetype(DASHBOARD_FONT_PATH, size)
+            except Exception:
+                return ImageFont.load_default()
 
-        fH1   = _tf(30)   # main title
-        fH2   = _tf(22)   # section title
-        fH3   = _tf(17)   # sub heading
-        fBody = _tf(14)   # body / row text
-        fSmall= _tf(11)   # small labels
-        fTiny = _tf(9)    # tiny / footer
-        fBig  = _tf(42)   # big number (#1 rank)
-        fMed  = _tf(28)   # medium number
-        fRk   = _tf(20)   # rank number in rows
+        fHero  = _tf(50)   # LEADERBOARD title
+        fH3    = _tf(20)   # section pill text
+        fBody  = _tf(16)   # row text
+        fSmall = _tf(13)   # small labels
+        fTiny  = _tf(11)   # footer
+        fHexN  = _tf(72)   # gigantic #1/#2/#3 inside hex
+        fBadge = _tf(14)   # rank badge text
+        fName  = _tf(20)   # podium username
+        fAmt   = _tf(15)   # podium amount
+        fYRk   = _tf(58)   # YOUR POSITION rank glyph
 
-        y = 18
-
-        # ── HEADER ───────────────────────────────────────────────
-        # Gold accent header band
-        for yy in range(y, y+62):
-            t = (yy-y)/62
-            hb = int(5 + t*6)
-            draw.line([(0,yy),(W,yy)], fill=(hb, hb+2, hb+16))
-        draw.line([(0,y+62),(W,y+62)], fill=C_GOLD, width=2)
-
-        # Bot username top-right with Telegram Casino subtitle
+        # ── HEADER STRIP ─────────────────────────────────────────
+        HDR_H = 92
+        draw.rectangle([0, 0, W, HDR_H], fill=C_HEADER)
+        # Hero title centered.
+        title = "LEADERBOARD"
+        tw = draw.textlength(title, font=fHero)
+        draw.text(((W - tw) // 2, 18), title, fill=C_BLUE, font=fHero)
+        # Top-right: @bot_username + CASINO subtitle.
         bot_lbl = f"@{bot_username}"
         blw = draw.textlength(bot_lbl, font=fSmall)
-        draw.text((W-blw-18, y+8), bot_lbl, fill=C_GOLD, font=fSmall)
-        sublbl = "Telegram Casino"
-        sblw = draw.textlength(sublbl, font=fTiny)
-        draw.text((W-sblw-18, y+26), sublbl, fill=C_MUTED, font=fTiny)
+        draw.text((W - blw - 22, 18), bot_lbl, fill=C_WHITE, font=fSmall)
+        casino_sub = "CASINO"
+        cw = draw.textlength(casino_sub, font=fTiny)
+        draw.text((W - cw - 22, 38), casino_sub, fill=C_MUTED, font=fTiny)
+        # Top-left: small leaderboard chip.
+        lb_chip = "leaderboard"
+        lcw = draw.textlength(lb_chip, font=fSmall)
+        chip_y = HDR_H + 12
+        draw.text((W - lcw - 22, chip_y), lb_chip, fill=C_BLUE, font=fSmall)
+        # tiny bar-chart glyph next to it
+        draw.rectangle([W - lcw - 38, chip_y + 4, W - lcw - 34, chip_y + 18], fill=C_BLUE)
+        draw.rectangle([W - lcw - 32, chip_y + 8, W - lcw - 28, chip_y + 18], fill=C_BLUE)
+        draw.rectangle([W - lcw - 26, chip_y + 12, W - lcw - 22, chip_y + 18], fill=C_BLUE)
 
-        # "LEADERBOARD" with shadow effect
-        title = "LEADERBOARD"
-        tw = draw.textlength(title, font=fH1)
-        tx = (W-tw)//2
-        # shadow
-        draw.text((tx+2, y+14), title, fill=C_GOLD_DIM, font=fH1)
-        draw.text((tx, y+12), title, fill=C_GOLD, font=fH1)
-        y += 82
-
-        # Section title pill
+        # ── SECTION TITLE PILL ───────────────────────────────────
         stw = draw.textlength(section_title, font=fH3)
-        pill_x = (W-stw)//2 - 28
-        draw.rounded_rectangle([pill_x, y, pill_x+stw+56, y+36], radius=18,
-                                fill=(14, 28, 56), outline=C_BLUE, width=2)
-        # Blue dots on pill sides
-        draw.ellipse([pill_x-6, y+14, pill_x+2, y+22], fill=C_BLUE)
-        draw.ellipse([pill_x+stw+54, y+14, pill_x+stw+62, y+22], fill=C_BLUE)
-        draw.text(((W-stw)//2, y+7), section_title, fill=(140, 210, 255), font=fH3)
-        y += 50
+        pill_w = int(stw + 56)
+        pill_h = 46
+        pill_x = (W - pill_w) // 2
+        pill_y = HDR_H + 38
+        draw.rounded_rectangle([pill_x, pill_y, pill_x + pill_w, pill_y + pill_h],
+                               radius=22, fill=(8, 18, 44), outline=C_BLUE_DIM, width=2)
+        draw.text((pill_x + 28, pill_y + 11), section_title, fill=C_WHITE, font=fH3)
 
-        # ── TOP 3 SHOWCASE ───────────────────────────────────────
+        # Decorative dotted side lines below pill (matches the template).
+        for dx in range(20, pill_x - 20, 14):
+            draw.line([(dx, pill_y + pill_h // 2), (dx + 6, pill_y + pill_h // 2)],
+                      fill=C_BORDER, width=1)
+        for dx in range(pill_x + pill_w + 20, W - 20, 14):
+            draw.line([(dx, pill_y + pill_h // 2), (dx + 6, pill_y + pill_h // 2)],
+                      fill=C_BORDER, width=1)
+
+        # ── TOP-3 HEXAGONAL PODIUM ───────────────────────────────
         top3 = entries[:3]
+        avatars = top_avatars or {}
 
-        def draw_podium_card(rank_num, entry, x, cy, card_w, card_h, is_center):
-            """Draw a top-3 rank card."""
-            mc = MEDAL[rank_num-1]
-            mdim = MEDAL_DIM[rank_num-1]
-            mbg = MEDAL_BG[rank_num-1]
+        def _hex_polygon(cx, cy, radius_w, radius_h):
+            """Return a 6-point hex polygon (pointy top/bottom)."""
+            return [
+                (cx, cy - radius_h),
+                (cx + radius_w, cy - radius_h // 2),
+                (cx + radius_w, cy + radius_h // 2),
+                (cx, cy + radius_h),
+                (cx - radius_w, cy + radius_h // 2),
+                (cx - radius_w, cy - radius_h // 2),
+            ]
 
-            # Card background
-            draw.rounded_rectangle([x, cy, x+card_w, cy+card_h], radius=16,
-                                    fill=mbg, outline=mc, width=2)
-            # Inner glow line at top
-            draw.rounded_rectangle([x+1, cy+1, x+card_w-1, cy+8], radius=4, fill=mc)
+        def _paste_avatar_circle(cx, cy, r, pic, ring_color):
+            """Paste a circular avatar at (cx, cy) with radius r."""
+            box = (cx - r, cy - r, cx + r, cy + r)
+            # Glow ring.
+            draw.ellipse([box[0] - 4, box[1] - 4, box[2] + 4, box[3] + 4],
+                         outline=ring_color, width=3)
+            if isinstance(pic, Image.Image):
+                try:
+                    sz = (r * 2, r * 2)
+                    src = pic.convert("RGBA").resize(sz, Image.Resampling.LANCZOS)
+                    mask = Image.new("L", sz, 0)
+                    ImageDraw.Draw(mask).ellipse([0, 0, sz[0] - 1, sz[1] - 1], fill=255)
+                    img.paste(src, (cx - r, cy - r), mask)
+                    return
+                except Exception:
+                    pass
+            # Fallback: dim disc with mask-like initial.
+            draw.ellipse(box, fill=(20, 20, 35), outline=ring_color, width=2)
 
-            # Rank circle — prominent
-            cx_card = x + card_w // 2
-            if is_center:
-                # #1 gets a big circle
-                draw.ellipse([cx_card-28, cy+14, cx_card+28, cy+70], fill=mdim)
-                draw.ellipse([cx_card-24, cy+18, cx_card+24, cy+66], fill=mc)
-                rk_str = "#1"
-                rkw = draw.textlength(rk_str, font=fMed)
-                draw.text((cx_card-rkw//2, cy+26), rk_str, fill=(20,15,4), font=fMed)
-            else:
-                draw.ellipse([cx_card-22, cy+14, cx_card+22, cy+58], fill=mdim)
-                draw.ellipse([cx_card-18, cy+18, cx_card+18, cy+54], fill=mc)
-                rk_str = f"#{rank_num}"
-                rkw = draw.textlength(rk_str, font=fBody)
-                draw.text((cx_card-rkw//2, cy+27), rk_str, fill=(20,15,4), font=fBody)
+        def _draw_light_beam(cx, top_y, bot_y, top_w, bot_w, color):
+            """Translucent trapezoidal beam shooting up from the hex top."""
+            beam = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            beam_draw = ImageDraw.Draw(beam)
+            # Layered alpha so the beam looks brighter at the bottom (where it
+            # leaves the hex) and fades softly toward the top.
+            for layer, (alpha, scale) in enumerate([
+                (110, 1.0),
+                (70,  0.85),
+                (40,  0.7),
+            ]):
+                tw_l = max(2, int(top_w * scale))
+                bw_l = max(4, int(bot_w * scale))
+                poly = [
+                    (cx - bw_l // 2, bot_y),
+                    (cx + bw_l // 2, bot_y),
+                    (cx + tw_l // 2, top_y),
+                    (cx - tw_l // 2, top_y),
+                ]
+                beam_draw.polygon(poly, fill=(color[0], color[1], color[2], alpha))
+            beam = beam.filter(ImageFilter.GaussianBlur(radius=12))
+            img.alpha_composite(beam)
 
-            # Username
-            uname = entry["username"][:16]
-            if is_center:
-                unw = draw.textlength(uname, font=fH3)
-                draw.text((cx_card-unw//2, cy+76), uname, fill=C_WHITE, font=fH3)
-                # Value
-                val_str = value_formatter(entry['value'])
-                vw = draw.textlength(val_str, font=fBody)
-                draw.text((cx_card-vw//2, cy+100), val_str, fill=C_GREEN, font=fBody)
-            else:
-                unw = draw.textlength(uname, font=fSmall)
-                draw.text((cx_card-unw//2, cy+62), uname, fill=C_WHITE, font=fSmall)
-                val_str = value_formatter(entry['value'])
-                vw = draw.textlength(val_str, font=fSmall)
-                draw.text((cx_card-vw//2, cy+80), val_str, fill=C_GREEN, font=fSmall)
+        def _draw_hex_pedestal(rank_num, entry, cx, avatar_cy, hex_h, is_center):
+            """Render a single hex pedestal + avatar + label.
 
-        # Layout: #2 left, #1 center (taller), #3 right
-        SIDE_W, SIDE_H = 190, 115
-        CTR_W, CTR_H  = 240, 134
-        SIDE_Y_OFFSET = 20  # side cards sit lower (shorter on the podium)
-        total_top3_w = SIDE_W + CTR_W + SIDE_W + 16
-        tx0 = (W - total_top3_w) // 2
+            Positioning is driven from ``avatar_cy`` (the y-center of the
+            floating avatar). Username + amount are stacked below the avatar
+            and the hex sits below them. The hex top is computed
+            deterministically so the labels never overlap the hex.
+            """
+            mc = MEDAL[rank_num - 1]
+            mdim = MEDAL_DIM[rank_num - 1]
+            mbg = MEDAL_BG[rank_num - 1]
 
-        if len(top3) >= 1:
-            draw_podium_card(1, top3[0], tx0+SIDE_W+8, y, CTR_W, CTR_H, True)
-        if len(top3) >= 2:
-            draw_podium_card(2, top3[1], tx0, y+SIDE_Y_OFFSET, SIDE_W, SIDE_H, False)
-        if len(top3) >= 3:
-            draw_podium_card(3, top3[2], tx0+SIDE_W+CTR_W+16, y+SIDE_Y_OFFSET, SIDE_W, SIDE_H, False)
+            av_r = 40 if is_center else 32
+            rx = 96 if is_center else 80
+            ry = hex_h // 2
 
-        y += CTR_H + 24
+            # Compute label band + hex top from avatar position so nothing
+            # overlaps.
+            label_top = avatar_cy + av_r + 12
+            hex_top_y = label_top + 56  # username row (24) + amount row (20) + pad
+            cy = hex_top_y + ry
+            poly = _hex_polygon(cx, cy, rx, ry)
 
-        # ── SEPARATOR ────────────────────────────────────────────
-        draw.line([(30,y),(W-30,y)], fill=C_ACCENT, width=1)
-        lbl4 = "RANKS  4 — 10"
-        lbl4w = draw.textlength(lbl4, font=fSmall)
-        draw.text(((W-lbl4w)//2, y+5), lbl4, fill=C_MUTED, font=fSmall)
-        y += 26
+            # 1. Light beam (drawn first, behind the hex).
+            beam_top = max(HDR_H + 60, avatar_cy - av_r - 30)
+            _draw_light_beam(
+                cx, beam_top, cy,
+                top_w=int(rx * 0.7), bot_w=int(rx * 1.7),
+                color=mc,
+            )
 
-        # ── RANKS 4-10 ───────────────────────────────────────────
-        for i, entry in enumerate(entries[3:10]):
-            rank = entry["rank"]
-            uname = entry["username"][:24]
-            val = entry["value"]
+            # 2. Glow halo behind hex.
+            halo = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            halo_draw = ImageDraw.Draw(halo)
+            halo_poly = _hex_polygon(cx, cy, rx + 16, ry + 16)
+            halo_draw.polygon(halo_poly, fill=(mc[0], mc[1], mc[2], 50))
+            halo = halo.filter(ImageFilter.GaussianBlur(radius=10))
+            img.alpha_composite(halo)
 
-            RH = 48
-            bg = C_CARD if i%2==0 else C_CARD_ALT
-            draw.rounded_rectangle([18,y,W-18,y+RH], radius=10, fill=bg, outline=C_BORDER, width=1)
+            # 3. Filled hex with bright outline.
+            draw.polygon(poly, fill=mbg, outline=mc)
+            for _ in range(2):
+                draw.polygon(poly, outline=mc)
+            # Inner thin dim outline for depth.
+            inner = _hex_polygon(cx, cy, rx - 10, ry - 10)
+            draw.polygon(inner, outline=mdim)
 
-            # Rank badge circle
-            draw.ellipse([30,y+10,58,y+38], fill=C_ACCENT)
-            rk_str = f"#{rank}"
-            rkw = draw.textlength(rk_str, font=fSmall)
-            draw.text((44-rkw//2, y+16), rk_str, fill=C_MUTED, font=fSmall)
+            # 4. Big rank glyph centered in hex.
+            rk_str = f"#{rank_num}"
+            rkw = draw.textlength(rk_str, font=fHexN)
+            # Vertically centred-ish in the hex (font ascent makes pure
+            # centring look low; nudge up a bit).
+            glyph_y = cy - 50
+            draw.text((cx - rkw / 2 + 4, glyph_y + 4), rk_str, fill=mdim, font=fHexN)
+            draw.text((cx - rkw / 2, glyph_y), rk_str, fill=mc, font=fHexN)
 
-            # Username
-            draw.text((72, y+13), uname, fill=C_WHITE, font=fBody)
+            # 5. Floating avatar.
+            _paste_avatar_circle(cx, avatar_cy, av_r, avatars.get(rank_num), mc)
 
-            # Value — right aligned
-            val_str = value_formatter(val)
-            vw = draw.textlength(val_str, font=fBody)
-            draw.text((W-32, y+13), val_str, fill=C_GREEN, font=fBody, anchor="ra")
+            # 6. Small "#N" badge clipped to the avatar's top-left.
+            badge_w, badge_h = 42, 24
+            bx0 = cx - av_r - 10
+            by0 = avatar_cy - av_r - 8
+            draw.rounded_rectangle([bx0, by0, bx0 + badge_w, by0 + badge_h],
+                                   radius=8, fill=mbg, outline=mc, width=2)
+            bs = f"#{rank_num}"
+            bsw = draw.textlength(bs, font=fBadge)
+            draw.text((bx0 + (badge_w - bsw) / 2, by0 + 4), bs, fill=mc, font=fBadge)
 
-            y += RH + 5
+            # 7. Username + amount labels between the avatar and the hex top.
+            uname = (entry["username"][:18] if entry and entry.get("username") else "")
+            unw = draw.textlength(uname, font=fName)
+            draw.text((cx - unw / 2, label_top), uname, fill=C_WHITE, font=fName)
+            if entry:
+                val_str = value_formatter(entry["value"])
+                vw = draw.textlength(val_str, font=fAmt)
+                draw.text((cx - vw / 2, label_top + 28), val_str, fill=C_GREEN, font=fAmt)
 
-        # Empty state
-        if not entries:
-            draw.text(((W-100)//2, y+10), "No data yet", fill=C_MUTED, font=fBody)
-            y += 50
+            return cy + ry  # Return hex bottom y for caller layout.
 
-        # ── YOUR RANK CARD ────────────────────────────────────────
-        y += 20
-        draw.line([(30,y),(W-30,y)], fill=C_ACCENT, width=1)
-        y += 10
-        YR_H = 84
-        draw.rounded_rectangle([18,y,W-18,y+YR_H], radius=14, fill=(10,22,46), outline=C_BLUE, width=2)
-        # "YOUR RANK" label
-        draw.text((36, y+10), your_rank_label, fill=C_MUTED, font=fSmall)
-        draw.line([(36, y+24),(W-36, y+24)], fill=C_ACCENT, width=1)
+        # Layout: hex centers and heights.
+        side_hex_h = 130
+        center_hex_h = 170
+        cx_left = int(W * 0.20)
+        cx_mid  = W // 2
+        cx_right = int(W * 0.80)
 
-        # Rank badge
+        # Avatar y positions (center sits higher = taller pedestal).
+        ctr_avatar_y  = HDR_H + 130
+        side_avatar_y = HDR_H + 170
+
+        ctr_bottom = _draw_hex_pedestal(
+            1, top3[0] if len(top3) >= 1 else None,
+            cx_mid, ctr_avatar_y, center_hex_h, True,
+        )
+        _ = _draw_hex_pedestal(
+            2, top3[1] if len(top3) >= 2 else None,
+            cx_left, side_avatar_y, side_hex_h, False,
+        )
+        _ = _draw_hex_pedestal(
+            3, top3[2] if len(top3) >= 3 else None,
+            cx_right, side_avatar_y, side_hex_h, False,
+        )
+
+        # ── RANKS 4-10 SEPARATOR ─────────────────────────────────
+        sep_y = ctr_bottom + 30
+        draw.line([(40, sep_y), (W - 40, sep_y)], fill=C_BORDER, width=1)
+        ranks_lbl = "RANKS  4 — 10"
+        rlw = draw.textlength(ranks_lbl, font=fSmall)
+        draw.rectangle([((W - rlw) // 2 - 8), sep_y - 8, ((W + rlw) // 2 + 8), sep_y + 8],
+                       fill=C_BG_MID)
+        draw.text(((W - rlw) // 2, sep_y - 7), ranks_lbl, fill=C_MUTED, font=fSmall)
+
+        # ── YOUR POSITION (left) + RANKS 4-10 ROWS (right) ───────
+        body_y = sep_y + 26
+        # Your-position card on the left.
+        YP_W = 250
+        YP_H = 170
+        YP_X = 22
+        draw.rounded_rectangle([YP_X, body_y, YP_X + YP_W, body_y + YP_H],
+                               radius=20, fill=(8, 18, 44), outline=C_BLUE, width=2)
+        # Soft outer glow.
+        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow)
+        gd.rounded_rectangle([YP_X - 6, body_y - 6, YP_X + YP_W + 6, body_y + YP_H + 6],
+                             radius=24, outline=(60, 160, 220, 80), width=4)
+        glow = glow.filter(ImageFilter.GaussianBlur(radius=4))
+        img.alpha_composite(glow)
+        # Header line.
+        draw.text((YP_X + 22, body_y + 18), your_rank_label, fill=C_MUTED, font=fSmall)
+        draw.line([(YP_X + 22, body_y + 40), (YP_X + YP_W - 22, body_y + 40)],
+                  fill=C_BORDER, width=1)
+        # Rank glyph + value.
         if user_rank is not None and isinstance(user_rank, int):
             rk_str = f"#{user_rank}"
             rk_color = C_GOLD
-            rk_bg = (30,22,4)
         else:
             rk_str = "–"
             rk_color = C_MUTED
-            rk_bg = C_CARD
-        rkw = draw.textlength(rk_str, font=fMed)
-        draw.rounded_rectangle([36,y+30,36+rkw+26,y+68], radius=10, fill=rk_bg, outline=rk_color, width=2)
-        draw.text((36+13, y+34), rk_str, fill=rk_color, font=fMed)
-
-        # Wagered amount (or generic value)
-        waged_lbl = your_value_label
+        draw.text((YP_X + 22, body_y + 62), rk_str, fill=rk_color, font=fYRk)
+        draw.text((YP_X + 110, body_y + 78), your_value_label, fill=C_MUTED, font=fSmall)
         if user_wagered > 0:
-            waged_val = value_formatter(user_wagered)
+            wv = value_formatter(user_wagered)
         else:
-            waged_val = "No data yet"
-        draw.text((rkw+82, y+32), waged_lbl, fill=C_MUTED, font=fSmall)
-        draw.text((rkw+82, y+48), waged_val, fill=C_GREEN, font=fH3)
+            wv = "—"
+        draw.text((YP_X + 110, body_y + 96), wv, fill=C_GREEN, font=fName)
+
+        # Right-side ranks 4-10 rows.
+        ROWS_X0 = YP_X + YP_W + 18
+        ROWS_X1 = W - 22
+        rows_y = body_y
+        ROW_H = 64
+        ROW_GAP = 8
+        rank_entries = list(entries[3:10])
+        # Always render exactly 7 slots (filled or empty) so the card stays
+        # visually balanced like the template.
+        for i in range(7):
+            row_top = rows_y + i * (ROW_H + ROW_GAP)
+            row_bot = row_top + ROW_H
+            if row_bot > body_y + YP_H + 220:
+                break
+            entry = rank_entries[i] if i < len(rank_entries) else None
+            row_filled = entry is not None
+            bg = C_CARD if row_filled else (10, 18, 38)
+            draw.rounded_rectangle([ROWS_X0, row_top, ROWS_X1, row_bot],
+                                   radius=12, fill=bg, outline=C_BORDER, width=1)
+            # Avatar circle (left).
+            ac_r = 18
+            ac_cx = ROWS_X0 + 26
+            ac_cy = (row_top + row_bot) // 2
+            draw.ellipse([ac_cx - ac_r, ac_cy - ac_r, ac_cx + ac_r, ac_cy + ac_r],
+                         fill=(18, 30, 60), outline=C_BORDER, width=1)
+            if row_filled:
+                rk_str = f"#{entry['rank']}"
+                rkw = draw.textlength(rk_str, font=fBadge)
+                draw.text((ac_cx - rkw / 2, ac_cy - 8), rk_str, fill=C_BLUE, font=fBadge)
+                # Username.
+                uname = entry["username"][:24]
+                draw.text((ac_cx + ac_r + 16, ac_cy - 10), uname, fill=C_WHITE, font=fBody)
+                # Value (right-aligned).
+                vstr = value_formatter(entry["value"])
+                vw = draw.textlength(vstr, font=fBody)
+                draw.text((ROWS_X1 - vw - 18, ac_cy - 10), vstr, fill=C_GREEN, font=fBody)
+            else:
+                # Empty placeholder row.
+                draw.text((ROWS_X1 - 28, ac_cy - 10), "—", fill=C_MUTED, font=fBody)
 
         # ── FOOTER ────────────────────────────────────────────────
-        y = H - 36
-        draw.line([(18,y),(W-18,y)], fill=C_ACCENT, width=1)
+        footer_y = H - 42
         footer = "Play Responsibly  •  Telegram Casino"
-        fw = draw.textlength(footer, font=fTiny)
-        draw.text(((W-fw)//2, y+10), footer, fill=(60,75,100), font=fTiny)
+        fw = draw.textlength(footer, font=fSmall)
+        draw.text(((W - fw) // 2, footer_y), footer, fill=C_MUTED, font=fSmall)
+        # Tiny diamond glyph in the bottom-right corner.
+        dx, dy = W - 36, footer_y - 4
+        diamond = [(dx, dy - 10), (dx + 10, dy), (dx, dy + 10), (dx - 10, dy)]
+        draw.polygon(diamond, fill=C_BLUE)
 
         # ── SAVE ──────────────────────────────────────────────────
         output = BytesIO()
@@ -10746,17 +10979,50 @@ def _render_roulette_sync(username, bet_amount, choice, choice_numbers, winning_
         return None
 
 
+# Per-user in-flight fetches so the first miss for a hot user doesn't fan out
+# to N parallel Telegram API calls when N concurrent commands all need the
+# same avatar (e.g. broadcast/replay scenarios). The first caller does the
+# real fetch, the rest await the same Future.
+_profile_pic_inflight: dict = {}  # user_id -> asyncio.Future
+
+
 async def _get_cached_profile_picture(context, user_id: int):
-    """Return cached profile picture or fetch a fresh one."""
+    """Return cached profile picture or fetch a fresh one.
+
+    PERFORMANCE: coalesces concurrent misses for the same user into a
+    single ``get_user_profile_picture`` call so we never hit the
+    Telegram API N times for the same avatar within a single render
+    burst.
+    """
     now = datetime.now().timestamp()
     cached = _profile_pic_cache.get(user_id)
     if cached:
         img, ts = cached
         if now - ts < _PROFILE_PIC_CACHE_TTL:
             return img
-    img = await get_user_profile_picture(context, user_id)
-    _profile_pic_cache[user_id] = (img, now)
-    return img
+
+    inflight = _profile_pic_inflight.get(user_id)
+    if inflight is not None and not inflight.done():
+        try:
+            return await inflight
+        except Exception:
+            return None
+
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    _profile_pic_inflight[user_id] = fut
+    try:
+        img = await get_user_profile_picture(context, user_id)
+        _profile_pic_cache[user_id] = (img, now)
+        if not fut.done():
+            fut.set_result(img)
+        return img
+    except Exception as e:
+        if not fut.done():
+            fut.set_exception(e)
+        raise
+    finally:
+        _profile_pic_inflight.pop(user_id, None)
 
 async def ensure_user_in_wallets(user_id: int, username: str = None, referrer_id: int = None, context: ContextTypes.DEFAULT_TYPE = None, first_name: str = None):
     """OPTIMIZED: Fast path for existing users, deferred API call for new users."""
@@ -11568,7 +11834,7 @@ async def _jackpot_run_draw(application):
         try:
             loop = asyncio.get_running_loop()
             img_buf = await loop.run_in_executor(
-                None,
+                _image_executor,
                 generate_jackpot_winner_image,
                 uname or f"User-{uid}",
                 amount_won,
@@ -11650,14 +11916,49 @@ async def _jackpot_scheduler_task(application):
             await asyncio.sleep(60)
 
 
+def _jackpot_prune_all():
+    """Drop every user-wager bucket entry older than 7 days. Keeps the
+    jackpot state file from growing unbounded as inactive users
+    accumulate stale day-buckets."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+    user_wagers = _jackpot_state.get("user_wagers", {})
+    if not isinstance(user_wagers, dict):
+        return
+    pruned_users = 0
+    for key in list(user_wagers.keys()):
+        bucket = user_wagers.get(key)
+        if not isinstance(bucket, dict):
+            user_wagers.pop(key, None)
+            pruned_users += 1
+            continue
+        cleaned = {d: v for d, v in bucket.items() if d > cutoff}
+        if cleaned:
+            user_wagers[key] = cleaned
+        else:
+            user_wagers.pop(key, None)
+            pruned_users += 1
+    if pruned_users:
+        _jackpot_mark_dirty()
+
+
 async def _jackpot_save_loop():
-    """Background loop that persists jackpot state when dirty (every 30s)."""
+    """Background loop that persists jackpot state when dirty (every 30s)
+    and prunes stale user-wager buckets (every 5 minutes)."""
+    last_prune_at = 0.0
     while True:
         try:
             await asyncio.sleep(30)
+            try:
+                import time as _t
+                now_mono = _t.monotonic()
+                if now_mono - last_prune_at > 300:
+                    last_prune_at = now_mono
+                    _jackpot_prune_all()
+            except Exception as e:
+                logging.error(f"Jackpot prune failed: {e}")
             if _jackpot_dirty:
                 try:
-                    await asyncio.get_running_loop().run_in_executor(None, _jackpot_save_now)
+                    await asyncio.get_running_loop().run_in_executor(_save_executor, _jackpot_save_now)
                 except Exception as e:
                     logging.error(f"Jackpot background save failed: {e}")
         except asyncio.CancelledError:
@@ -12032,7 +12333,7 @@ async def jackpot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         loop = asyncio.get_running_loop()
         img_buf = await loop.run_in_executor(
-            None,
+            _image_executor,
             generate_jackpot_status_image,
             pool, threshold, user_w, secs, last_winner,
             bot_uname, user.username, profile_pic,
@@ -31154,8 +31455,9 @@ async def resetleaderboard_command(update: Update, context: ContextTypes.DEFAULT
     # Save all user data
     save_all_data()
 
-    # Rebuild empty leaderboards
-    _rebuild_leaderboards()
+    # Rebuild empty leaderboards (force-bypass cache after admin reset).
+    _invalidate_leaderboard_cache()
+    _rebuild_leaderboards(force=True)
 
     await update.message.reply_text(
         f"{pe('check')} <b>Leaderboard Reset Complete</b>\n\n"
@@ -33091,7 +33393,7 @@ def check_7up_specific_combo(target_combo: list, dice_values: list) -> tuple:
 
 def generate_7up_help_image() -> BytesIO:
     """Generate PIL help image for 7Up7Down game."""
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
     W, H = 900, 1200
     BG = (15, 10, 35)  # Dark purple-black
