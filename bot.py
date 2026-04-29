@@ -9536,258 +9536,390 @@ async def generate_stats_image(user_id: int, context: ContextTypes.DEFAULT_TYPE,
 
 
 def _render_stats_sync(text_data, game_list, pvp_entries, profile_pic_data):
-    """Render stats image - institutional premium casino design."""
+    """Render stats image — circuit-board / wireframe-head design.
+
+    Mirrors ``example_designs/stats_pil_image_design_template.png``.
+    Layout (rough):
+      - Header: bot username centered + "TELEGRAM CASINO • PLAYER STATS" sub.
+        Top-right: bot username + "Since <date>".
+      - Wireframe head avatar in the top-left (geometric mesh).
+      - Glass-effect "name card": first name large + @username + ID.
+      - Right of name card: small badge with rank "#N" + circle avatar +
+        level pill ("Bronze I" / "Silver II" / etc.).
+      - 4×2 grid of colored stat tiles (games, wagered, win rate, P&L /
+        avg bet, biggest win, fav game, bonuses) — each tile has a thin
+        coloured border that matches the metric type.
+      - "GAME BREAKDOWN" table with diamond bullets per row, P&L coloured.
+      - Decorative circuit-board lines on the left/right edges + bottom.
+      - Footer: "Play Responsibly • Gamble with Control" centered, bot
+        username + diamond glyph in the bottom-right.
+    """
     try:
-        W, H = 920, 860
-        img = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+        W, H = 1060, 980
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
         # ── PALETTE ──────────────────────────────────────────────
-        C_BG_TOP      = (4,  10, 24)
-        C_BG_BOT      = (8,  18, 40)
-        C_CARD        = (10, 20, 42)
-        C_CARD_ALT    = (7,  15, 33)
-        C_BORDER      = (22, 48, 90)
-        C_GOLD        = (255, 200, 60)
-        C_GOLD_DIM    = (180, 140, 40)
-        C_BLUE        = (70, 160, 255)
-        C_BLUE_DIM    = (40, 100, 200)
-        C_GREEN       = (0,  210, 110)
-        C_RED         = (255, 70, 80)
-        C_WHITE       = (240, 245, 255)
-        C_MUTED       = (100, 120, 160)
-        C_PURPLE      = (170, 110, 255)
-        C_HEADER_BG   = (6,  14, 32)
-        C_ACCENT_LINE = (30, 70, 140)
-
-        # ── BACKGROUND ───────────────────────────────────────────
-        for yy in range(H):
-            t = yy / H
-            r = int(C_BG_TOP[0] + t * (C_BG_BOT[0] - C_BG_TOP[0]))
-            g = int(C_BG_TOP[1] + t * (C_BG_BOT[1] - C_BG_TOP[1]))
-            b = int(C_BG_TOP[2] + t * (C_BG_BOT[2] - C_BG_TOP[2]))
-            draw.line([(0, yy), (W, yy)], fill=(r, g, b))
-
-        # Subtle stars
-        _rng = random.Random(99)
-        for _ in range(100):
-            sx, sy = _rng.randint(0, W), _rng.randint(0, H)
-            br = _rng.randint(40, 140)
-            draw.ellipse([sx-1, sy-1, sx+1, sy+1], fill=(br, br, br+15))
-
-        # Outer border — double ring
-        draw.rounded_rectangle([2, 2, W-3, H-3], radius=20, outline=C_BLUE_DIM, width=2)
-        draw.rounded_rectangle([5, 5, W-6, H-6], radius=18, outline=C_ACCENT_LINE, width=1)
+        C_BG_TOP   = (3,  6,  22)
+        C_BG_MID   = (10, 10, 36)
+        C_BG_BOT   = (28, 14, 50)
+        C_HEADER   = (8,  16, 40)
+        C_CARD     = (14, 22, 48)
+        C_CARD_ALT = (10, 18, 40)
+        C_BORDER   = (28, 56, 110)
+        C_WHITE    = (235, 240, 255)
+        C_MUTED    = (130, 145, 180)
+        C_BLUE     = (90, 200, 255)
+        C_BLUE_DIM = (35, 110, 200)
+        C_GOLD     = (255, 200, 80)
+        C_GOLD_DIM = (170, 130, 30)
+        C_GREEN    = (80, 235, 140)
+        C_RED      = (255, 90, 100)
+        C_PURPLE   = (180, 110, 255)
+        C_GRAY     = (120, 130, 160)
+        C_CIRCUIT  = (40, 70, 130)
 
         # ── FONTS ────────────────────────────────────────────────
         def _tf(size):
-            try: return ImageFont.truetype(DASHBOARD_FONT_PATH, size)
-            except: return ImageFont.load_default()
+            try:
+                return ImageFont.truetype(DASHBOARD_FONT_PATH, size)
+            except Exception:
+                return ImageFont.load_default()
 
-        fH1 = _tf(26)   # heading 1
-        fH2 = _tf(20)   # heading 2
-        fH3 = _tf(15)   # heading 3
-        fBody = _tf(13)  # body
-        fSmall = _tf(11) # small
-        fTiny = _tf(9)   # tiny
-        fBig = _tf(36)   # big value
-        fMed = _tf(22)   # medium value
-        fTag = _tf(17)   # tag/badge
+        fHero  = _tf(36)
+        fSub   = _tf(13)
+        fName  = _tf(46)
+        fH3    = _tf(20)
+        fBody  = _tf(16)
+        fSmall = _tf(13)
+        fTiny  = _tf(11)
+        fTile  = _tf(28)
+        fTileLb= _tf(12)
+        fLevel = _tf(18)
+        fRank  = _tf(20)
 
-        # ── HEADER BAR ───────────────────────────────────────────
-        # Gradient header (top 58px)
-        for yy in range(58):
-            t = yy / 58
-            hb = int(6 + t * 4)
-            draw.line([(0, yy), (W, yy)], fill=(hb, hb+2, hb+14))
-        # Gold accent bar at bottom of header
-        for yy in range(58, 61):
-            alpha = int(220 * (1 - (yy-58)/3))
-            draw.line([(0, yy), (W, yy)], fill=C_GOLD)
+        # ── BACKGROUND: navy → faint purple gradient ─────────────
+        for yy in range(H):
+            t = yy / H
+            if t < 0.55:
+                u = t / 0.55
+                r = int(C_BG_TOP[0] + u * (C_BG_MID[0] - C_BG_TOP[0]))
+                g = int(C_BG_TOP[1] + u * (C_BG_MID[1] - C_BG_TOP[1]))
+                b = int(C_BG_TOP[2] + u * (C_BG_MID[2] - C_BG_TOP[2]))
+            else:
+                u = (t - 0.55) / 0.45
+                r = int(C_BG_MID[0] + u * (C_BG_BOT[0] - C_BG_MID[0]))
+                g = int(C_BG_MID[1] + u * (C_BG_BOT[1] - C_BG_MID[1]))
+                b = int(C_BG_MID[2] + u * (C_BG_BOT[2] - C_BG_MID[2]))
+            draw.line([(0, yy), (W, yy)], fill=(r, g, b))
 
-        # Bot username — centered, gold
-        bot_label = f"@{text_data['bot_username']}"
-        bw = draw.textlength(bot_label, font=fH2)
-        draw.text(((W-bw)/2, 8), bot_label, fill=C_GOLD, font=fH2)
+        # Decorative circuit-board lines on left edge + bottom.
+        _rng = random.Random(42)
+        # Bottom right grid (perspective lines).
+        for i in range(20):
+            yline = H - 280 + i * 14
+            draw.line([(W // 2 - i * 22, yline), (W - 30, yline)],
+                      fill=(40, 50, 100), width=1)
+        for i in range(18):
+            x0 = int(W / 2 + i * (W / 2 - 30) / 18)
+            draw.line([(x0, H - 280), (x0 + i * 18, H - 30)],
+                      fill=(40, 50, 100), width=1)
+        # Left edge circuit lines.
+        for _ in range(24):
+            x0 = _rng.randint(8, 90)
+            y0 = _rng.randint(280, H - 200)
+            seg = _rng.randint(50, 130)
+            draw.line([(x0, y0), (x0 + seg, y0)], fill=C_CIRCUIT, width=1)
+            draw.line([(x0 + seg, y0), (x0 + seg, y0 + 18)], fill=C_CIRCUIT, width=1)
+            draw.ellipse([x0 + seg - 3, y0 + 16, x0 + seg + 3, y0 + 22], fill=C_BLUE_DIM)
+        # Right edge circuit lines.
+        for _ in range(16):
+            x0 = _rng.randint(W - 130, W - 30)
+            y0 = _rng.randint(80, 230)
+            seg = _rng.randint(40, 90)
+            draw.line([(x0, y0), (x0 - seg, y0)], fill=C_CIRCUIT, width=1)
+            draw.line([(x0 - seg, y0), (x0 - seg, y0 + 14)], fill=C_CIRCUIT, width=1)
+            draw.ellipse([x0 - seg - 3, y0 + 12, x0 - seg + 3, y0 + 18], fill=C_BLUE_DIM)
+        # Faint star sparkle.
+        for _ in range(80):
+            sx, sy = _rng.randint(0, W), _rng.randint(0, H)
+            br = _rng.randint(40, 130)
+            draw.ellipse([sx - 1, sy - 1, sx + 1, sy + 1], fill=(br, br, br + 20))
+
+        # ── HEADER STRIP ─────────────────────────────────────────
+        draw.rectangle([0, 0, W, 90], fill=C_HEADER)
+        # Bot username centered.
+        bot_lbl = f"@{text_data['bot_username']}"
+        bw = draw.textlength(bot_lbl, font=fHero)
+        draw.text(((W - bw) / 2, 12), bot_lbl, fill=C_WHITE, font=fHero)
+        # Subtitle.
         sub = "TELEGRAM CASINO  •  PLAYER STATS"
-        sw = draw.textlength(sub, font=fTiny)
-        draw.text(((W-sw)/2, 34), sub, fill=C_MUTED, font=fTiny)
-        # Top-right: @bot_username (small) + "Since DD MMM YYYY"
-        rt_bot = f"@{text_data['bot_username']}"
-        rt_w = draw.textlength(rt_bot, font=fSmall)
-        draw.text((W-rt_w-16, 14), rt_bot, fill=C_GOLD, font=fSmall)
+        sw = draw.textlength(sub, font=fSub)
+        draw.text(((W - sw) / 2, 58), sub, fill=C_MUTED, font=fSub)
+        # Top-right.
+        rt_lbl = f"@{text_data['bot_username']}"
+        rw = draw.textlength(rt_lbl, font=fSmall)
+        draw.text((W - rw - 22, 18), rt_lbl, fill=C_BLUE, font=fSmall)
         ms = f"Since {text_data['member_since']}"
         msw = draw.textlength(ms, font=fTiny)
-        draw.text((W-msw-16, 38), ms, fill=C_MUTED, font=fTiny)
+        draw.text((W - msw - 22, 44), ms, fill=C_MUTED, font=fTiny)
+        # Hairline under header.
+        draw.line([(0, 92), (W, 92)], fill=C_GOLD_DIM, width=1)
 
-        y = 72  # cursor after header
+        # ── WIREFRAME HEAD AVATAR (top-left) ─────────────────────
+        head_cx, head_cy = 110, 165
+        head_rx, head_ry = 80, 100
+        head_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        head_draw = ImageDraw.Draw(head_layer)
+        # Outline ellipse + inner mesh.
+        head_draw.ellipse(
+            [head_cx - head_rx, head_cy - head_ry, head_cx + head_rx, head_cy + head_ry],
+            outline=(70, 200, 255, 200), width=2,
+        )
+        # Vertical mesh lines.
+        for ang in range(-80, 81, 14):
+            rad = math.radians(ang)
+            x = head_cx + math.sin(rad) * head_rx
+            head_draw.line(
+                [(int(x), head_cy - head_ry), (int(x), head_cy + head_ry)],
+                fill=(60, 170, 230, 110), width=1,
+            )
+        # Horizontal arcs (as lines for simplicity).
+        for ang in range(-70, 71, 14):
+            rad = math.radians(ang)
+            yy = head_cy + math.sin(rad) * head_ry
+            head_draw.line(
+                [(head_cx - head_rx, int(yy)), (head_cx + head_rx, int(yy))],
+                fill=(60, 170, 230, 90), width=1,
+            )
+        # A small bright "third-eye" dot.
+        head_draw.ellipse(
+            [head_cx - 3, head_cy - 6, head_cx + 3, head_cy], fill=(180, 230, 255, 255),
+        )
+        head_layer = head_layer.filter(ImageFilter.GaussianBlur(radius=0.6))
+        img.alpha_composite(head_layer)
 
-        # ── PROFILE CARD ─────────────────────────────────────────
-        PC_H = 96
-        draw.rounded_rectangle([14, y, W-14, y+PC_H], radius=14, fill=C_CARD, outline=C_BORDER, width=1)
-        # Left gold accent strip
-        draw.rounded_rectangle([14, y, 20, y+PC_H], radius=4, fill=C_GOLD)
+        # ── NAME CARD (centre, glass blue glow) ──────────────────
+        NC_X0 = 220
+        NC_X1 = W - 250
+        NC_Y0 = 110
+        NC_Y1 = 226
+        # Outer glow.
+        glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow_layer)
+        gd.rounded_rectangle([NC_X0 - 6, NC_Y0 - 6, NC_X1 + 6, NC_Y1 + 6],
+                             radius=22, outline=(70, 200, 255, 110), width=4)
+        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=4))
+        img.alpha_composite(glow_layer)
+        # Card.
+        draw.rounded_rectangle([NC_X0, NC_Y0, NC_X1, NC_Y1], radius=18,
+                               fill=(10, 22, 50), outline=C_BLUE, width=2)
+        # First name.
+        name_str = (text_data.get("first_name", "Player") or "Player")[:18] + ".."
+        if len(text_data.get("first_name") or "") <= 16:
+            name_str = (text_data.get("first_name") or "Player")[:18]
+        draw.text((NC_X0 + 30, NC_Y0 + 14), name_str, fill=C_WHITE, font=fName)
+        # Username + ID.
+        uname = text_data.get("username", "")
+        draw.text((NC_X0 + 32, NC_Y0 + 70), uname, fill=C_MUTED, font=fSmall)
+        uid_str = f"ID: {text_data.get('user_id', '')}"
+        draw.text((NC_X0 + 32, NC_Y0 + 90), uid_str, fill=(85, 100, 140), font=fTiny)
 
-        # Avatar
-        AV = 68
-        ax, ay = 50, y + (PC_H - AV) // 2
-        # Avatar glow ring
-        draw.ellipse([ax-4, ay-4, ax+AV+3, ay+AV+3], outline=C_GOLD, width=2)
+        # ── RANK / LEVEL CARD (right of name card) ───────────────
+        RC_X0 = W - 230
+        RC_X1 = W - 28
+        RC_Y0 = 110
+        RC_Y1 = 226
+        draw.rounded_rectangle([RC_X0, RC_Y0, RC_X1, RC_Y1], radius=18,
+                               fill=(20, 14, 38), outline=C_PURPLE, width=2)
+        # Rank pill (top-left of card).
+        rk_pill_w, rk_pill_h = 60, 30
+        rkx0 = RC_X0 + 18
+        rky0 = RC_Y0 + 18
+        draw.rounded_rectangle([rkx0, rky0, rkx0 + rk_pill_w, rky0 + rk_pill_h],
+                               radius=12, fill=(48, 28, 14), outline=C_GOLD, width=2)
+        rk_str = text_data.get("rank", "#---")
+        rkw = draw.textlength(rk_str, font=fRank)
+        draw.text((rkx0 + (rk_pill_w - rkw) / 2, rky0 + 4), rk_str, fill=C_GOLD, font=fRank)
+        # Avatar (top-right of card).
+        av_r = 22
+        av_cx = RC_X1 - 30
+        av_cy = rky0 + rk_pill_h // 2
         if profile_pic_data and isinstance(profile_pic_data, Image.Image):
             try:
-                pic = profile_pic_data.convert("RGBA").resize((AV, AV), Image.Resampling.LANCZOS)
-                mask = Image.new("L", (AV, AV), 0)
-                ImageDraw.Draw(mask).ellipse([0, 0, AV-1, AV-1], fill=255)
-                circ = Image.new("RGBA", (AV, AV), (0,0,0,0))
-                circ.paste(pic, (0,0), mask)
-                img.paste(circ, (ax, ay), circ)
-            except:
-                draw.ellipse([ax, ay, ax+AV, ay+AV], fill=C_CARD_ALT, outline=C_BLUE, width=2)
+                sz = av_r * 2
+                src = profile_pic_data.convert("RGBA").resize((sz, sz), Image.Resampling.LANCZOS)
+                mask = Image.new("L", (sz, sz), 0)
+                ImageDraw.Draw(mask).ellipse([0, 0, sz - 1, sz - 1], fill=255)
+                img.paste(src, (av_cx - av_r, av_cy - av_r), mask)
+                draw.ellipse([av_cx - av_r, av_cy - av_r, av_cx + av_r, av_cy + av_r],
+                             outline=C_PURPLE, width=2)
+            except Exception:
+                draw.ellipse([av_cx - av_r, av_cy - av_r, av_cx + av_r, av_cy + av_r],
+                             fill=(40, 24, 60), outline=C_PURPLE, width=2)
         else:
-            draw.ellipse([ax, ay, ax+AV, ay+AV], fill=C_CARD_ALT, outline=C_BLUE, width=2)
-            init = text_data["first_name"][:1].upper()
-            iw = draw.textlength(init, font=fH1)
-            draw.text((ax + (AV-iw)//2, ay + (AV-28)//2), init, fill=C_BLUE, font=fH1)
+            draw.ellipse([av_cx - av_r, av_cy - av_r, av_cx + av_r, av_cy + av_r],
+                         fill=(40, 24, 60), outline=C_PURPLE, width=2)
+        # Level pill (centered below).
+        lvl_str = text_data.get("level", "Bronze I")
+        lvw = draw.textlength(lvl_str, font=fLevel)
+        lpw = max(int(lvw + 36), 130)
+        lph = 38
+        lpx = RC_X0 + (RC_X1 - RC_X0 - lpw) // 2
+        lpy = RC_Y0 + 64
+        draw.rounded_rectangle([lpx, lpy, lpx + lpw, lpy + lph], radius=14,
+                               fill=(40, 18, 60), outline=C_PURPLE, width=2)
+        draw.text((lpx + (lpw - lvw) / 2, lpy + 8), lvl_str, fill=C_PURPLE, font=fLevel)
 
-        # Name + username
-        nx = ax + AV + 18
-        draw.text((nx, y+12), text_data["first_name"], fill=C_WHITE, font=fH1)
-        draw.text((nx, y+44), text_data["username"], fill=C_MUTED, font=fBody)
-        uid_text = f"ID: {text_data['user_id']}"
-        draw.text((nx, y+62), uid_text, fill=(70, 90, 130), font=fSmall)
+        # ── 4×2 STAT TILE GRID ───────────────────────────────────
+        TILE_Y0 = 250
+        TILE_GAP = 14
+        TILE_W = (W - 28 - TILE_GAP * 3) // 4
+        TILE_H = 96
 
-        # Rank badge — top right of profile card
-        rk = text_data["rank"]
-        rkw = draw.textlength(rk, font=fMed)
-        rbx = W - 130
-        rby = y + 10
-        draw.rounded_rectangle([rbx-8, rby-4, rbx+rkw+20, rby+34], radius=10, fill=(30,22,5), outline=C_GOLD, width=2)
-        draw.text((rbx+6, rby), rk, fill=C_GOLD, font=fMed)
+        def _draw_tile(col, row, value, label, border_color, value_color, icon_glyph=None):
+            x0 = 14 + col * (TILE_W + TILE_GAP)
+            y0 = TILE_Y0 + row * (TILE_H + TILE_GAP)
+            x1 = x0 + TILE_W
+            y1 = y0 + TILE_H
+            draw.rounded_rectangle([x0, y0, x1, y1], radius=14,
+                                   fill=(14, 24, 50), outline=border_color, width=2)
+            # Subtle outer glow.
+            gl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            gld = ImageDraw.Draw(gl)
+            gld.rounded_rectangle([x0 - 2, y0 - 2, x1 + 2, y1 + 2],
+                                  radius=16,
+                                  outline=(border_color[0], border_color[1], border_color[2], 80),
+                                  width=2)
+            gl = gl.filter(ImageFilter.GaussianBlur(radius=3))
+            img.alpha_composite(gl)
+            # Icon circle on the left.
+            ic_cx = x0 + 32
+            ic_cy = y0 + TILE_H // 2 - 4
+            draw.ellipse([ic_cx - 18, ic_cy - 18, ic_cx + 18, ic_cy + 18],
+                         fill=(8, 16, 36), outline=border_color, width=2)
+            if icon_glyph:
+                gw = draw.textlength(icon_glyph, font=fH3)
+                draw.text((ic_cx - gw / 2, ic_cy - 12), icon_glyph,
+                          fill=border_color, font=fH3)
+            # Value (centered horizontally in remaining space).
+            val_str = str(value)
+            vw = draw.textlength(val_str, font=fTile)
+            val_cx = (x0 + 60 + x1) // 2
+            draw.text((val_cx - vw / 2, y0 + 18), val_str, fill=value_color, font=fTile)
+            # Label below.
+            lbw = draw.textlength(label, font=fTileLb)
+            draw.text((val_cx - lbw / 2, y0 + 60), label, fill=C_MUTED, font=fTileLb)
 
-        # Level badge — below rank
-        lv = text_data["level"]
-        lvw = draw.textlength(lv, font=fTag)
-        lbx = rbx - 8
-        lby = rby + 42
-        draw.rounded_rectangle([lbx, lby, lbx+lvw+28, lby+26], radius=8, fill=(25,12,45), outline=C_PURPLE, width=1)
-        draw.text((lbx+14, lby+3), lv, fill=C_PURPLE, font=fTag)
+        # Row 1
+        total_pnl = text_data.get("total_pnl", 0.0)
+        pnl_pos = total_pnl >= 0
+        _draw_tile(0, 0, text_data.get("total_games", 0), "GAMES PLAYED",
+                   C_GRAY, C_WHITE, "⌬")
+        _draw_tile(1, 0, f"${text_data.get('total_wagered', 0):,.2f}", "TOTAL WAGERED",
+                   C_BLUE, C_BLUE, "$")
+        _draw_tile(2, 0, f"{text_data.get('win_rate', 0):.1f}%", "WIN RATE",
+                   C_GOLD, C_GOLD, "◷")
+        pnl_str = f"{'+' if pnl_pos else ''}${total_pnl:,.2f}"
+        _draw_tile(3, 0, pnl_str, "NET P&L",
+                   C_GREEN if pnl_pos else C_RED,
+                   C_GREEN if pnl_pos else C_RED, "▣")
+        # Row 2
+        _draw_tile(0, 1, f"${text_data.get('avg_bet', 0):,.2f}", "AVG BET",
+                   C_BLUE, C_BLUE, "✎")
+        biggest = text_data.get("biggest_win", 0.0)
+        _draw_tile(1, 1, f"+${biggest:,.2f}", "BIGGEST WIN",
+                   C_GOLD, C_GOLD, "♛")
+        fav = text_data.get("fav_game", "—") or "—"
+        _draw_tile(2, 1, str(fav)[:14], "FAV GAME",
+                   C_GRAY, C_WHITE, "♦")
+        bonuses = text_data.get("total_bonuses", 0.0) or 0.0
+        _draw_tile(3, 1, f"${bonuses:,.2f}", "BONUSES",
+                   C_PURPLE, C_PURPLE, "🎁")
 
-        y += PC_H + 14
+        # ── GAME BREAKDOWN TABLE ─────────────────────────────────
+        BR_Y0 = TILE_Y0 + 2 * (TILE_H + TILE_GAP) + 22
+        # Section header.
+        section_lbl = "GAME  BREAKDOWN"
+        slw = draw.textlength(section_lbl, font=fSmall)
+        # Hairline + label centered overlay.
+        draw.line([(20, BR_Y0), (W - 20, BR_Y0)], fill=C_BORDER, width=1)
+        # Erase a slot for the label.
+        draw.rectangle([(W - slw) / 2 - 12, BR_Y0 - 9, (W + slw) / 2 + 12, BR_Y0 + 9],
+                       fill=C_BG_MID)
+        draw.text(((W - slw) / 2, BR_Y0 - 8), section_lbl, fill=C_BLUE, font=fSmall)
+        # Table column headers.
+        BR_Y0 += 14
+        col_game = 30
+        col_played = int(W * 0.45)
+        col_wr = int(W * 0.62)
+        col_pnl = W - 40
+        draw.text((col_game, BR_Y0), "GAME", fill=C_MUTED, font=fTiny)
+        draw.text((col_played, BR_Y0), "PLAYED", fill=C_MUTED, font=fTiny)
+        draw.text((col_wr, BR_Y0), "WIN RATE", fill=C_MUTED, font=fTiny)
+        draw.text((col_pnl, BR_Y0), "P&L", fill=C_MUTED, font=fTiny, anchor="ra")
+        BR_Y0 += 18
+        # Rows.
+        rows = (game_list or [])[:6]
+        if not rows:
+            draw.text((col_game, BR_Y0 + 8), "No games played yet",
+                      fill=C_MUTED, font=fSmall)
+            BR_Y0 += 36
+        else:
+            for entry in rows:
+                draw.line([(20, BR_Y0), (W - 20, BR_Y0)], fill=(20, 30, 60), width=1)
+                # Diamond bullet.
+                bx = col_game - 12
+                by = BR_Y0 + 18
+                draw.polygon([(bx, by - 5), (bx + 5, by), (bx, by + 5), (bx - 5, by)],
+                             fill=C_GOLD)
+                # Game name.
+                gname = entry.get("name", "")
+                draw.text((col_game + 2, BR_Y0 + 12), str(gname)[:24],
+                          fill=C_WHITE, font=fBody)
+                # Played count.
+                draw.text((col_played, BR_Y0 + 12), str(entry.get("games", 0)),
+                          fill=C_WHITE, font=fBody)
+                # Win rate (red < 50%, green ≥ 50%).
+                wr = entry.get("wr", 0.0)
+                wr_color = C_GREEN if wr >= 50 else C_RED
+                draw.text((col_wr, BR_Y0 + 12), f"{wr:.1f}%",
+                          fill=wr_color, font=fBody)
+                # P&L right-aligned.
+                pnl = entry.get("pnl", 0.0)
+                pnl_color = C_GREEN if pnl >= 0 else C_RED
+                pnl_str = f"{'+' if pnl >= 0 else '-'}${abs(pnl):,.2f}"
+                draw.text((col_pnl, BR_Y0 + 12), pnl_str,
+                          fill=pnl_color, font=fBody, anchor="ra")
+                BR_Y0 += 36
+            draw.line([(20, BR_Y0), (W - 20, BR_Y0)], fill=(20, 30, 60), width=1)
 
-        # ── STAT CARDS (2 rows × 4) ──────────────────────────────
-        pnl_val = text_data["total_pnl"]
-        pnl_pos = pnl_val >= 0
-        pnl_color = C_GREEN if pnl_pos else C_RED
-        pnl_sign = "+" if pnl_pos else ""
-        pnl_bg = (4, 28, 16) if pnl_pos else (28, 6, 8)
-
-        stat_cards = [
-            # (value, label, value_color, border_color, card_fill)
-            (str(text_data["total_games"]),                 "GAMES PLAYED",  C_WHITE,   C_BORDER,   C_CARD),
-            (format_compact_usd(text_data["total_wagered"]),"TOTAL WAGERED", C_BLUE,    C_BLUE_DIM, (8,18,40)),
-            (f'{text_data["win_rate"]:.1f}%',               "WIN RATE",      C_GOLD,    C_GOLD_DIM, (22,18,4)),
-            (f'{pnl_sign}{format_compact_usd(pnl_val)}',   "NET P&L",       pnl_color, pnl_color,  pnl_bg),
-            (format_compact_usd(text_data["avg_bet"]),      "AVG BET",       C_BLUE,    C_BLUE_DIM, C_CARD),
-            (f'+{format_compact_usd(text_data["biggest_win"])}', "BIGGEST WIN", C_GOLD, C_GOLD_DIM, (22,18,4)),
-            (get_display_name(text_data["fav_game"])[:14],  "FAV GAME",      C_WHITE,   C_BORDER,   C_CARD),
-            (format_compact_usd(text_data["total_bonuses"]),"BONUSES",       C_PURPLE,  C_PURPLE,   (18,8,35)),
-        ]
-        CW = (W - 28 - 3*10) // 4  # card width
-        CH = 78                      # card height
-        GAP = 10
-
-        for row in range(2):
-            for col in range(4):
-                idx = row*4 + col
-                val, lbl, vcol, bcol, cfill = stat_cards[idx]
-                cx = 14 + col*(CW+GAP)
-                cy = y + row*(CH+GAP)
-                # Card body
-                draw.rounded_rectangle([cx, cy, cx+CW, cy+CH], radius=12, fill=cfill, outline=bcol, width=1)
-                # Top accent line
-                draw.rounded_rectangle([cx+1, cy+1, cx+CW-1, cy+5], radius=3, fill=bcol)
-                # Value
-                vw = draw.textlength(val, font=fH2)
-                if vw > CW - 16:
-                    val_f = fBody
-                    vw = draw.textlength(val, font=fBody)
-                else:
-                    val_f = fH2
-                draw.text((cx + (CW-vw)//2, cy+14), val, fill=vcol, font=val_f)
-                # Label
-                lw = draw.textlength(lbl, font=fTiny)
-                draw.text((cx + (CW-lw)//2, cy+54), lbl, fill=C_MUTED, font=fTiny)
-
-        y += 2*(CH+GAP) + 6
-
-        # ── SECTION DIVIDER ──────────────────────────────────────
-        def section_header(title, yy):
-            tw = draw.textlength(title, font=fSmall)
-            draw.line([(14, yy+7), ((W-tw)//2 - 10, yy+7)], fill=C_ACCENT_LINE, width=1)
-            draw.text(((W-tw)//2, yy), title, fill=C_BLUE, font=fSmall)
-            draw.line([((W+tw)//2 + 10, yy+7), (W-14, yy+7)], fill=C_ACCENT_LINE, width=1)
-            return yy + 22
-
-        y = section_header("GAME  BREAKDOWN", y)
-
-        # Column headers
-        draw.text((24, y), "GAME", fill=C_MUTED, font=fTiny)
-        draw.text((320, y), "PLAYED", fill=C_MUTED, font=fTiny)
-        draw.text((450, y), "WIN RATE", fill=C_MUTED, font=fTiny)
-        draw.text((W-20, y), "P&L", fill=C_MUTED, font=fTiny, anchor="ra")
-        y += 16
-        draw.line([(14, y), (W-14, y)], fill=C_BORDER, width=1)
-        y += 6
-
-        GL = game_list[:7]
-        for i, g in enumerate(GL):
-            gname = g["name"][:22]
-            ggames = g["games"]
-            gwr = g["wr"]
-            gpnl = g["pnl"]
-            gpnl_pos = g["pnl_positive"]
-            gpnl_color = C_GREEN if gpnl_pos else C_RED
-
-            RH = 30
-            bg = C_CARD if i % 2 == 0 else C_CARD_ALT
-            draw.rounded_rectangle([14, y, W-14, y+RH], radius=7, fill=bg)
-            # Left accent dot for top game
-            if i == 0:
-                draw.ellipse([17, y+11, 21, y+19], fill=C_GOLD)
-            draw.text((28, y+7), gname, fill=C_WHITE if i==0 else (200,210,230), font=fBody)
-            draw.text((320, y+8), f"{ggames:,}", fill=C_MUTED, font=fSmall)
-            wr_color = C_GREEN if gwr >= 50 else C_RED
-            draw.text((450, y+8), f"{gwr:.1f}%", fill=wr_color, font=fSmall)
-            pnl_str = f"+{format_compact_usd(gpnl)}" if gpnl_pos else format_compact_usd(gpnl)
-            draw.text((W-20, y+8), pnl_str, fill=gpnl_color, font=fSmall, anchor="ra")
-            y += RH + 4
-
-        # ── FOOTER ───────────────────────────────────────────────
-        y = H - 34
-        draw.line([(14, y), (W-14, y)], fill=C_BORDER, width=1)
-        footer = "Play Responsibly  •  Gamble with Control"
-        fw = draw.textlength(footer, font=fTiny)
-        draw.text(((W-fw)//2, y+8), footer, fill=(60, 75, 100), font=fTiny)
-        # Bot watermark right
+        # ── FOOTER ──────────────────────────────────────────────
+        ftr_y = H - 30
+        draw.line([(0, ftr_y - 14), (W, ftr_y - 14)], fill=C_BORDER, width=1)
+        ftr = "Play Responsibly  •  Gamble with Control"
+        fw = draw.textlength(ftr, font=fSmall)
+        draw.text(((W - fw) / 2, ftr_y - 8), ftr, fill=C_MUTED, font=fSmall)
+        # Diamond + bot username right.
         wm = f"@{text_data['bot_username']}"
-        wmw = draw.textlength(wm, font=fTiny)
-        draw.text((W-wmw-14, y+8), wm, fill=C_GOLD_DIM, font=fTiny)
+        wmw = draw.textlength(wm, font=fSmall)
+        draw.text((W - wmw - 30, ftr_y - 8), wm, fill=C_BLUE, font=fSmall)
+        dx, dy = W - 22, ftr_y - 4
+        draw.polygon([(dx, dy - 8), (dx + 8, dy), (dx, dy + 8), (dx - 8, dy)],
+                     fill=C_BLUE)
 
-        # ── SAVE ─────────────────────────────────────────────────
+        # ── SAVE ────────────────────────────────────────────────
         buf = BytesIO()
         img = img.convert("RGB")
-        img.save(buf, format='PNG', optimize=True)
+        img.save(buf, format="PNG", optimize=True)
         buf.seek(0)
         return buf
     except Exception as e:
         logging.error(f"Error rendering stats image: {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return None
 
-
-# ============================================================
-# LEADERBOARD TEMPLATE - 1:1 copy of example design
-# ============================================================
 async def generate_leaderboard_image(context, period='all_time', viewing_user_id=None):
     """Generate leaderboard template image with user's actual rank."""
     try:
