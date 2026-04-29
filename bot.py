@@ -1499,6 +1499,11 @@ _PROFILE_PIC_CACHE_TTL = 300        # 5 minutes
 _bot_username_cache: str = None
 _bot_info_cache = None
 
+# Recent limbo plays per chat: chat_id -> list[(user_id, display_name)],
+# newest first, max 3. Used to populate the player rail in the limbo PIL.
+_recent_limbo_players: dict = {}
+_RECENT_LIMBO_MAX = 3
+
 # Shared HTTP client for price updates
 _shared_http_client: httpx.AsyncClient = None
 
@@ -15195,196 +15200,364 @@ def generate_limbo_image(
     game_id: str = None,
     currency: str = "USDT",
     player_profile_pic = None,  # PIL Image or None
+    recent_players=None,  # list[{"name": str, "pic": PIL.Image|None}]
 ) -> BytesIO:
+    """Render the Limbo result image — retro perspective grid + neon green glow.
+
+    Mirrors ``example_designs/limbo_pil_image_template_design.png``.
+    Layout:
+      - Wide canvas, dark navy gradient with a retro vanishing-point grid
+        floor + side perspective rails (purple/magenta).
+      - Wireframe-mesh head avatar in the top-left.
+      - Top-right: '@bot_username' large + '@player_username' small.
+      - Two columns near the top:
+          • TARGET (blue label) + a thin gold-bordered pill with the
+            target multiplier and the game ID below it.
+          • OUTCOME (green/red label) + the outcome multiplier (no pill)
+            and the game ID below it.
+      - Center: massive radial green/red glow with the outcome
+        multiplier (e.g. ``3.00x``) huge in the middle.
+      - Below the glow: a rounded green/red-bordered card with
+        ``YOU WIN!`` / ``YOU LOSE`` + ``+/-$amount`` + ``Payout: $X``.
+      - Recent-players rail: a rounded gray-bordered card listing up
+        to three (avatar + display name) pairs from this chat's
+        recent limbo plays.
+      - Bottom info bar: ``Bet: $X CCY`` left, mountain glyph + ``LIMBO``
+        center, ``@bot_username`` right.
+      - Footer hairline ``Play Responsibly • Telegram Casino • limbo``.
+
+    ``recent_players`` is an optional list of dicts with keys
+    ``{"name": str, "pic": PIL.Image|None}`` describing the most recent
+    limbo plays in the same chat (max 3). When ``None``, the rail just
+    shows the current player.
     """
-    Render a 800x600 Limbo game result image with neon bluish-black theme.
-    
-    Shows:
-    - Target multiplier (top center)
-    - Outcome multiplier (center, large)
-    - Win/Loss result
-    - Player username + bet amount (bottom left)
-    - Bot username watermark (bottom right)
-    - Game ID (subtle)
-    
-    Returns a BytesIO PNG buffer.
-    """
-    W, H = 800, 600
-    img = Image.new("RGB", (W, H), LIMBO_BG_COLOR)
+    from PIL import ImageFilter as _ImgFilter
+
+    W, H = 1062, 980
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    
-    # Background gradient effect (subtle radial glow)
-    center_x, center_y = W // 2, H // 2 - 40
-    for radius in range(200, 0, -10):
-        alpha = int(15 * (radius / 200))
-        glow_color = (8 + alpha, 12 + alpha // 2, 28 + alpha)
-        draw.ellipse(
-            [center_x - radius, center_y - radius, center_x + radius, center_y + radius],
-            fill=glow_color
-        )
-    
-    # Grid lines (subtle)
-    for gx in range(0, W, 50):
-        draw.line([(gx, 0), (gx, H)], fill=(20, 35, 70, 40), width=1)
-    for gy in range(0, H, 50):
-        draw.line([(0, gy), (W, gy)], fill=(20, 35, 70, 40), width=1)
-    
-    # Top decorative line
-    draw.line([(40, 70), (W - 40, 70)], fill=LIMBO_ACCENT, width=2)
 
-    # Player profile pic (top-left, circle, like the example template).
-    pp_size = 56
-    pp_x, pp_y = 18, 12
-    draw.ellipse(
-        [pp_x, pp_y, pp_x + pp_size, pp_y + pp_size],
-        fill=(15, 25, 55), outline=LIMBO_ACCENT, width=2,
-    )
-    if player_profile_pic is not None:
-        try:
-            pp_resized = player_profile_pic.resize((pp_size - 4, pp_size - 4), Image.LANCZOS)
-            mask = Image.new("L", (pp_size - 4, pp_size - 4), 0)
-            ImageDraw.Draw(mask).ellipse([0, 0, pp_size - 4, pp_size - 4], fill=255)
-            img_rgba = img.convert("RGBA")
-            pp_rgba = pp_resized.convert("RGBA")
-            pp_rgba.putalpha(mask)
-            img_rgba.paste(pp_rgba, (pp_x + 2, pp_y + 2), pp_rgba)
-            img = img_rgba.convert("RGB")
-            draw = ImageDraw.Draw(img)
-        except Exception:
-            pass
+    # ── PALETTE ─────────────────────────────────────────────
+    BG_TOP = (4, 8, 28)
+    BG_BOT = (10, 8, 36)
+    GRID_COLOR = (40, 30, 100)
+    GRID_HOT = (140, 60, 200)
+    HEAD_COLOR = (140, 200, 240)
+    GREEN = (90, 240, 130)
+    GREEN_DIM = (40, 130, 70)
+    RED = (255, 70, 80)
+    GOLD = LIMBO_GOLD
+    WHITE = LIMBO_TEXT_WHITE
+    DIM = LIMBO_TEXT_DIM
+    BLUE = (90, 200, 255)
 
-    # Title: LIMBO (next to profile pic, left side)
-    font_title = _limbo_get_font(28)
-    title_text = "LIMBO"
-    draw.text((pp_x + pp_size + 12, 22), title_text, font=font_title, fill=LIMBO_ACCENT)
+    # ── BACKGROUND ──────────────────────────────────────────
+    for yy in range(H):
+        t = yy / H
+        r = int(BG_TOP[0] + t * (BG_BOT[0] - BG_TOP[0]))
+        g = int(BG_TOP[1] + t * (BG_BOT[1] - BG_TOP[1]))
+        b = int(BG_TOP[2] + t * (BG_BOT[2] - BG_TOP[2]))
+        draw.line([(0, yy), (W, yy)], fill=(r, g, b))
 
-    # Top-right: @bot_username + Telegram Casino subtitle
-    font_wm_top = _limbo_get_font(15)
-    font_wm_sub = _limbo_get_font(11)
-    wm_top = f"@{bot_username}" if not bot_username.startswith("@") else bot_username
-    wmt_w = draw.textlength(wm_top, font=font_wm_top)
-    draw.text((W - wmt_w - 18, 14), wm_top, font=font_wm_top, fill=LIMBO_GOLD)
-    sub_brand = "Telegram Casino"
-    sub_w = draw.textlength(sub_brand, font=font_wm_sub)
-    draw.text((W - sub_w - 18, 34), sub_brand, font=font_wm_sub, fill=LIMBO_TEXT_DIM)
+    # ── PERSPECTIVE GRID FLOOR ─────────────────────────────
+    horizon_y = int(H * 0.30)
+    vp_x = W // 2
+    floor_top = horizon_y + 40
+    floor_bot = H - 40
+    # Vertical rails fanning out from the vanishing point.
+    n_rails = 14
+    for i in range(-n_rails, n_rails + 1):
+        if i == 0:
+            continue
+        end_x = vp_x + i * (W // n_rails)
+        col = GRID_HOT if abs(i) <= 2 else GRID_COLOR
+        draw.line([(vp_x, horizon_y + 30), (end_x, floor_bot)],
+                  fill=col, width=1)
+    # Horizontal grid lines (perspective).
+    n_horiz = 22
+    for i in range(1, n_horiz + 1):
+        # exponential perspective y so lines bunch up near horizon.
+        u = i / n_horiz
+        ly = int(floor_top + (floor_bot - floor_top) * (u ** 1.6))
+        # x-extent grows with distance from horizon.
+        extent = int((ly - floor_top) / (floor_bot - floor_top + 1) * (W // 2 + 200))
+        x0 = max(0, vp_x - extent - 200)
+        x1 = min(W, vp_x + extent + 200)
+        col = GRID_HOT if i % 6 == 0 else GRID_COLOR
+        draw.line([(x0, ly), (x1, ly)], fill=col, width=1)
 
-    # Game ID (subtle, below the top decorative line)
-    font_game_id = _limbo_get_font(11)
-    if game_id:
-        gid_text = f"ID: {game_id}"
-        gid_w = draw.textlength(gid_text, font=font_game_id)
-        draw.text((W - gid_w - 18, 76), gid_text, font=font_game_id, fill=LIMBO_TEXT_DIM)
+    # Side wall lines (rough trapezoidal perspective).
+    for off in range(0, 14):
+        # left wall
+        x_top = 40 + off * 12
+        y_top = horizon_y + 20 + off * 6
+        x_bot = 0 - off * 30
+        y_bot = floor_bot
+        draw.line([(x_top, y_top), (x_bot, y_bot)], fill=GRID_COLOR, width=1)
+        # right wall
+        x_top_r = W - 40 - off * 12
+        x_bot_r = W + off * 30
+        draw.line([(x_top_r, y_top), (x_bot_r, y_bot)], fill=GRID_COLOR, width=1)
 
-    # Player username under the LIMBO title (if provided)
+    # Sparkles.
+    rng = random.Random(123)
+    for _ in range(80):
+        sx, sy = rng.randint(0, W), rng.randint(0, H)
+        br = rng.randint(40, 140)
+        draw.ellipse([sx - 1, sy - 1, sx + 1, sy + 1], fill=(br, br, br + 25))
+
+    # ── WIREFRAME HEAD (top-left) ──────────────────────────
+    head_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    head_draw = ImageDraw.Draw(head_layer)
+    h_cx, h_cy, h_rx, h_ry = 105, 130, 70, 90
+    head_draw.ellipse([h_cx - h_rx, h_cy - h_ry, h_cx + h_rx, h_cy + h_ry],
+                      outline=HEAD_COLOR + (220,), width=2)
+    for ang in range(-80, 81, 14):
+        rad = math.radians(ang)
+        x = h_cx + math.sin(rad) * h_rx
+        head_draw.line([(int(x), h_cy - h_ry), (int(x), h_cy + h_ry)],
+                       fill=HEAD_COLOR + (110,), width=1)
+    for ang in range(-70, 71, 14):
+        rad = math.radians(ang)
+        yy = h_cy + math.sin(rad) * h_ry
+        head_draw.line([(h_cx - h_rx, int(yy)), (h_cx + h_rx, int(yy))],
+                       fill=HEAD_COLOR + (90,), width=1)
+    head_draw.ellipse([h_cx - 3, h_cy - 4, h_cx + 3, h_cy + 2],
+                      fill=(220, 240, 255, 255))
+    head_layer = head_layer.filter(_ImgFilter.GaussianBlur(radius=0.5))
+    img.alpha_composite(head_layer)
+
+    # ── TOP-RIGHT: bot username + player username ──────────
+    f_bot = _limbo_get_font(28)
+    f_user = _limbo_get_font(20)
+    wm_text = f"@{bot_username}" if not bot_username.startswith("@") else bot_username
+    wmw = draw.textlength(wm_text, font=f_bot)
+    draw.text((W - wmw - 30, 28), wm_text, font=f_bot, fill=BLUE)
     if player_username:
-        font_pu = _limbo_get_font(12)
-        pu_label = f"@{player_username}" if not player_username.startswith("@") else player_username
-        draw.text((pp_x + pp_size + 12, 56), pu_label, font=font_pu, fill=LIMBO_TEXT_DIM)
-    
-    # Fonts
-    font_label = _limbo_get_font(20)
-    font_target = _limbo_get_font(56)
-    font_outcome = _limbo_get_font(72)
-    font_result = _limbo_get_font(36)
-    font_info = _limbo_get_font(18)
-    font_small = _limbo_get_font(14)
-    font_wm = _limbo_get_font(13)
-    
-    # TARGET section (top center)
-    target_label = "TARGET"
-    target_label_w = draw.textlength(target_label, font=font_label)
-    draw.text(((W - target_label_w) // 2, 80), target_label, font=font_label, fill=LIMBO_TEXT_DIM)
-    
-    target_str = f"{target_multiplier:.2f}x"
-    target_w = draw.textlength(target_str, font=font_target)
-    draw.text(((W - target_w) // 2, 110), target_str, font=font_target, fill=LIMBO_GOLD)
-    
-    # Divider
-    div_y = 190
-    draw.line([(100, div_y), (W - 100, div_y)], fill=LIMBO_BORDER, width=1)
-    
-    # OUTCOME section (center, large)
-    outcome_label = "OUTCOME"
-    outcome_label_w = draw.textlength(outcome_label, font=font_label)
-    draw.text(((W - outcome_label_w) // 2, 210), outcome_label, font=font_label, fill=LIMBO_TEXT_DIM)
-    
-    outcome_str = f"{outcome:.2f}x"
-    outcome_w = draw.textlength(outcome_str, font=font_outcome)
-    outcome_color = LIMBO_GREEN if win else LIMBO_LOSE
-    draw.text(((W - outcome_w) // 2, 250), outcome_str, font=font_outcome, fill=outcome_color)
-    
-    # RESULT box (below outcome)
-    result_y = 350
-    box_h = 80
-    box_w = 400
-    box_x = (W - box_w) // 2
-    
-    # Background box
-    box_color = LIMBO_WIN if win else LIMBO_LOSE
-    # Draw box with rounded corners effect
-    draw.rounded_rectangle(
-        [box_x, result_y, box_x + box_w, result_y + box_h],
-        radius=12,
-        fill=(box_color[0] // 5, box_color[1] // 5, box_color[2] // 5),
-        outline=box_color,
-        width=2
-    )
-    
-    result_text = "YOU WIN!" if win else "YOU LOSE"
-    result_w = draw.textlength(result_text, font=font_result)
-    draw.text(((W - result_w) // 2, result_y + 8), result_text, font=font_result, fill=box_color)
-    
-    # Profit/Loss amount
-    if win:
-        amount_text = f"+${profit:.2f}"
-        amount_color = LIMBO_GREEN
-    else:
-        amount_text = f"-${bet_amount:.2f}"
-        amount_color = LIMBO_LOSE
-    
-    amount_w = draw.textlength(amount_text, font=font_info)
-    draw.text(((W - amount_w) // 2, result_y + 50), amount_text, font=font_info, fill=amount_color)
-    
-    # PAYOUT info (if win)
-    if win:
-        payout = bet_amount * target_multiplier
-        payout_text = f"Payout: ${payout:.2f}"
-        payout_w = draw.textlength(payout_text, font=font_small)
-        draw.text(((W - payout_w) // 2, result_y + box_h + 12), payout_text, font=font_small, fill=LIMBO_TEXT_DIM)
-    
-    # Bottom info strip (bet | LIMBO | @bot_username)
-    bar_y = H - 56
-    draw.rounded_rectangle(
-        [14, bar_y, W - 14, bar_y + 30],
-        radius=8,
-        fill=(10, 18, 38),
-        outline=LIMBO_BORDER,
-        width=1,
-    )
-    bet_text = f"Bet: ${bet_amount:.2f} {currency}"
-    draw.text((28, bar_y + 7), bet_text, font=font_info, fill=LIMBO_GOLD)
-    center_lbl = "LIMBO"
-    cw = draw.textlength(center_lbl, font=font_info)
-    draw.text(((W - cw) // 2, bar_y + 7), center_lbl, font=font_info, fill=LIMBO_ACCENT)
-    wm_text = f"@{bot_username}"
-    wm_w = draw.textlength(wm_text, font=font_wm)
-    draw.text((W - wm_w - 28, bar_y + 9), wm_text, font=font_wm, fill=LIMBO_TEXT_WHITE)
+        pu = f"@{player_username}" if not player_username.startswith("@") else player_username
+        puw = draw.textlength(pu, font=f_user)
+        draw.text((W - puw - 30, 70), pu, font=f_user, fill=DIM)
 
-    # Soft footer line
-    footer_text = "Play Responsibly  •  Telegram Casino  •  limbo"
-    fw = draw.textlength(footer_text, font=font_small)
-    draw.text(((W - fw) // 2, H - 22), footer_text, font=font_small, fill=(60, 90, 140))
-    
-    # Side decorative lines
-    draw.line([(20, 80), (20, H - 60)], fill=LIMBO_ACCENT, width=1)
-    draw.line([(W - 20, 80), (W - 20, H - 60)], fill=LIMBO_ACCENT, width=1)
-    
-    # Save to BytesIO
+    # ── TARGET / OUTCOME COLUMNS ───────────────────────────
+    f_lbl = _limbo_get_font(26)
+    f_target_val = _limbo_get_font(40)
+    f_outcome_val = _limbo_get_font(80)
+    f_gid = _limbo_get_font(13)
+
+    target_col_x = W // 2 - 160
+    outcome_col_x = W // 2 + 160
+    col_y = 90
+    # TARGET label.
+    tl = "TARGET"
+    tlw = draw.textlength(tl, font=f_lbl)
+    draw.text((target_col_x - tlw / 2, col_y), tl, font=f_lbl, fill=BLUE)
+    # TARGET pill.
+    tgt_str = f"{target_multiplier:.2f}x"
+    tgw = draw.textlength(tgt_str, font=f_target_val)
+    pill_w = max(int(tgw + 60), 200)
+    pill_h = 56
+    px0 = int(target_col_x - pill_w / 2)
+    py0 = col_y + 36
+    draw.rounded_rectangle([px0, py0, px0 + pill_w, py0 + pill_h],
+                            radius=14, fill=(14, 22, 50),
+                            outline=GOLD, width=2)
+    draw.text((px0 + (pill_w - tgw) / 2, py0 + 4),
+              tgt_str, font=f_target_val, fill=GOLD)
+    # OUTCOME label.
+    ol_color = GREEN if win else RED
+    ol = "OUTCOME"
+    olw = draw.textlength(ol, font=f_lbl)
+    draw.text((outcome_col_x - olw / 2, col_y), ol, font=f_lbl, fill=ol_color)
+    # OUTCOME value (top column, no pill).
+    out_str = f"{outcome:.2f}x"
+    outw = draw.textlength(out_str, font=f_outcome_val)
+    draw.text((outcome_col_x - outw / 2, col_y + 24),
+              out_str, font=f_outcome_val, fill=ol_color)
+    # Game ID below both columns.
+    if game_id:
+        gid_str = str(game_id)
+        gidw = draw.textlength(gid_str, font=f_gid)
+        draw.text((target_col_x - gidw / 2, py0 + pill_h + 10),
+                  gid_str, font=f_gid, fill=DIM)
+        draw.text((outcome_col_x - gidw / 2, py0 + pill_h + 10),
+                  gid_str, font=f_gid, fill=DIM)
+
+    # ── CENTER GLOW + HUGE MULTIPLIER ──────────────────────
+    glow_cx = W // 2
+    glow_cy = int(H * 0.46)
+    glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow_layer)
+    glow_color = GREEN if win else RED
+    # Three layered ellipses with falling alpha.
+    for r, alpha in [(280, 160), (220, 110), (160, 80)]:
+        gd.ellipse(
+            [glow_cx - int(r * 1.15), glow_cy - r,
+             glow_cx + int(r * 1.15), glow_cy + r],
+            fill=(glow_color[0], glow_color[1], glow_color[2], alpha),
+        )
+    glow_layer = glow_layer.filter(_ImgFilter.GaussianBlur(radius=24))
+    img.alpha_composite(glow_layer)
+    draw = ImageDraw.Draw(img)
+    # Huge outcome text in the center of the glow.
+    f_huge = _limbo_get_font(150)
+    big_str = f"{outcome:.2f}x"
+    bsw = draw.textlength(big_str, font=f_huge)
+    # subtle text-glow underlay.
+    text_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    tgd = ImageDraw.Draw(text_glow)
+    tgd.text((glow_cx - bsw / 2, glow_cy - 110), big_str,
+             font=f_huge, fill=(glow_color[0], glow_color[1], glow_color[2], 220))
+    text_glow = text_glow.filter(_ImgFilter.GaussianBlur(radius=8))
+    img.alpha_composite(text_glow)
+    draw = ImageDraw.Draw(img)
+    draw.text((glow_cx - bsw / 2, glow_cy - 110), big_str,
+              font=f_huge, fill=WHITE)
+
+    # ── RESULT CARD (YOU WIN/LOSE) ─────────────────────────
+    rcw = 460
+    rch = 130
+    rcx0 = (W - rcw) // 2
+    rcy0 = glow_cy + 90
+    # outer subtle glow.
+    rg = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    rgd = ImageDraw.Draw(rg)
+    rgd.rounded_rectangle([rcx0 - 8, rcy0 - 8, rcx0 + rcw + 8, rcy0 + rch + 8],
+                          radius=18, outline=(glow_color[0], glow_color[1], glow_color[2], 150), width=4)
+    rg = rg.filter(_ImgFilter.GaussianBlur(radius=6))
+    img.alpha_composite(rg)
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([rcx0, rcy0, rcx0 + rcw, rcy0 + rch],
+                            radius=16, fill=(8, 20, 14) if win else (28, 10, 12),
+                            outline=glow_color, width=2)
+    # YOU WIN / YOU LOSE
+    f_rh = _limbo_get_font(34)
+    title = "YOU WIN!" if win else "YOU LOSE"
+    titw = draw.textlength(title, font=f_rh)
+    draw.text((rcx0 + (rcw - titw) / 2, rcy0 + 14),
+              title, font=f_rh, fill=WHITE)
+    # +/- amount
+    f_ra = _limbo_get_font(34)
+    if win:
+        amt_str = f"+${profit:,.2f}"
+        amt_color = GREEN
+    else:
+        amt_str = f"-${bet_amount:,.2f}"
+        amt_color = RED
+    aw = draw.textlength(amt_str, font=f_ra)
+    draw.text((rcx0 + (rcw - aw) / 2, rcy0 + 54),
+              amt_str, font=f_ra, fill=amt_color)
+    # Payout (only when win)
+    f_pp = _limbo_get_font(18)
+    if win:
+        payout = bet_amount + profit
+        pp_str = f"Payout: ${payout:,.2f}"
+        ppw = draw.textlength(pp_str, font=f_pp)
+        # coin glyph.
+        cglyph_x = rcx0 + (rcw + ppw) / 2 + 14
+        cglyph_y = rcy0 + 96 + 4
+        draw.ellipse([cglyph_x, cglyph_y, cglyph_x + 18, cglyph_y + 18],
+                     fill=GREEN_DIM, outline=GREEN, width=1)
+        f_cg = _limbo_get_font(13)
+        draw.text((cglyph_x + 5, cglyph_y + 1), "$", font=f_cg, fill=WHITE)
+        draw.text((rcx0 + (rcw - ppw) / 2 - 14, rcy0 + 96),
+                  pp_str, font=f_pp, fill=DIM)
+
+    # ── RECENT PLAYERS RAIL ────────────────────────────────
+    rail_w = 580
+    rail_h = 110
+    rail_x0 = (W - rail_w) // 2
+    rail_y0 = rcy0 + rch + 36
+    draw.rounded_rectangle([rail_x0, rail_y0, rail_x0 + rail_w, rail_y0 + rail_h],
+                            radius=18, fill=(18, 22, 48), outline=(60, 70, 110), width=2)
+    # Build rail entries from recent_players (or fallback to single current player).
+    if recent_players:
+        entries = list(recent_players)[:3]
+    else:
+        entries = [{
+            "name": player_username or "Player",
+            "pic": player_profile_pic,
+        }]
+    f_pname = _limbo_get_font(20)
+    av_r = 22
+    # Place 2 entries on the first row, 1 on the second when 3 are present.
+    pad_x = rail_x0 + 18
+    pad_y = rail_y0 + 14
+    cell_w = (rail_w - 36) // 2
+    for idx, ent in enumerate(entries):
+        col = idx % 2
+        row = idx // 2
+        cx0 = pad_x + col * cell_w
+        cy0 = pad_y + row * 42
+        avx = cx0 + 4
+        avy = cy0 + 4
+        # Avatar circle.
+        if ent.get("pic") and isinstance(ent["pic"], Image.Image):
+            try:
+                sz = av_r * 2
+                src = ent["pic"].convert("RGBA").resize((sz, sz), Image.Resampling.LANCZOS)
+                mask = Image.new("L", (sz, sz), 0)
+                ImageDraw.Draw(mask).ellipse([0, 0, sz - 1, sz - 1], fill=255)
+                img.paste(src, (avx, avy), mask)
+                draw.ellipse([avx, avy, avx + sz, avy + sz],
+                             outline=GOLD if idx == 0 else (110, 130, 170), width=2)
+            except Exception:
+                draw.ellipse([avx, avy, avx + av_r * 2, avy + av_r * 2],
+                             fill=(20, 28, 50), outline=(110, 130, 170), width=2)
+        else:
+            draw.ellipse([avx, avy, avx + av_r * 2, avy + av_r * 2],
+                         fill=(20, 28, 50), outline=(110, 130, 170), width=2)
+        # Name.
+        nm = (ent.get("name") or "Player")
+        nm = nm if not nm.startswith("@") else nm[1:]
+        nm = nm[:14] + ".." if len(nm) > 14 else nm
+        draw.text((avx + av_r * 2 + 14, avy + 8),
+                  nm, font=f_pname, fill=WHITE)
+
+    # ── BOTTOM INFO BAR ────────────────────────────────────
+    bar_y = H - 80
+    bar_h = 50
+    draw.rounded_rectangle([16, bar_y, W - 16, bar_y + bar_h],
+                            radius=12, fill=(10, 16, 36), outline=(40, 50, 90), width=1)
+    f_bar = _limbo_get_font(20)
+    # Bet (left).
+    bet_str = f"Bet: ${bet_amount:.2f} {currency}"
+    draw.text((36, bar_y + (bar_h - 24) / 2),
+              bet_str, font=f_bar, fill=WHITE)
+    # Center: mountain glyph + LIMBO.
+    lbl = "LIMBO"
+    lw = draw.textlength(lbl, font=f_bar)
+    glyph_x = (W - lw) // 2 - 32
+    glyph_y = bar_y + bar_h // 2
+    # tiny mountain (triangle).
+    draw.polygon(
+        [(glyph_x, glyph_y + 12),
+         (glyph_x + 12, glyph_y - 10),
+         (glyph_x + 24, glyph_y + 12)],
+        fill=GOLD,
+    )
+    draw.text(((W - lw) / 2, bar_y + (bar_h - 24) / 2),
+              lbl, font=f_bar, fill=GOLD)
+    # Right: bot username + diamond.
+    rt = f"@{bot_username}" if not bot_username.startswith("@") else bot_username
+    rtw = draw.textlength(rt, font=f_bar)
+    draw.text((W - rtw - 60, bar_y + (bar_h - 24) / 2),
+              rt, font=f_bar, fill=BLUE)
+    dx, dy = W - 38, bar_y + bar_h // 2
+    draw.polygon([(dx, dy - 9), (dx + 9, dy), (dx, dy + 9), (dx - 9, dy)],
+                 fill=BLUE)
+
+    # ── FOOTER LINE ────────────────────────────────────────
+    f_foot = _limbo_get_font(14)
+    foot = "Play Responsibly  •  Telegram Casino  •  limbo"
+    fw = draw.textlength(foot, font=f_foot)
+    draw.text(((W - fw) / 2, H - 22), foot, font=f_foot, fill=DIM)
+
+    # Save
+    out = img.convert("RGB")
     buf = BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    out.save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf
-
 
 async def async_generate_limbo_image(*args, **kwargs) -> BytesIO:
     """Async wrapper for generate_limbo_image to avoid blocking the event loop."""
@@ -22519,6 +22692,30 @@ async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Generate Limbo template image
     active_currency = get_active_currency(user.id)
     player_pic = await _get_cached_profile_picture(context, user.id)
+
+    # Track recent limbo players in this chat (newest first, max 3) so
+    # the limbo PIL can show a player rail at the bottom matching the
+    # template. Names only — no hardcoded examples.
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    cur_uid = user.id
+    cur_display = user.username or user.first_name or str(user.id)
+    bucket = _recent_limbo_players.setdefault(chat_id, [])
+    bucket = [(uid, nm) for (uid, nm) in bucket if uid != cur_uid]
+    bucket.insert(0, (cur_uid, cur_display))
+    bucket = bucket[:_RECENT_LIMBO_MAX]
+    _recent_limbo_players[chat_id] = bucket
+    # Build rail entries (best-effort avatars).
+    rail_entries = []
+    for uid, nm in bucket:
+        if uid == cur_uid:
+            pic = player_pic
+        else:
+            try:
+                pic = await _get_cached_profile_picture(context, uid)
+            except Exception:
+                pic = None
+        rail_entries.append({"name": nm, "pic": pic})
+
     limbo_image = await async_generate_limbo_image(
         target_multiplier=target_multiplier,
         outcome=outcome,
@@ -22530,6 +22727,7 @@ async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         game_id=game_id,
         currency=active_currency,
         player_profile_pic=player_pic,
+        recent_players=rail_entries,
     )
 
     # Create keyboard with provably fair button only
