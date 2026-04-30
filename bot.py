@@ -27063,20 +27063,6 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_matched_pvb and active_pvb_game_id and active_pvb_game_id in game_sessions:
         game = game_sessions[active_pvb_game_id]
 
-        # CRITICAL FIX: Check if it's actually the user's turn before accepting their roll.
-        # Two flags can mean "bot is rolling right now":
-        #   - waiting_for == "bot"  (set explicitly when the bot owns the round)
-        #   - bot_is_rolling        (set around multi_roll_parallel calls)
-        # The user-rolls-first flow only sets bot_is_rolling, so without this
-        # second check, dice the user spams during the bot's animation get
-        # appended as extra "user rolls" and trigger overlapping round
-        # resolutions — causing the lag, duplicate bot rolls, and unusual
-        # behavior reported for /dice <amount> PvB matches.
-        if game.get("waiting_for") == "bot" or game.get("bot_is_rolling"):
-            if DEBUG_EMOJI_GAMES:
-                logging.info(f"PVB IGNORED: user={user.id} tried to roll during bot's turn (game={active_pvb_game_id})")
-            return
-
         game_type = (game['game_type']
                      .replace("pvb_", "")
                      .replace("xdxw_", "")
@@ -27092,6 +27078,31 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
         game_rolls = game.get('game_rolls', 1)
         game_mode = game.get('game_mode', 'normal')
         bot_rolls_first = game.get('bot_rolls_first', False)
+
+        # CRITICAL FIX (race-condition #1): drop dice that arrive while the
+        # bot is still rolling or while we're mid-way through resolving the
+        # previous round.
+        #
+        # `waiting_for == "bot"` and `bot_is_rolling` cover the bot's
+        # animation window. But there is a *second* race window between
+        # the moment we clear those flags after multi_roll_parallel
+        # returns and the moment we reset `game['user_rolls']` to [] at
+        # the end of round resolution (which only happens after several
+        # `await reply_text` calls). A dice the user spams in that window
+        # used to be appended onto the still-full `user_rolls` list, sail
+        # past the `len < game_rolls` gate, and trigger a *second* bot
+        # roll for the same round — that is the source of the duplicate
+        # bot rolls + score corruption + "behaves unusual" reports for
+        # /dice <amount> PvB matches.
+        #
+        # Closing the race: also bail when `user_rolls` is already at
+        # full capacity for this round, regardless of the boolean flags.
+        if (game.get("waiting_for") == "bot"
+                or game.get("bot_is_rolling")
+                or len(game.get('user_rolls', []) or []) >= game_rolls):
+            if DEBUG_EMOJI_GAMES:
+                logging.info(f"PVB IGNORED: user={user.id} tried to roll during bot's turn / round resolution (game={active_pvb_game_id})")
+            return
 
         if update.message.dice and update.message.dice.emoji == expected_emoji and update.message.forward_origin is None:
             # Cancel PvB timeout since user is rolling
@@ -27195,7 +27206,19 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     game['bot_is_rolling'] = True
                     game['waiting_for'] = 'bot'
                     bot_rolls = []
-                    command_msg_id = game.get('command_message_id')
+                    # CRITICAL FIX: reply-tag the user's most-recent dice
+                    # message rather than the original /dice <amount>
+                    # command. Tagging the user's recent dice is the
+                    # natural "Bot is responding to your roll" UX and is
+                    # what the user expects in /dice <amount> mode (parity
+                    # with what they see in /dice <amount> XdX'w mode
+                    # where the bot's emoji clearly tags the user). Using
+                    # the original /dice command id made the bot's roll
+                    # land deep above the user's dice in the chat scroll,
+                    # which is what the user reported as "doesn't
+                    # actually tag the user message".
+                    command_msg_id = (update.message.message_id
+                                      if update.message else game.get('command_message_id'))
                     try:
                         rolls_data = await multi_roll_parallel(context, update.effective_chat.id, expected_emoji, game_rolls, reply_to_message_id=command_msg_id)
                         for msg, _ in rolls_data:
@@ -27210,12 +27233,20 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if user.id in active_pvb_games:
                             del active_pvb_games[user.id]
                         _unindex_user_game(user.id, active_pvb_game_id)
+                        _active_cashout_buttons.pop(active_pvb_game_id, None)
+                        _cashout_refresh_last.pop(active_pvb_game_id, None)
                         credit_wallet(user.id, game['bet_amount'])
                         update_pnl(user.id)
                         save_user_data(user.id)
                         return
-                    game.pop('bot_is_rolling', None)
-                    game['waiting_for'] = 'user'
+                    # NOTE: keep `bot_is_rolling=True` and `waiting_for='bot'`
+                    # in place until *after* user_rolls/bot_rolls are reset
+                    # below. Clearing them here used to open a small race
+                    # window during the round-result `await reply_text`
+                    # where a spammed dice would be appended to the
+                    # still-full user_rolls list and trigger a duplicate
+                    # bot roll. The flags now act as a single "round in
+                    # progress" guard until the round is fully resolved.
 
                 game["bot_rolls"] = bot_rolls
                 bot_total = sum(bot_rolls)
@@ -27260,6 +27291,11 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             game["current_round"] += 1
             game['user_rolls'] = []  # Reset for next round
             game['bot_rolls'] = []  # Reset for next round
+            # Round fully resolved — *now* it's safe to clear the
+            # "round-in-progress" guards. The next-round bot-rolls-first
+            # branch below re-sets them as needed for its own bot roll.
+            game.pop('bot_is_rolling', None)
+            game['waiting_for'] = 'user'
 
             # Check for game end
             if game["user_score"] >= game["target_score"]:
@@ -27280,6 +27316,10 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if user.id in active_pvb_games:
                     del active_pvb_games[user.id]
                 _unindex_user_game(user.id, active_pvb_game_id)
+                # Lifecycle cleanup: cashout button state is per-game.
+                _active_cashout_buttons.pop(active_pvb_game_id, None)
+                _cashout_refresh_last.pop(active_pvb_game_id, None)
+                _game_locks.pop(active_pvb_game_id, None)
             elif game["bot_score"] >= game["target_score"]:
                 # Cancel any pending timeout
                 _cancel_pvb_timeout_jobs(context, user.id, active_pvb_game_id)
@@ -27294,6 +27334,10 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if user.id in active_pvb_games:
                     del active_pvb_games[user.id]
                 _unindex_user_game(user.id, active_pvb_game_id)
+                # Lifecycle cleanup: cashout button state is per-game.
+                _active_cashout_buttons.pop(active_pvb_game_id, None)
+                _cashout_refresh_last.pop(active_pvb_game_id, None)
+                _game_locks.pop(active_pvb_game_id, None)
             else: # Continue game - next round
                 # AIORateLimiter handles per-chat pacing; manual sleep removed.
 
@@ -27311,7 +27355,10 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     # Bot rolls - use multi_roll_parallel for lightning-fast speed
                     bot_rolls = []
-                    command_msg_id = game.get('command_message_id')
+                    # Reply-tag the user's most-recent dice (parity with
+                    # the user-rolls-first branch above).
+                    command_msg_id = (update.message.message_id
+                                      if update.message else game.get('command_message_id'))
                     try:
                         rolls_data = await multi_roll_parallel(context, update.effective_chat.id, expected_emoji, game_rolls, reply_to_message_id=command_msg_id)
                         for msg, _ in rolls_data:
@@ -27326,6 +27373,8 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if user.id in active_pvb_games:
                             del active_pvb_games[user.id]
                         _unindex_user_game(user.id, active_pvb_game_id)
+                        _active_cashout_buttons.pop(active_pvb_game_id, None)
+                        _cashout_refresh_last.pop(active_pvb_game_id, None)
                         credit_wallet(user.id, game['bet_amount'])
                         update_pnl(user.id)
                         save_user_data(user.id)
@@ -27531,11 +27580,23 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         # that re-enters during the await silently skips additional dice.
                         match_data['bot_is_rolling'] = True
                         match_data['waiting_for'] = 'bot'
-                        await asyncio.sleep(1)
-                        await update.message.reply_text(f"Bot is rolling...")
+                        # PERFORMANCE: dropped the asyncio.sleep(1) +
+                        # "Bot is rolling..." ack reply. With
+                        # AIORateLimiter that ack is a third
+                        # message-per-round serialised on the chat's
+                        # rate window before the bot's actual dice can
+                        # land — and the bot's dice that immediately
+                        # follows is itself a clear "bot is rolling"
+                        # indicator. Same change has already been made
+                        # in the PvB block; this brings the PvP-vs-bot
+                        # path to parity.
 
                         bot_rolls = []
-                        command_msg_id = match_data.get('command_message_id')
+                        # Reply-tag the user's most-recent dice rather
+                        # than the original /dice <amount> command
+                        # (parity with PvB block above and natural UX).
+                        command_msg_id = (update.message.message_id
+                                          if update.message else match_data.get('command_message_id'))
                         try:
                             rolls_data = await multi_roll_parallel(context, chat_id, dice_obj.emoji, game_rolls, reply_to_message_id=command_msg_id)
                             for msg, _ in rolls_data:
@@ -27544,10 +27605,15 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             logging.error(f"Error sending bot dice in PvP game: {e}")
                             bot_rolls = [0] * game_rolls  # Fallback
 
-                        match_data.pop('bot_is_rolling', None)
-                        match_data['waiting_for'] = 'user'
                         match_data["player_rolls"][p2] = bot_rolls
                         p2_rolls = bot_rolls
+                        # NOTE: defer clearing bot_is_rolling /
+                        # waiting_for until after match_data["player_rolls"]
+                        # is reset below — same race-window fix as the
+                        # PvB block. Otherwise a dice the user spams
+                        # during the round-result `await reply_text`
+                        # could append onto the still-full p1_rolls list
+                        # and trigger a duplicate bot roll.
 
                     if len(p1_rolls) == game_rolls and len(p2_rolls) == game_rolls:
                         # Both players completed, calculate results
@@ -27633,6 +27699,16 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if match_data.get("points"):
                             if match_data["points"].get(p1, 0) >= target: final_winner = p1
                             elif match_data["points"].get(p2, 0) >= target: final_winner = p2
+
+                        # Round fully resolved — clear the bot-rolling guards
+                        # before anything that awaits, so legitimate next-round
+                        # dice are accepted but late-arriving spam from the
+                        # current round (already rejected by the new
+                        # `len(player_rolls) >= game_rolls` check above)
+                        # cannot trigger a duplicate bot roll. Same
+                        # race-window fix as the PvB block.
+                        match_data.pop('bot_is_rolling', None)
+                        match_data['waiting_for'] = 'user'
 
                         if final_winner is not None:
                             loser_id = p2 if final_winner == p1 else p1
