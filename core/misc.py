@@ -1568,3 +1568,39 @@ async def pf_verify_calculate_result(update_or_query, context: ContextTypes.DEFA
 
     return ConversationHandler.END
 
+def _build_worker_application():
+    """Factory referenced by ``MYCASINO_APP_FACTORY`` (default).
+
+    Returns a fully-built :class:`telegram.ext.Application` with the
+    zero-downtime runtime installed and all plugins auto-loaded.
+    """
+    builder = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(512)
+        .get_updates_pool_timeout(30)
+        .get_updates_connect_timeout(15)
+        .get_updates_read_timeout(15)
+        .get_updates_write_timeout(15)
+        .connection_pool_size(512)
+        .pool_timeout(30)
+        .connect_timeout(15)
+        .read_timeout(30)
+        .write_timeout(30)
+    )
+    rate_limiter = create_optional_rate_limiter()
+    if rate_limiter is not None:
+        builder = builder.rate_limiter(rate_limiter)
+    app = builder.build()
+
+    try:
+        from runtime import register_runtime as _register_runtime
+        _register_runtime(app, is_admin=is_admin, autoload_plugins=True)
+    except Exception as _e:
+        logging.warning(
+            f"Worker: zero-downtime runtime not installed: "
+            f"{type(_e).__name__}: {_e}",
+            exc_info=True,
+        )
+    return app
+

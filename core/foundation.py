@@ -8707,6 +8707,21 @@ def main():
     if rate_limiter is not None:
         app_builder = app_builder.rate_limiter(rate_limiter)
     app = app_builder.build()
+
+    # ===== ZERO-DOWNTIME RUNTIME =====
+    # Wires admin /reload, /reloadall, /listplugins commands and (when
+    # MYCASINO_AUTOLOAD_PLUGINS=1) auto-loads every module under
+    # plugins/ at startup. The runtime module never imports bot.py, so
+    # it is itself reloadable in development. See docs/ZERO_DOWNTIME.md.
+    try:
+        from runtime import register_runtime as _register_runtime
+        _register_runtime(app, is_admin=is_admin)
+    except Exception as _e:
+        logging.warning(
+            f"Zero-downtime runtime not installed: {type(_e).__name__}: {_e}",
+            exc_info=True,
+        )
+
     # Conversation handlers
     admin_handler = ConversationHandler(
         entry_points=[
@@ -9563,6 +9578,14 @@ def _wireup() -> None:
     log = _logging.getLogger(__name__)
     g = globals()
     mods = []
+    # Names we must NOT hoist between modules: dunders, importlib
+    # internals, and the wireup machinery itself.
+    _SKIP = {'_wireup', '_SPLIT_MODULES'}
+    def _hoistable(k):
+        if k in _SKIP:
+            return False
+        # Skip dunder attributes (__name__, __doc__, __dict__, ...).
+        return not (k.startswith('__') and k.endswith('__'))
     for mn in _SPLIT_MODULES:
         try:
             mod = importlib.import_module(mn)
@@ -9570,16 +9593,18 @@ def _wireup() -> None:
             log.warning('Failed to import split module %s: %s', mn, e, exc_info=True)
             continue
         mods.append(mod)
-        # Hoist this module's public names into foundation IMMEDIATELY
-        # so the next split module sees them via ``from core.foundation import *``.
+        # Hoist this module's names (including underscore-prefixed
+        # internal helpers like ``_render_dashboard_sync``) into
+        # foundation IMMEDIATELY so the next split module sees them
+        # via ``from core.foundation import *`` AND via the merged
+        # snapshot pushed back below.
         for k in dir(mod):
-            if k.startswith('_'):
-                continue
-            g[k] = getattr(mod, k)
+            if _hoistable(k):
+                g[k] = getattr(mod, k)
     # Push the fully-merged namespace back into every module so that
     # late-bound references (function bodies that resolve names at
     # call time) succeed across module boundaries.
-    snapshot = {k: v for k, v in g.items() if not k.startswith('_')}
+    snapshot = {k: v for k, v in g.items() if _hoistable(k)}
     for mod in mods:
         for k, v in snapshot.items():
             if k not in mod.__dict__:

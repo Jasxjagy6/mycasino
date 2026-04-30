@@ -44,8 +44,16 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
+# The splitter reads from a frozen copy of the monolith at
+# .refactor/bot_monolith.py.  This way the live bot.py can be the thin
+# launcher without breaking ``python3 .refactor/split_bot.py``.  If the
+# frozen copy is missing we fall back to bot.py (for first-run).
+MONO = ROOT / ".refactor" / "bot_monolith.py"
 BOT = ROOT / "bot.py"
-SRC = BOT.read_text()
+if MONO.exists():
+    SRC = MONO.read_text()
+else:
+    SRC = BOT.read_text()
 LINES = SRC.split("\n")
 TREE = ast.parse(SRC)
 
@@ -373,6 +381,14 @@ def write_foundation(out: Path) -> None:
         "    log = _logging.getLogger(__name__)\n"
         "    g = globals()\n"
         "    mods = []\n"
+        "    # Names we must NOT hoist between modules: dunders, importlib\n"
+        "    # internals, and the wireup machinery itself.\n"
+        "    _SKIP = {'_wireup', '_SPLIT_MODULES'}\n"
+        "    def _hoistable(k):\n"
+        "        if k in _SKIP:\n"
+        "            return False\n"
+        "        # Skip dunder attributes (__name__, __doc__, __dict__, ...).\n"
+        "        return not (k.startswith('__') and k.endswith('__'))\n"
         "    for mn in _SPLIT_MODULES:\n"
         "        try:\n"
         "            mod = importlib.import_module(mn)\n"
@@ -380,16 +396,18 @@ def write_foundation(out: Path) -> None:
         "            log.warning('Failed to import split module %s: %s', mn, e, exc_info=True)\n"
         "            continue\n"
         "        mods.append(mod)\n"
-        "        # Hoist this module's public names into foundation IMMEDIATELY\n"
-        "        # so the next split module sees them via ``from core.foundation import *``.\n"
+        "        # Hoist this module's names (including underscore-prefixed\n"
+        "        # internal helpers like ``_render_dashboard_sync``) into\n"
+        "        # foundation IMMEDIATELY so the next split module sees them\n"
+        "        # via ``from core.foundation import *`` AND via the merged\n"
+        "        # snapshot pushed back below.\n"
         "        for k in dir(mod):\n"
-        "            if k.startswith('_'):\n"
-        "                continue\n"
-        "            g[k] = getattr(mod, k)\n"
+        "            if _hoistable(k):\n"
+        "                g[k] = getattr(mod, k)\n"
         "    # Push the fully-merged namespace back into every module so that\n"
         "    # late-bound references (function bodies that resolve names at\n"
         "    # call time) succeed across module boundaries.\n"
-        "    snapshot = {k: v for k, v in g.items() if not k.startswith('_')}\n"
+        "    snapshot = {k: v for k, v in g.items() if _hoistable(k)}\n"
         "    for mod in mods:\n"
         "        for k, v in snapshot.items():\n"
         "            if k not in mod.__dict__:\n"
