@@ -16,3 +16,10 @@ node_modules/
 dist/
 build/
 *.egg-info/
+
+# Local runtime artefacts
+bot_state.json
+deposits.db
+__pycache__/
+*.pyc
+.venv/
