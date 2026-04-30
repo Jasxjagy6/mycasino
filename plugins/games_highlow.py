@@ -66,10 +66,8 @@ async def highlow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         bet_amount_str = args[1].lower()
-        if bet_amount_str == 'all':
-            bet = get_active_balance_usd(user.id)
-        else:
-            bet = float(bet_amount_str)
+        # Display-currency aware (parity with blackjack/tower).
+        bet, _bet_disp, _disp_cur = parse_bet_amount(bet_amount_str, user.id)
     except Exception:
         await update.message.reply_text("Invalid amount.")
         return

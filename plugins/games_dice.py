@@ -29,10 +29,8 @@ async def coin_flip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         bet_amount_str = args[1].lower()
-        if bet_amount_str == 'all':
-            bet = get_active_balance_usd(user.id)
-        else:
-            bet = float(bet_amount_str)
+        # Display-currency aware (parity with blackjack/tower).
+        bet, _bet_disp, _disp_cur = parse_bet_amount(bet_amount_str, user.id)
     except Exception:
         await update.message.reply_text("Invalid amount.")
         return
@@ -220,10 +218,8 @@ async def dice_roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         bet_amount_str = args[1].lower()
-        if bet_amount_str == 'all':
-            bet_amount = get_active_balance_usd(user.id)
-        else:
-            bet_amount = float(bet_amount_str)
+        # Display-currency aware (parity with blackjack/tower).
+        bet_amount, _bet_disp, _disp_cur = parse_bet_amount(bet_amount_str, user.id)
     except ValueError:
         await update.message.reply_text("Invalid amount.")
         return
@@ -340,7 +336,8 @@ async def dice_rush_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         try:
             bet_amount_str = args[2].lower()
-            bet_amount = get_active_balance_usd(user.id) if bet_amount_str == 'all' else float(bet_amount_str)
+            # Display-currency aware (parity with blackjack/tower).
+            bet_amount, _bet_disp, _disp_cur = parse_bet_amount(bet_amount_str, user.id)
         except ValueError:
             await update.message.reply_text("Invalid amount.")
             return

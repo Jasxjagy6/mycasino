@@ -83,10 +83,8 @@ async def mines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         bet_amount_str = update.message.text.lower()
-        if bet_amount_str == 'all':
-            bet_amount = get_active_balance_usd(user.id)
-        else:
-            bet_amount = float(bet_amount_str)
+        # Display-currency aware: typed in the user's chosen fiat.
+        bet_amount, _bet_disp, _disp_cur = parse_bet_amount(bet_amount_str, user.id)
     except ValueError:
         await update.message.reply_text("Invalid bet amount. Please enter a number.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="cancel_game")]]))
         return SELECT_BET_AMOUNT

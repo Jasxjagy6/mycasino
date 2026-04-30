@@ -151,10 +151,9 @@ async def tower_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         bet_str = update.message.text.lower()
-        if bet_str == 'all':
-            bet_amount = get_active_balance_usd(user.id)
-        else:
-            bet_amount = float(bet_str)
+        # parse_bet_amount honours the user's display currency
+        # (e.g. /tower 500 with display=INR means ₹500, not $500).
+        bet_amount, _bet_disp, _disp_cur = parse_bet_amount(bet_str, user.id)
     except ValueError:
         await update.message.reply_text(
             "❌ Invalid amount. Please enter a number or 'all'.",
@@ -263,13 +262,10 @@ async def tower_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
         return
 
-    # Parse bet amount from command
+    # Parse bet amount from command (display-currency aware)
     try:
         bet_str = context.args[0].lower()
-        if bet_str == 'all':
-            bet_amount = get_active_balance_usd(user.id)
-        else:
-            bet_amount = float(bet_str)
+        bet_amount, _bet_disp, _disp_cur = parse_bet_amount(bet_str, user.id)
     except ValueError:
         await update.message.reply_text(f"{pe('cross')} Invalid amount. Please enter a number or 'all'.")
         return

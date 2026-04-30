@@ -95,10 +95,8 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) == 1:
         try:
             bet_amount_str = args[0].lower()
-            if bet_amount_str == 'all':
-                bet_amount = get_active_balance_usd(user.id)
-            else:
-                bet_amount = float(bet_amount_str)
+            # Display-currency aware (parity with blackjack/tower).
+            bet_amount, _bet_disp, _disp_cur = parse_bet_amount(bet_amount_str, user.id)
         except ValueError:
             await update.message.reply_text("Invalid amount.")
             return
@@ -169,10 +167,7 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         bet_amount_str = args[0].lower()
-        if bet_amount_str == 'all':
-            bet_amount = get_active_balance_usd(user.id)
-        else:
-            bet_amount = float(bet_amount_str)
+        bet_amount, _bet_disp, _disp_cur = parse_bet_amount(bet_amount_str, user.id)
     except ValueError:
         await update.message.reply_text("Invalid amount.")
         return
