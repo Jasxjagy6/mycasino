@@ -499,58 +499,40 @@ def _get_httpx_client():
         )
     return _httpx_client
 
+_VALID_BUTTON_STYLES = {"primary", "success", "danger"}
+
+
 def apply_button_style(button, style, custom_emoji_id=None):
-    """Best-effort styling for an InlineKeyboardButton.
+    """Inject Bot API 9.4 ``style`` (and optional Premium
+    ``icon_custom_emoji_id``) into an InlineKeyboardButton.
 
-    The public Telegram Bot API does NOT support a ``style`` field on
-    inline-keyboard buttons (this is verified — sending it produces
-    ``Can't parse inline keyboard button: field "style" must be of
-    type string``).  We previously emitted the field anyway as a
-    speculative workaround, which broke ``/start``, ``/menu`` and
-    every other screen that built keyboards through this helper.
+    The Bot API requires ``style`` to be one of the strings
+    ``"primary"`` (blue), ``"success"`` (green), or ``"danger"`` (red).
+    A historical caller bug passed ``style=None`` for one button,
+    which made PTB serialise ``"style": null`` — Telegram rejects the
+    *entire* keyboard with::
 
-    Today this helper:
+        Can't parse inline keyboard button:
+        field "style" must be of type string
 
-    * Optionally prepends a small marker emoji to the button label so
-      'success' / 'primary' / 'danger' visually differ even without
-      colored buttons.
-    * Forwards ``custom_emoji_id`` as ``icon_custom_emoji_id`` only —
-      this *is* a real (premium) Bot API field.
-    * Returns a plain ``InlineKeyboardButton`` (no dict injection),
-      which serialises cleanly through PTB to Telegram.
+    so every screen built through this helper (``/start``, the wallet
+    menu, the games list, the currency picker, …) failed.  Now we
+    silently drop ``style`` when it is None / "" / not one of the
+    three allowed values, instead of poisoning the whole keyboard.
 
-    Callers can be migrated off this helper at their own pace; the
-    return value is API-compatible with the previous dict-style.
+    ``custom_emoji_id`` is the Premium icon field — only sent when
+    it's a non-empty string.
+
+    Returns a dict (the existing call sites either pass it straight to
+    ``InlineKeyboardMarkup([[...]])`` via PTB's ``de_json`` path or
+    through ``create_styled_keyboard``).
     """
-    label = button.text or ""
-    # Visual hint when no other marker is present.  We deliberately do
-    # NOT add prefixes if the caller already put a checkmark / cross /
-    # status emoji at the start of the label.
-    _hints = {
-        'success': '\u2705',  # ✅
-        'primary': '\U0001F535',  # 🔵
-        'danger':  '\U0001F534',  # 🔴
-        'warning': '\U0001F7E1',  # 🟡
-        'secondary': '\u26AA',   # ⚪
-    }
-    hint = _hints.get(style)
-    if hint and not any(label.startswith(p) for p in _hints.values()):
-        # Don't double-prefix.
-        label = f"{hint} {label}" if not label.startswith(hint) else label
-    new_kwargs = {
-        "text": label,
-        "url": button.url,
-        "callback_data": button.callback_data,
-        "web_app": button.web_app,
-        "login_url": button.login_url,
-        "switch_inline_query": button.switch_inline_query,
-        "switch_inline_query_current_chat": button.switch_inline_query_current_chat,
-        "callback_game": button.callback_game,
-        "pay": button.pay,
-    }
-    # PTB versions vary in field names; pop any None values.
-    new_kwargs = {k: v for k, v in new_kwargs.items() if v is not None}
-    return InlineKeyboardButton(**new_kwargs)
+    btn_dict = button.to_dict() if hasattr(button, "to_dict") else dict(button)
+    if isinstance(style, str) and style in _VALID_BUTTON_STYLES:
+        btn_dict["style"] = style
+    if isinstance(custom_emoji_id, str) and custom_emoji_id:
+        btn_dict["icon_custom_emoji_id"] = custom_emoji_id
+    return btn_dict
 
 def create_styled_keyboard(keyboard_array):
     """

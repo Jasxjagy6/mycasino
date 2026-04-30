@@ -7850,6 +7850,7 @@ def register(ctx):
     app.add_handler(CallbackQueryHandler(users_navigation_callback, pattern='^users_', block=False))
     app.add_handler(CallbackQueryHandler(price_update_callback, pattern='^price_update_', block=False))
     app.add_handler(CallbackQueryHandler(active_all_navigation_callback, pattern='^activeall_', block=False))
-    helper_app.add_handler(CallbackQueryHandler(stats_view_callback, pattern='^stats_(24h|alltime)_', block=False))
-    helper_app.add_handler(CallbackQueryHandler(price_update_callback, pattern='^price_update_', block=False))
+    if helper_app is not None:
+        helper_app.add_handler(CallbackQueryHandler(stats_view_callback, pattern='^stats_(24h|alltime)_', block=False))
+        helper_app.add_handler(CallbackQueryHandler(price_update_callback, pattern='^price_update_', block=False))
 

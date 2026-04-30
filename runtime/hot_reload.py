@@ -224,6 +224,58 @@ class HotReloadManager:
     # Public API
     # ------------------------------------------------------------------
 
+    def _snapshot_app_handlers(self) -> Dict[int, List[Any]]:
+        """Return ``{group: [handler, ...]}`` from the live application.
+
+        Used by :meth:`load` / :meth:`reload` to detect handlers that a
+        plugin's ``register()`` added via the bare ``app.add_handler``
+        API (i.e. without going through ``ctx.add_handler``) so the
+        manager can still bookkeep — and later remove — them.
+        """
+        snap: Dict[int, List[Any]] = {}
+        for group, handlers in (self._application.handlers or {}).items():
+            snap[group] = list(handlers)
+        return snap
+
+    def _diff_app_handlers(
+        self,
+        before: Dict[int, List[Any]],
+        record: PluginRecord,
+    ) -> int:
+        """Detect handlers added since *before* and attach them to *record*."""
+        added = 0
+        for group, handlers in (self._application.handlers or {}).items():
+            old_set = before.get(group, [])
+            old_ids = {id(h) for h in old_set}
+            for h in handlers:
+                if id(h) not in old_ids:
+                    record.add_handler_record(h, group)
+                    added += 1
+        return added
+
+    def _adopt_existing(self, name: str) -> Optional[PluginRecord]:
+        """Build a :class:`PluginRecord` from handlers already in the app.
+
+        Some plugins are loaded by the legacy ``main()`` flow (the
+        monolith era) instead of going through ``manager.load()``.  When
+        an admin asks to reload one of those, walk the live application
+        handlers and pick out the ones whose callback's ``__module__``
+        matches ``plugins.<name>`` — those are the handlers the plugin
+        owns and we need to remove them on reload.
+        """
+        full = self._full_module_name(name)
+        module = sys.modules.get(full)
+        if module is None:
+            return None
+        record = PluginRecord(name=name, module=module)
+        for group, handlers in (self._application.handlers or {}).items():
+            for h in handlers:
+                cb = getattr(h, "callback", None)
+                cb_mod = getattr(cb, "__module__", "") if cb else ""
+                if cb_mod == full:
+                    record.add_handler_record(h, group)
+        return record
+
     async def load(self, name: str) -> Dict[str, Any]:
         """Load a plugin by short name (e.g. ``"blackjack"``)."""
         async with self._lock_for(name):
@@ -231,7 +283,24 @@ class HotReloadManager:
                 return self.info(name)  # type: ignore[return-value]
 
             full = self._full_module_name(name)
+            already_imported = full in sys.modules
             module = importlib.import_module(full)
+            # If the module was already imported by the legacy ``_wireup``
+            # flow, its ``register()`` has already been called against
+            # the application — re-calling it here would double-register
+            # every handler.  Adopt the existing handlers instead.
+            if already_imported:
+                record = self._adopt_existing(name) or PluginRecord(
+                    name=name, module=module
+                )
+                self._plugins[name] = record
+                logger.info(
+                    "Plugin adopted (legacy-loaded): %s (%d handlers)",
+                    name,
+                    len(record.handlers),
+                )
+                return self.info(name)  # type: ignore[return-value]
+
             record = PluginRecord(name=name, module=module)
             ctx = PluginContext(self, self._application, record)
             register = getattr(module, "register", None)
@@ -239,6 +308,7 @@ class HotReloadManager:
                 raise RuntimeError(
                     f"Plugin '{name}' is missing a top-level register(ctx) function"
                 )
+            before = self._snapshot_app_handlers()
             try:
                 result = register(ctx)
                 if asyncio.iscoroutine(result):
@@ -251,6 +321,9 @@ class HotReloadManager:
                 # register time after side-effects at import time).
                 sys.modules.pop(full, None)
                 raise
+            # Detect handlers register() added via app.add_handler so
+            # they're tracked alongside ones added via ctx.add_handler.
+            self._diff_app_handlers(before, record)
             await self._call_lifecycle(module, ctx, "on_load")
             self._plugins[name] = record
             logger.info(
@@ -266,8 +339,16 @@ class HotReloadManager:
         async with self._lock_for(name):
             old = self._plugins.get(name)
             if old is None:
-                # Treat reload-of-unloaded as a regular load.
-                return await self.load(name)
+                # Plugin was loaded by the legacy ``_wireup`` flow, not
+                # via ``manager.load()`` — adopt its handlers first so
+                # we can bookkeep + reload it cleanly.
+                adopted = self._adopt_existing(name)
+                if adopted is not None:
+                    self._plugins[name] = adopted
+                    old = adopted
+                else:
+                    # Genuinely unloaded; treat as a regular load.
+                    return await self.load(name)
 
             old_ctx = PluginContext(self, self._application, old)
             # Snapshot handlers BEFORE we strip them so we can roll back
@@ -315,6 +396,7 @@ class HotReloadManager:
                 raise RuntimeError(
                     f"Reloaded plugin '{name}' is missing register(ctx)"
                 )
+            before = self._snapshot_app_handlers()
             try:
                 result = register(new_ctx)
                 if asyncio.iscoroutine(result):
@@ -328,6 +410,8 @@ class HotReloadManager:
                 old.handlers = [h for hs in saved_groups.values() for h in hs]
                 await self._reregister_old(old)
                 raise
+            # Track handlers register() added via app.add_handler.
+            self._diff_app_handlers(before, new_record)
             await self._call_lifecycle(new_module, new_ctx, "on_reload")
             self._plugins[name] = new_record
             logger.info(
