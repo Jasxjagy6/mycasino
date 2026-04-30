@@ -127,6 +127,7 @@ async def _antispam_callback(update: "Update", context) -> None:
         return
     user_id = query.from_user.id
     now = time.monotonic()
+    logger.debug("antispam: tap user=%s data=%r", user_id, query.data)
 
     # Already silenced?
     until = _silenced_until.get(user_id, 0.0)
@@ -171,7 +172,11 @@ def install_antispam(application: "Application") -> None:
     handler group (``-100``) so it runs before every plugin handler."""
     if getattr(application, "_antispam_installed", False):
         return
-    handler = CallbackQueryHandler(_antispam_callback, pattern=None, block=False)
+    # ``block=True`` is required for ``ApplicationHandlerStop`` to actually
+    # short-circuit the rest of the dispatch — non-blocking handlers run
+    # in their own task and the stop exception never reaches the
+    # application's processing loop.
+    handler = CallbackQueryHandler(_antispam_callback, pattern=None, block=True)
     application.add_handler(handler, group=-100)
     setattr(application, "_antispam_installed", True)
     logger.info(

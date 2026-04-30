@@ -109,13 +109,81 @@ def register(ctx):
     except Exception:
         logger.exception("[hotpatch] _wireup failed")
 
-    # 4. Install anti-spam middleware (idempotent).
+    # 4. Install anti-spam middleware. We tear down any previously
+    # installed handler first because a prior version of this hotpatch
+    # registered the middleware with ``block=False`` which prevents
+    # ``ApplicationHandlerStop`` from short-circuiting downstream
+    # handlers — taking it out and re-installing with ``block=True``
+    # is the safe path.
     try:
+        try:
+            for group, handlers in list((app.handlers or {}).items()):
+                for h in list(handlers):
+                    cb = getattr(h, "callback", None)
+                    if getattr(cb, "__module__", "") == "runtime.antispam":
+                        try:
+                            app.remove_handler(h, group=group)
+                        except Exception:
+                            pass
+            setattr(app, "_antispam_installed", False)
+        except Exception:
+            pass
+        # Reload the module so the new ``block=True`` registration
+        # path is in effect even after a partial earlier install.
+        try:
+            import runtime.antispam as _as
+            importlib.reload(_as)
+        except Exception:
+            from runtime import antispam as _as  # noqa: F401
         from runtime.antispam import install_antispam
         install_antispam(app)
-        logger.info("[hotpatch] antispam middleware installed")
+        logger.info("[hotpatch] antispam middleware installed (block=True)")
     except Exception:
         logger.exception("[hotpatch] antispam install failed")
+
+    # 4b. Reload runtime.admin_handlers + re-register the runtime command
+    # surface so /runtimestatus picks up the antispam + win-broadcast
+    # counter blocks (and so /refreshcore is available without a bot
+    # restart).
+    try:
+        import runtime.admin_handlers as _ah
+        importlib.reload(_ah)
+        # Strip any previous runtime admin handlers we own so we don't
+        # double-register them.
+        try:
+            for group, handlers in list((app.handlers or {}).items()):
+                for h in list(handlers):
+                    cb = getattr(h, "callback", None)
+                    cb_mod = getattr(cb, "__module__", "")
+                    cb_qual = getattr(cb, "__qualname__", "")
+                    if cb_mod == "runtime.admin_handlers" or (
+                        cb_qual.endswith("_status_cmd")
+                        or cb_qual.endswith("_list_cmd")
+                        or cb_qual.endswith("_reload_cmd")
+                        or cb_qual.endswith("_reloadall_cmd")
+                        or cb_qual.endswith("_loadplugin_cmd")
+                        or cb_qual.endswith("_unloadplugin_cmd")
+                        or cb_qual.endswith("_refreshcore_cmd")
+                    ):
+                        try:
+                            app.remove_handler(h, group=group)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        # Re-call register_runtime to install the freshly-reloaded
+        # admin command surface against the same plugin manager.
+        try:
+            from runtime import plugin_loader as _pl
+            from core.foundation import is_admin as _is_admin
+            pm = getattr(_pl, "_singleton", None)
+            if pm is not None and hasattr(_ah, "register_admin_handlers"):
+                _ah.register_admin_handlers(app, pm, is_admin=_is_admin)
+                logger.info("[hotpatch] admin handlers re-registered")
+        except Exception:
+            logger.exception("[hotpatch] admin handler re-register failed")
+    except Exception:
+        logger.exception("[hotpatch] admin_handlers reload failed")
 
     # 5. Patch the running PluginManager so its `_adopt_existing`
     # picks up handlers wrapped by core.foundation decorators
