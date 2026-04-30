@@ -376,9 +376,20 @@ async def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False,
     if win and win_amount and win_amount > 0:
         try:
             from core import win_broadcaster
+            # Resolve a human-readable game type. Many call sites pass
+            # only ``game_id`` (no ``game_type``) and a corresponding
+            # entry in ``game_sessions`` may have already been popped by
+            # the time we reach here. Fall back to the prefix of the
+            # game id which encodes the game (eg. ``SCRATCH-…``,
+            # ``BJ-…``, ``MNS-…``).
+            broadcast_game_type = game_type
+            if not broadcast_game_type or broadcast_game_type == 'unknown':
+                gid = str(game_id or '')
+                prefix = gid.split('-', 1)[0].lower() if gid else ''
+                broadcast_game_type = prefix or 'game'
             win_broadcaster.schedule_win_broadcast(
                 user_id=user_id,
-                game_type=game_type,
+                game_type=broadcast_game_type,
                 bet_usd=amount,
                 win_usd=win_amount,
                 multiplier=multiplier,

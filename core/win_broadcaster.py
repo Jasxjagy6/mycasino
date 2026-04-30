@@ -58,33 +58,54 @@ _dropped = 0  # observability counter; surfaced via /runtimestatus eventually
 _round_robin_idx = 0  # spreads load across all configured helper bots
 
 
-# Map internal game_type strings to display names.
+# Map internal game_type strings (and game_id prefixes) to display names.
+# Game IDs in this casino are formatted ``<PREFIX>-<datetime>-<rand>`` so
+# the prefix uniquely identifies the originating game — we lowercase
+# both sides before lookup.
 _GAME_DISPLAY_NAMES = {
     "blackjack": "Blackjack",
+    "bj": "Blackjack",
     "dice": "Dice",
     "dr": "Dice Race",
     "rush": "Dice Rush",
     "flip": "Coin Flip",
+    "cf": "Coin Flip",
     "predict": "Predict",
+    "pdt": "Predict",
     "slots": "Slots",
     "sl": "Slots",
     "roulette": "Roulette",
+    "rl": "Roulette",
+    "rt": "Roulette",
     "mines": "Mines",
+    "mns": "Mines",
     "tower": "Tower",
+    "twr": "Tower",
     "limbo": "Limbo",
+    "lmb": "Limbo",
     "keno": "Keno",
     "highlow": "High-Low",
     "hl": "High-Low",
     "plinko": "Plinko",
+    "pl": "Plinko",
+    "plk": "Plinko",
     "wheel": "Wheel",
+    "wh": "Wheel",
     "scratch": "Scratch",
+    "sc": "Scratch",
     "crash": "Crash",
+    "cr": "Crash",
     "coinchain": "CoinChain",
+    "cc": "CoinChain",
     "chicken": "Chicken Road",
     "chicken_road": "Chicken Road",
+    "ckn": "Chicken Road",
     "matches": "Match",
+    "match": "Match",
     "pvp": "PvP Match",
     "pvb": "PvB Match",
+    "raffle": "Raffle",
+    "rfl": "Raffle",
 }
 
 
@@ -161,23 +182,61 @@ def _ensure_queue() -> asyncio.Queue:
     return _queue
 
 
+# Track which helper Bot instances have had `initialize()` called on
+# them. Direct `Bot(token=...)` instances (constructed outside an
+# Application) are NOT auto-initialised by PTB v20+, so the first
+# `send_message()` raises "Bot is not properly initialized". Initialising
+# is idempotent at the http-pool level — we just need to do it once per
+# Bot object.
+_initialised_bots: set = set()
+
+
+async def _ensure_bot_initialised(b) -> None:
+    if b is None:
+        return
+    if id(b) in _initialised_bots:
+        return
+    init = getattr(b, "initialize", None)
+    if init is None:
+        _initialised_bots.add(id(b))
+        return
+    try:
+        await init()
+    except Exception:  # noqa: BLE001 — already-initialised raises here
+        pass
+    _initialised_bots.add(id(b))
+
+
 async def _send_one(payload: dict) -> None:
     """Send a single broadcast. Errors are logged but never raised — a
     win broadcast must never disrupt gameplay."""
     if not WIN_CHANNEL:
         return
-    bot = _pick_helper_bot()
     text = payload["text"]
     last_err: Optional[Exception] = None
-    # Try helper bot first, then fall back to remaining helpers in pool.
-    candidates = []
+    # Try ``_pick_helper_bot()`` first then any remaining helpers in the
+    # pool. Use ``id()``-based dedup because ``Bot.__eq__`` in PTB v20+
+    # accesses ``self.token`` and raises "Bot is not properly
+    # initialized" on freshly-constructed Bot instances — that's the
+    # root of the broadcast crash we kept seeing.
+    pool = helper_bots or ([helper_bot] if helper_bot else [])
+    candidates: list = []
+    seen_ids: set = set()
+    bot = _pick_helper_bot()
     if bot is not None:
         candidates.append(bot)
-    pool = helper_bots or ([helper_bot] if helper_bot else [])
+        seen_ids.add(id(bot))
     for b in pool:
-        if b not in candidates:
+        if id(b) not in seen_ids:
             candidates.append(b)
-    for b in candidates:
+            seen_ids.add(id(b))
+    for i, b in enumerate(candidates):
+        try:
+            await _ensure_bot_initialised(b)
+        except Exception as e:
+            logging.debug("Win broadcast init helper %d failed: %r", i, e)
+            last_err = e
+            continue
         try:
             await b.send_message(
                 chat_id=WIN_CHANNEL,
@@ -185,15 +244,17 @@ async def _send_one(payload: dict) -> None:
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
+
             return
         except Exception as e:
             last_err = e
+            logging.debug("Win broadcast helper %d send failed: %r", i, e)
             # Try the next helper. Most "Forbidden: bot is not a member"
             # errors mean THIS particular helper hasn't been added to the
             # channel — the next one might be.
             continue
     if last_err is not None:
-        logging.debug("Win broadcast skipped: %s", last_err)
+        logging.warning("Win broadcast: all helpers failed: %r", last_err)
 
 
 async def _drain_queue() -> None:

@@ -27,12 +27,34 @@ VERSION = 1
 def register(ctx):
     app = ctx.application
 
-    # 1. Ensure the new win_broadcaster module is imported.
+    # 1. Ensure the new win_broadcaster module is imported. Cancel any
+    # in-flight worker first so the reload doesn't leave an old task
+    # bound to stale code.
     try:
-        if "core.win_broadcaster" in sys.modules:
-            importlib.reload(sys.modules["core.win_broadcaster"])
+        old = sys.modules.get("core.win_broadcaster")
+        if old is not None:
+            t = getattr(old, "_worker_task", None)
+            if t is not None and not t.done():
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            # Drop module-level state so reload starts clean.
+            for k in ("_worker_task", "_queue", "_initialised_bots"):
+                if hasattr(old, k):
+                    try:
+                        setattr(old, k, None if k != "_initialised_bots" else set())
+                    except Exception:
+                        pass
+            importlib.reload(old)
         else:
             importlib.import_module("core.win_broadcaster")
+        # Force the worker to start so the queue starts draining.
+        try:
+            wb = sys.modules["core.win_broadcaster"]
+            wb._ensure_worker()
+        except Exception:
+            logger.exception("[hotpatch] _ensure_worker failed")
         logger.info("[hotpatch] core.win_broadcaster ready")
     except Exception:
         logger.exception("[hotpatch] win_broadcaster import failed")
@@ -45,6 +67,38 @@ def register(ctx):
         importlib.import_module("core.wallet")
     except Exception:
         logger.exception("[hotpatch] core.wallet reload failed")
+
+    # 2b. Push the freshly-reloaded wallet symbols into every plugin
+    # module's namespace, OVERWRITING the stale references they
+    # received via `from core.foundation import *` at original import
+    # time. The default _wireup() pushback uses setdefault, which won't
+    # replace already-set names — that's exactly why /scratch & friends
+    # call the OLD update_stats_on_bet (no win-broadcast hook).
+    try:
+        wallet_mod = sys.modules.get("core.wallet")
+        if wallet_mod is not None:
+            wallet_public = {
+                k: getattr(wallet_mod, k)
+                for k in dir(wallet_mod)
+                if not k.startswith("__")
+                and getattr(getattr(wallet_mod, k, None), "__module__", "") == "core.wallet"
+            }
+            replaced = 0
+            for mn, mod in list(sys.modules.items()):
+                if not mn.startswith("plugins.") and mn != "core.foundation":
+                    continue
+                if mod is None:
+                    continue
+                for k, v in wallet_public.items():
+                    if k in mod.__dict__ and mod.__dict__[k] is not v:
+                        mod.__dict__[k] = v
+                        replaced += 1
+            logger.info(
+                "[hotpatch] re-bound %d wallet symbols across plugins",
+                replaced,
+            )
+    except Exception:
+        logger.exception("[hotpatch] wallet re-bind failed")
 
     # 3. Re-run _wireup() to re-hoist symbols across split modules.
     try:
