@@ -1,0 +1,32 @@
+[Unit]
+Description=mycasino Telegram bot (%i color)
+After=network-online.target redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mycasino
+Group=mycasino
+WorkingDirectory=/opt/mycasino-%i
+EnvironmentFile=/etc/mycasino/%i.env
+
+# Per-color port: blue -> 8000, green -> 8001.  Health: port+1000.
+Environment=MYCASINO_COLOR=%i
+ExecStart=/opt/mycasino-%i/.venv/bin/python -m bot
+
+# Drain grace: send SIGTERM, give the bot DRAIN_SECONDS to flush.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
