@@ -1,0 +1,28 @@
+# Minimal redis.conf snippet recommended for the mycasino queue.
+#
+# The receiver writes Telegram updates to a Stream capped at
+# MYCASINO_QUEUE_MAXLEN (default 100k) using XADD MAXLEN ~ N, so the
+# stream's memory footprint is bounded.  We still want AOF persistence
+# turned on for the rare case where redis crashes during a deploy --
+# without it the workers' in-flight (un-XACKed) entries would be lost.
+
+bind 127.0.0.1 ::1
+protected-mode yes
+
+# Persistence: AOF is enough for our workload (no large datasets).
+appendonly yes
+appendfsync everysec
+
+# Lazy free keeps the main thread responsive when older stream entries
+# get trimmed by the receiver's MAXLEN ~ N.
+lazyfree-lazy-eviction yes
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del yes
+lazyfree-lazy-user-del yes
+
+# Tune for tens of thousands of pending entries comfortably.
+maxmemory 512mb
+maxmemory-policy noeviction
+
+# Keep replication off unless you actually run a replica.
+# replicaof <host> <port>

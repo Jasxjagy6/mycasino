@@ -1,0 +1,30 @@
+[Unit]
+Description=mycasino Telegram update worker (%i)
+After=network-online.target redis.service mycasino-receiver.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mycasino
+Group=mycasino
+WorkingDirectory=/opt/mycasino
+EnvironmentFile=/etc/mycasino/worker.env
+Environment=MYCASINO_QUEUE_CONSUMER=worker-%i
+ExecStart=/opt/mycasino/.venv/bin/python -m runtime.queue_worker
+
+# Workers can be restarted at will -- the receiver buffers updates in
+# the Redis Stream while we're down.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

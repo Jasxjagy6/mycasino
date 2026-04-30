@@ -1,0 +1,28 @@
+[Unit]
+Description=mycasino Telegram update receiver (Redis enqueue)
+After=network-online.target redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mycasino
+Group=mycasino
+WorkingDirectory=/opt/mycasino
+EnvironmentFile=/etc/mycasino/receiver.env
+ExecStart=/opt/mycasino/.venv/bin/python -m runtime.queue_receiver
+
+# The receiver is intentionally tiny -- restart fast, no drain needed.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+Restart=always
+RestartSec=2
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

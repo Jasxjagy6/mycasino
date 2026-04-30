@@ -1,0 +1,5 @@
+# Extra dependencies for the zero-downtime runtime layer (runtime/*).
+# Install on top of requirements.txt:
+#     pip install -r requirements.txt -r requirements-runtime.txt
+redis>=5.0,<6        # asyncio client + Streams support (XADD/XREADGROUP/XAUTOCLAIM)
+aiohttp>=3.9,<4      # already pulled in by requirements.txt; pinned here for clarity
