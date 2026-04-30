@@ -33,7 +33,7 @@ def register_runtime(
     application: "Application",
     *,
     is_admin: Optional[Callable[[int], bool]] = None,
-    plugins_package: str = "plugins",
+    plugins_package: Optional[str] = None,
     autoload_plugins: Optional[bool] = None,
 ) -> PluginManager:
     """Wire the runtime layer onto an existing PTB application.
@@ -57,6 +57,9 @@ def register_runtime(
     if getattr(application, _RUNTIME_FLAG, False):
         logger.debug("Runtime already installed on application; skipping")
         return application.bot_data.get("plugin_manager")  # type: ignore[return-value]
+
+    if plugins_package is None:
+        plugins_package = os.environ.get("MYCASINO_PLUGINS_PACKAGE", "plugins")
 
     manager = PluginManager(application, package=plugins_package)
     if not is_installed():
