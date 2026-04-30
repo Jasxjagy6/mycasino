@@ -80,7 +80,7 @@ async def coin_flip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
          apply_button_style(InlineKeyboardButton("Tails", callback_data=f"flip_pick_{game_id}_Tails"), 'primary')]
     ]
     await update.message.reply_text(
-        f"{pe('coin')} <b>Coin Flip Started!</b> (ID: <code>{game_id}</code>)\n\n💰 Bet: ${bet:.2f}\nChoose Heads or Tails!\n\n"
+        f"{pe('coin')} <b>Coin Flip Started!</b> (ID: <code>{game_id}</code>)\n\n💰 Bet: {dformat(bet)}\nChoose Heads or Tails!\n\n"
         f"{pe('target')} Current Multiplier: 1.94x",
         parse_mode=ParseMode.HTML,
         reply_markup=create_styled_keyboard(keyboard)
@@ -127,11 +127,11 @@ async def coin_flip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             keyboard = [
                 [apply_button_style(InlineKeyboardButton("Heads", callback_data=f"flip_pick_{game_id}_Heads"), 'primary'),
                  apply_button_style(InlineKeyboardButton("Tails", callback_data=f"flip_pick_{game_id}_Tails"), 'primary')],
-                [apply_button_style(InlineKeyboardButton(f"Cash Out (${win_amount:.2f})", callback_data=f"flip_cashout_{game_id}"), 'success')]
+                [apply_button_style(InlineKeyboardButton(f"Cash Out ({dformat(win_amount)})", callback_data=f"flip_cashout_{game_id}"), 'success')]
             ]
             await query.edit_message_text(
                 f"{pe('win')} <b>Correct!</b> The coin landed on {pick}!\n\n"
-                f"{pe('money')} Current Win: <b>${win_amount:.2f}</b>\n🔥 Streak: {game['streak']}\n"
+                f"{pe('money')} Current Win: <b>{dformat(win_amount)}</b>\n🔥 Streak: {game['streak']}\n"
                 f"{pe('target')} Next Multiplier: {next_multiplier:.2f}x\n\nContinue playing or cash out?\nID: <code>{game_id}</code>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=create_styled_keyboard(keyboard)
@@ -193,7 +193,7 @@ async def coin_flip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ]
 
         await query.edit_message_text(
-            f"{pe('withdraw')} <b>Cashed Out!</b>\n\n🎉 You won <b>${win_amount:.2f}</b>!\n"
+            f"{pe('withdraw')} <b>Cashed Out!</b>\n\n🎉 You won <b>{dformat(win_amount)}</b>!\n"
             f"{pe('fire')} Final streak: {game['streak']}\n📈 Final multiplier: {multiplier:.2f}x\nID: <code>{game_id}</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard)
@@ -280,7 +280,7 @@ async def dice_roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
-        result_text = f"{pe('lose')} You lose ${bet_amount:.2f}. Try again!"
+        result_text = f"{pe('lose')} You lose {dformat(bet_amount)}. Try again!"
         await update_stats_on_bet(user.id, game_id, bet_amount, False, context=context)
 
     game_sessions[game_id] = {
@@ -295,7 +295,7 @@ async def dice_roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"{pe('dice')} <b>Dice Roll Result</b> (ID: <code>{game_id}</code>)\n\n🎯 Result: <b>{dice_result}</b>\n"
-        f"{pe('dice')} Your Choice: {choice}\n💰 Your Bet: ${bet_amount:.2f}\n\n{result_text}",
+        f"{pe('dice')} Your Choice: {choice}\n💰 Your Bet: {dformat(bet_amount)}\n\n{result_text}",
         parse_mode=ParseMode.HTML
     )
 
@@ -429,7 +429,7 @@ async def _play_classic_rush(update, context, user, chosen_number, bet_amount):
     # Send waiting message
     wait_msg = await update.message.reply_text(
         f"{pe('dice')} <b>Classic Rush</b>\n"
-        f"Your pick: <b>{chosen_number}</b> | Bet: ${bet_amount:.2f}\n"
+        f"Your pick: <b>{chosen_number}</b> | Bet: {dformat(bet_amount)}\n"
         f"Rolling 6 dice...",
         parse_mode=ParseMode.HTML
     )
@@ -483,7 +483,7 @@ async def _play_classic_rush(update, context, user, chosen_number, bet_amount):
         f"Your Pick: <b>{chosen_number}</b>\n"
         f"Rolls: [{dice_display}]\n"
         f"Matches: <b>{matches}</b>/6\n"
-        f"Bet: ${bet_amount:.2f}\n\n"
+        f"Bet: {dformat(bet_amount)}\n\n"
         f"{result_text}",
         parse_mode=ParseMode.HTML
     )
@@ -502,7 +502,7 @@ async def _play_odd_even_rush(update, context, user, choice, bet_amount):
 
     wait_msg = await update.message.reply_text(
         f"{pe('dice')} <b>Odd/Even Rush</b>\n"
-        f"Your pick: <b>{choice.upper()}</b> | Bet: ${bet_amount:.2f}\n"
+        f"Your pick: <b>{choice.upper()}</b> | Bet: {dformat(bet_amount)}\n"
         f"Rolling 6 dice...",
         parse_mode=ParseMode.HTML
     )
@@ -556,7 +556,7 @@ async def _play_odd_even_rush(update, context, user, choice, bet_amount):
         f"Your Pick: <b>{parity_label}</b>\n"
         f"Rolls: [{dice_display}]\n"
         f"{parity_label} Matches: <b>{matches}</b>/6\n"
-        f"Bet: ${bet_amount:.2f}\n\n"
+        f"Bet: {dformat(bet_amount)}\n\n"
         f"{result_text}",
         parse_mode=ParseMode.HTML
     )
@@ -575,7 +575,7 @@ async def _play_high_low_rush(update, context, user, choice, bet_amount):
 
     wait_msg = await update.message.reply_text(
         f"{pe('dice')} <b>High/Low Rush</b>\n"
-        f"Your pick: <b>{choice.upper()}</b> | Bet: ${bet_amount:.2f}\n"
+        f"Your pick: <b>{choice.upper()}</b> | Bet: {dformat(bet_amount)}\n"
         f"Rolling 6 dice...",
         parse_mode=ParseMode.HTML
     )
@@ -629,7 +629,7 @@ async def _play_high_low_rush(update, context, user, choice, bet_amount):
         f"Your Pick: <b>{label}</b>\n"
         f"Rolls: [{dice_display}]\n"
         f"{label} Matches: <b>{matches}</b>/6\n"
-        f"Bet: ${bet_amount:.2f}\n\n"
+        f"Bet: {dformat(bet_amount)}\n\n"
         f"{result_text}",
         parse_mode=ParseMode.HTML
     )
@@ -674,7 +674,7 @@ async def _play_rainbow_rush(update, context, user, bet_amount):
 
     wait_msg = await update.message.reply_text(
         f"{pe('rainbow')} <b>Rainbow Rush</b>\n"
-        f"Bet: ${bet_amount:.2f} | Win: 55x if all 6 dice are different!\n"
+        f"Bet: {dformat(bet_amount)} | Win: 55x if all 6 dice are different!\n"
         f"Rolling 6 dice...",
         parse_mode=ParseMode.HTML
     )
@@ -720,7 +720,7 @@ async def _play_rainbow_rush(update, context, user, bet_amount):
         f"{pe('rainbow')} <b>Rainbow Rush Result</b> (ID: <code>{game_id}</code>)\n\n"
         f"Rolls: [{dice_display}]\n"
         f"Unique: <b>{unique_count}</b>/6\n"
-        f"Bet: ${bet_amount:.2f}\n\n"
+        f"Bet: {dformat(bet_amount)}\n\n"
         f"{result_text}",
         parse_mode=ParseMode.HTML
     )
@@ -765,7 +765,7 @@ async def _play_blaze_rush(update, context, user, bet_amount):
 
     wait_msg = await update.message.reply_text(
         f"{pe('fire')} <b>Blaze Rush</b>\n"
-        f"Bet: ${bet_amount:.2f} | Win: 25x if all same parity!\n"
+        f"Bet: {dformat(bet_amount)} | Win: 25x if all same parity!\n"
         f"Rolling 6 dice...",
         parse_mode=ParseMode.HTML
     )
@@ -815,7 +815,7 @@ async def _play_blaze_rush(update, context, user, bet_amount):
     await update.message.reply_text(
         f"{pe('fire')} <b>Blaze Rush Result</b> (ID: <code>{game_id}</code>)\n\n"
         f"Rolls: [{dice_display}]\n"
-        f"Bet: ${bet_amount:.2f}\n\n"
+        f"Bet: {dformat(bet_amount)}\n\n"
         f"{result_text}",
         parse_mode=ParseMode.HTML
     )

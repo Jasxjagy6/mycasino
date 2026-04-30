@@ -117,7 +117,7 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         menu_text = (
             f"{pe('target')} <b>Roulette Game</b>\n\n"
-            f"{pe('money')} Bet Amount: <b>${bet_amount:.2f}</b>\n\n"
+            f"{pe('money')} Bet Amount: <b>{dformat(bet_amount)}</b>\n\n"
             f"Select your bet or choose numbers:"
         )
 
@@ -279,7 +279,7 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = (f"{pe('target')} <b>Roulette Result</b> (ID: <code>{game_id}</code>)\n\n"
         f"{pe('casino')} Winning Number: <b>{winning_number}</b> {color}\n"
-        f"{pe('dice')} Your Choice: {choice}\n💰 Your Bet: ${bet_amount:.2f}\n\n{result_text}")
+        f"{pe('dice')} Your Choice: {choice}\n💰 Your Bet: {dformat(bet_amount)}\n\n{result_text}")
 
     if template:
         await update.message.reply_photo(
@@ -514,7 +514,7 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['roulette_selected_numbers'] = []
         menu_text = (
             f"{pe('target')} <b>Roulette Game</b>\n\n"
-            f"{pe('money')} Bet Amount: <b>${bet_amount:.2f}</b>\n\n"
+            f"{pe('money')} Bet Amount: <b>{dformat(bet_amount)}</b>\n\n"
             f"Select your bet or choose numbers:"
         )
         await safe_edit_message(
@@ -548,7 +548,7 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         menu_text = (
             f"{pe('target')} <b>Roulette - Number Selection</b>\n\n"
-            f"{pe('money')} Bet Amount: <b>${bet_amount:.2f}</b>\n"
+            f"{pe('money')} Bet Amount: <b>{dformat(bet_amount)}</b>\n"
             f"{pe('dice')} Selected: <b>{len(selected_numbers)}/6 numbers</b>\n"
             f"{pe('chart')} Multiplier: <b>{multiplier}x</b>\n\n"
             f"Select up to 6 numbers (tap to toggle):"
@@ -566,7 +566,7 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['roulette_selected_numbers'] = []
         menu_text = (
             f"{pe('target')} <b>Roulette - Number Selection</b>\n\n"
-            f"{pe('money')} Bet Amount: <b>${bet_amount:.2f}</b>\n"
+            f"{pe('money')} Bet Amount: <b>{dformat(bet_amount)}</b>\n"
             f"{pe('dice')} Selected: <b>0/6 numbers</b>\n"
             f"{pe('chart')} Multiplier: <b>36x</b>\n\n"
             f"Select up to 6 numbers (tap to toggle):"
@@ -637,7 +637,7 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Update menu to show selection
             menu_text = (
                 f"{pe('target')} <b>Roulette Game</b>\n\n"
-                f"{pe('money')} Bet Amount: <b>${bet_amount:.2f}</b>\n"
+                f"{pe('money')} Bet Amount: <b>{dformat(bet_amount)}</b>\n"
                 f"{pe('dice')} Selected: <b>{display_name}</b>\n\n"
                 f"Tap <b>Start</b> to play or select a different option:"
             )
@@ -770,7 +770,7 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (f"{pe('target')} <b>Roulette Result</b> (ID: <code>{game_id}</code>)\n\n"
         f"{pe('casino')} Winning Number: <b>{winning_number}</b> {color}\n"
         f"{pe('dice')} Your Choice: {choice_display}\n"
-        f"{pe('money')} Your Bet: ${bet_amount:.2f}\n\n{result_text}")
+        f"{pe('money')} Your Bet: {dformat(bet_amount)}\n\n{result_text}")
 
     if template:
         await query.edit_message_media(

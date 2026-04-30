@@ -574,7 +574,7 @@ async def pvp_timeout_finish_job(context: ContextTypes.DEFAULT_TYPE):
                 user_stats[loser_id]['game_sessions'] = []
             user_stats[loser_id]['game_sessions'].append(match_id)
 
-        text += f"{pe('trophy')} <b>{final_winner_mention} wins the match and earns ${winnings:.2f}!</b>"
+        text += f"{pe('trophy')} <b>{final_winner_mention} wins the match and earns {dformat(winnings)}!</b>"
         # Emoji-game match messages are no longer pinned, so nothing to unpin.
     else:
         # Continue to next round - player who rolled (winner) rolls first

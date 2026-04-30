@@ -133,7 +133,7 @@ async def keno_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"────────\n\n"
         f"{pe('chart')} <b>Game Status:</b>\n"
         f"• Numbers Selected: 0/10\n"
-        f"• Bet Amount: ${bet_amount:.2f}\n\n"
+        f"• Bet Amount: {dformat(bet_amount)}\n\n"
         f"📝 <b>Instructions:</b>\n"
         f"Pick 1 to 10 numbers from the grid below."
     )
@@ -321,8 +321,8 @@ async def keno_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 result_text += (
                     f"{pe('win')} <b>YOU WIN!</b>\n"
                     f"{pe('money')} Multiplier: {multiplier}x\n"
-                    f"{pe('balance')} Profit: ${profit:.2f}\n"
-                    f"{pe('withdraw')} Total Payout: ${winnings:.2f}\n"
+                    f"{pe('balance')} Profit: {dformat(profit)}\n"
+                    f"{pe('withdraw')} Total Payout: {dformat(winnings)}\n"
                 )
             else:
                 result_text += (
@@ -360,7 +360,7 @@ async def keno_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb = InlineKeyboardMarkup([[rebet_btn, double_btn], [pf_button]])
 
             if win:
-                caption = f"{pe('win')} <b>YOU WIN!</b>\n{pe('money')} Multiplier: {multiplier}x\n{pe('balance')} Profit: ${profit:.2f}\n{pe('withdraw')} Total Payout: ${winnings:.2f}\n<b>Game ID:</b> <code>{game_id}</code>"
+                caption = f"{pe('win')} <b>YOU WIN!</b>\n{pe('money')} Multiplier: {multiplier}x\n{pe('balance')} Profit: {dformat(profit)}\n{pe('withdraw')} Total Payout: {dformat(winnings)}\n<b>Game ID:</b> <code>{game_id}</code>"
             else:
                 caption = f"{pe('cross')} <b>NO WIN</b>\n{pe('withdraw')} Lost: ${game['bet_amount']:.2f}\nBetter luck next time!\n<b>Game ID:</b> <code>{game_id}</code>"
 
@@ -503,13 +503,13 @@ async def keno_rebet_double_callback(update: Update, context: ContextTypes.DEFAU
         result_text += (
             f"{pe('win')} <b>YOU WIN!</b>\n"
             f"{pe('money')} Multiplier: {multiplier}x\n"
-            f"{pe('balance')} Profit: ${profit:.2f}\n"
-            f"{pe('withdraw')} Total Payout: ${winnings:.2f}\n"
+            f"{pe('balance')} Profit: {dformat(profit)}\n"
+            f"{pe('withdraw')} Total Payout: {dformat(winnings)}\n"
         )
     else:
         result_text += (
             f"{pe('cross')} <b>NO WIN</b>\n"
-            f"{pe('withdraw')} Lost: ${bet_amount:.2f}\n"
+            f"{pe('withdraw')} Lost: {dformat(bet_amount)}\n"
             f"Better luck next time!"
         )
 

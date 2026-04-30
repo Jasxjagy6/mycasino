@@ -65,7 +65,7 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result_text = f"{pe('win')} {win_type}\nYou win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
-        result_text = f"{pe('lose')} No match! You lose ${bet_amount:.2f}\nTry again for the jackpot!"
+        result_text = f"{pe('lose')} No match! You lose {dformat(bet_amount)}\nTry again for the jackpot!"
         await update_stats_on_bet(user.id, game_id, bet_amount, False, context=context)
 
     game_sessions[game_id] = {
@@ -93,7 +93,7 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     await update.message.reply_text(
-        f"{pe('casino')} <b>Slots Result</b>\n\n💰 Your Bet: ${bet_amount:.2f}\n\n{result_text}",
+        f"{pe('casino')} <b>Slots Result</b>\n\n💰 Your Bet: {dformat(bet_amount)}\n\n{result_text}",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -139,10 +139,10 @@ async def slots_rebet_double_callback(update: Update, context: ContextTypes.DEFA
     max_bet = limits.get('max')
 
     if bet_amount < min_bet:
-        await query.answer(f"Minimum bet is ${min_bet:.2f}", show_alert=True)
+        await query.answer(f"Minimum bet is {dformat(min_bet)}", show_alert=True)
         return
     if max_bet is not None and bet_amount > max_bet:
-        await query.answer(f"Maximum bet is ${max_bet:.2f}", show_alert=True)
+        await query.answer(f"Maximum bet is {dformat(max_bet)}", show_alert=True)
         return
 
     # Check balance
@@ -183,7 +183,7 @@ async def slots_rebet_double_callback(update: Update, context: ContextTypes.DEFA
         result_text = f"{pe('win')} {win_type}\nYou win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
-        result_text = f"{pe('lose')} No match! You lose ${bet_amount:.2f}\nTry again for the jackpot!"
+        result_text = f"{pe('lose')} No match! You lose {dformat(bet_amount)}\nTry again for the jackpot!"
         await update_stats_on_bet(user.id, game_id, bet_amount, False, context=context)
 
     game_sessions[game_id] = {
@@ -212,7 +212,7 @@ async def slots_rebet_double_callback(update: Update, context: ContextTypes.DEFA
     ]
 
     await query.edit_message_text(
-        f"{pe('casino')} <b>Slots Result</b>\n\n💰 Your Bet: ${bet_amount:.2f}\n\n{result_text}",
+        f"{pe('casino')} <b>Slots Result</b>\n\n💰 Your Bet: {dformat(bet_amount)}\n\n{result_text}",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(keyboard)
     )

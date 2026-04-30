@@ -5079,14 +5079,14 @@ async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Add Higher button only if not King (13)
         if current_card != 13:
-            row1.append(apply_button_style(InlineKeyboardButton("Higher ({high_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_high"), 'primary'))
+            row1.append(apply_button_style(InlineKeyboardButton(f"Higher ({high_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_high"), 'primary'))
 
         # Add Lower button only if not Ace (1)
         if current_card != 1:
-            row1.append(apply_button_style(InlineKeyboardButton("Lower ({low_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_low"), 'success'))
+            row1.append(apply_button_style(InlineKeyboardButton(f"Lower ({low_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_low"), 'success'))
 
         # Row 2: Tie button
-        row2 = [apply_button_style(InlineKeyboardButton("Tie ({tie_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_tie"), 'primary')]
+        row2 = [apply_button_style(InlineKeyboardButton(f"Tie ({tie_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_tie"), 'primary')]
 
         # Row 3: Skip Card and Cashout buttons (if streak > 0)
         row3 = [apply_button_style(InlineKeyboardButton("Skip Card", callback_data=f"hl_skip_{game_id}"), 'primary')]

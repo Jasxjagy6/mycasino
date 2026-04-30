@@ -952,7 +952,7 @@ async def _resolve_split_game(query, context, game_id, bot_uname):
                 break
 
         if existing_result and existing_result["status"] == "bust":
-            results.append(f"Hand {i+1}: Bust (-${bet:.2f})")
+            results.append(f"Hand {i+1}: Bust (-{dformat(bet)})")
             continue
 
         if dealer_value > 21:
@@ -960,16 +960,16 @@ async def _resolve_split_game(query, context, game_id, bot_uname):
             winnings = bet * 1.94
             total_winnings += winnings
             credit_wallet(user_id, winnings)
-            results.append(f"Hand {i+1}: Win +${winnings:.2f}")
+            results.append(f"Hand {i+1}: Win +{dformat(winnings)}")
             game['win'] = True
         elif player_value > dealer_value:
             winnings = bet * 1.94
             total_winnings += winnings
             credit_wallet(user_id, winnings)
-            results.append(f"Hand {i+1}: Win +${winnings:.2f}")
+            results.append(f"Hand {i+1}: Win +{dformat(winnings)}")
             game['win'] = True
         elif player_value < dealer_value:
-            results.append(f"Hand {i+1}: Loss (-${bet:.2f})")
+            results.append(f"Hand {i+1}: Loss (-{dformat(bet)})")
             if not game.get('win'):
                 game['win'] = False
         else:
@@ -1071,7 +1071,7 @@ async def handle_dealer_turn(query, context, game_id, bot_uname: str = "Casino")
         winnings = game["bet_amount"] * 1.94
         credit_wallet(user_id, winnings)
         result_text_plain = "You Win!"
-        result_pe_text = f"{pe('win')} You win! ${winnings:.2f}"
+        result_pe_text = f"{pe('win')} You win! {dformat(winnings)}"
         result_color_tuple = BJ_WIN_COLOR
         game['win'] = True
         await update_stats_on_bet(user_id, game_id, original_bet, True, multiplier=1.94, context=context)

@@ -575,7 +575,7 @@ async def plinko_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if win:
-        result_text += f"{pe('win')} <b>WIN!</b>\n💵 Profit: ${profit:.2f}\n💸 Total Payout: ${winnings:.2f}"
+        result_text += f"{pe('win')} <b>WIN!</b>\n💵 Profit: {dformat(profit)}\n💸 Total Payout: {dformat(winnings)}"
     else:
         result_text += f"{pe('cross')} <b>LOST</b>\n💸 Lost: ${abs(profit):.2f}"
 

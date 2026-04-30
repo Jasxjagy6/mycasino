@@ -32,7 +32,16 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
-BASE_DIR = '/root/7'
+# Repo root: the directory containing bot.py / core/.  This used to be
+# hard-coded to '/root/7' which broke any deployment that wasn't sitting
+# in that exact path.  Resolve from this file's location so the bot
+# works on any host (dev VM, blue/green prod boxes, container, etc.).
+# Operators can still override via ``BASE_DIR`` env if they really want
+# to.
+BASE_DIR = os.environ.get(
+    "BASE_DIR",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
 
 import warnings
 
@@ -491,26 +500,57 @@ def _get_httpx_client():
     return _httpx_client
 
 def apply_button_style(button, style, custom_emoji_id=None):
+    """Best-effort styling for an InlineKeyboardButton.
+
+    The public Telegram Bot API does NOT support a ``style`` field on
+    inline-keyboard buttons (this is verified — sending it produces
+    ``Can't parse inline keyboard button: field "style" must be of
+    type string``).  We previously emitted the field anyway as a
+    speculative workaround, which broke ``/start``, ``/menu`` and
+    every other screen that built keyboards through this helper.
+
+    Today this helper:
+
+    * Optionally prepends a small marker emoji to the button label so
+      'success' / 'primary' / 'danger' visually differ even without
+      colored buttons.
+    * Forwards ``custom_emoji_id`` as ``icon_custom_emoji_id`` only —
+      this *is* a real (premium) Bot API field.
+    * Returns a plain ``InlineKeyboardButton`` (no dict injection),
+      which serialises cleanly through PTB to Telegram.
+
+    Callers can be migrated off this helper at their own pace; the
+    return value is API-compatible with the previous dict-style.
     """
-    Apply style to InlineKeyboardButton using dict injection workaround.
-
-    Telegram Bot API 9.4 supports button styles but python-telegram-bot library
-    doesn't have native support yet. This workaround manually injects the style
-    parameter into the button dictionary.
-
-    Args:
-        button: InlineKeyboardButton object
-        style: One of 'success' (green), 'danger' (red), or 'primary' (blue)
-        custom_emoji_id: Optional Telegram Premium Custom Emoji ID for button icon
-
-    Returns:
-        dict: Button dictionary with style parameter injected
-    """
-    btn_dict = button.to_dict()
-    btn_dict['style'] = style
-    if custom_emoji_id is not None:
-        btn_dict['icon_custom_emoji_id'] = custom_emoji_id
-    return btn_dict
+    label = button.text or ""
+    # Visual hint when no other marker is present.  We deliberately do
+    # NOT add prefixes if the caller already put a checkmark / cross /
+    # status emoji at the start of the label.
+    _hints = {
+        'success': '\u2705',  # ✅
+        'primary': '\U0001F535',  # 🔵
+        'danger':  '\U0001F534',  # 🔴
+        'warning': '\U0001F7E1',  # 🟡
+        'secondary': '\u26AA',   # ⚪
+    }
+    hint = _hints.get(style)
+    if hint and not any(label.startswith(p) for p in _hints.values()):
+        # Don't double-prefix.
+        label = f"{hint} {label}" if not label.startswith(hint) else label
+    new_kwargs = {
+        "text": label,
+        "url": button.url,
+        "callback_data": button.callback_data,
+        "web_app": button.web_app,
+        "login_url": button.login_url,
+        "switch_inline_query": button.switch_inline_query,
+        "switch_inline_query_current_chat": button.switch_inline_query_current_chat,
+        "callback_game": button.callback_game,
+        "pay": button.pay,
+    }
+    # PTB versions vary in field names; pop any None values.
+    new_kwargs = {k: v for k, v in new_kwargs.items() if v is not None}
+    return InlineKeyboardButton(**new_kwargs)
 
 def create_styled_keyboard(keyboard_array):
     """
@@ -1629,6 +1669,56 @@ def format_display_amount(
         return f"{sym}{body}"
     # Crypto: "0.012345 BTC" reads better than "₿0.012345"
     return f"{body} {c}"
+
+import contextvars as _contextvars  # noqa: E402  -- used by dformat()
+
+# Tracks the user id of the request currently being handled.  Set by
+# ``check_banned`` (the outermost decorator on every command/callback
+# handler) so any ``dformat()`` call inside game logic renders amounts
+# in *this* user's display currency without each game having to plumb
+# ``user.id`` through every f-string manually.
+_current_user_id: "_contextvars.ContextVar[int|None]" = _contextvars.ContextVar(
+    "_current_user_id", default=None
+)
+
+
+def get_current_user_id():
+    """Return the user id of the active handler, or None."""
+    return _current_user_id.get()
+
+
+def dformat(amount_usd, user_id=None, *, compact: bool = False) -> str:
+    """Render a USD amount in the *current* user's display currency.
+
+    The user id is taken from the contextvar set by ``check_banned``,
+    so call sites in game plugins just say::
+
+        f"💰 Bet: {dformat(bet_amount)}"
+
+    and INR users see ``₹100.00`` while USD users still see ``$100.00``.
+
+    When called outside any handler (e.g. background tasks, tests) and
+    ``user_id`` isn't explicitly passed, falls back to USD formatting
+    so we never accidentally dollarise an INR user's screen.
+    """
+    uid = user_id if user_id is not None else _current_user_id.get()
+    try:
+        amt = float(amount_usd or 0.0)
+    except (TypeError, ValueError):
+        amt = 0.0
+    if uid is None:
+        # No active user context — safest to keep the legacy "$X.XX" so
+        # we don't lie about currency.
+        if compact:
+            try:
+                return format_compact(amt, "USD")
+            except Exception:
+                pass
+        return f"${amt:,.2f}"
+    if compact:
+        return format_compact_for_user(uid, amt)
+    return format_for_user(uid, amt, compact=False)
+
 
 def format_for_user(
     user_id,
@@ -4832,7 +4922,14 @@ def check_banned(func):
             elif update.callback_query:
                 await update.callback_query.answer("You are temporarily banned.", show_alert=True)
             return
-        return await func(update, context, *args, **kwargs)
+        # Set the contextvar so any ``dformat()`` call inside the
+        # handler renders amounts in this user's display currency
+        # without each game plumbing user_id through every f-string.
+        token = _current_user_id.set(user.id)
+        try:
+            return await func(update, context, *args, **kwargs)
+        finally:
+            _current_user_id.reset(token)
     wrapper.__name__ = func.__name__
     return wrapper
 

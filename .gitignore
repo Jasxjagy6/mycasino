@@ -23,3 +23,7 @@ deposits.db
 __pycache__/
 *.pyc
 .venv/
+user_data/
+recovery_data/
+*.session
+*.session-journal

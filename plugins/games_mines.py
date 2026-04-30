@@ -52,7 +52,7 @@ def mines_keyboard(game_id, reveal=False):
         multiplier = get_mines_multiplier(game["num_mines"], safe_picks)
         winnings = game["bet_amount"] * multiplier
         # GREEN cashout button
-        cashout_text = f"Cashout (${winnings:.2f})"
+        cashout_text = f"Cashout ({dformat(winnings)})"
         cashout_btn = apply_button_style(
             InlineKeyboardButton(cashout_text, callback_data=f"mines_cashout_{game_id}_{user_id}"),
             'success',  # GREEN
@@ -131,7 +131,7 @@ async def mines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user_data(user.id)
 
     initial_text = (
-        f"{pe('bomb')} <b>Mines Game Started!</b> (ID: <code>{game_id}</code>)\n\nBet: <b>${bet_amount:.2f}</b>\nMines: <b>{num_mines}</b>\n\n"
+        f"{pe('bomb')} <b>Mines Game Started!</b> (ID: <code>{game_id}</code>)\n\nBet: <b>{dformat(bet_amount)}</b>\nMines: <b>{num_mines}</b>\n\n"
         "Click the buttons to reveal tiles. Find gems to increase your multiplier. Avoid the bombs!\n"
         "You can cash out after any successful pick."
     )
@@ -340,12 +340,12 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         kb = InlineKeyboardMarkup([[rebet_btn, double_btn], [pf_button]])
         if template:
             await query.edit_message_media(
-                InputMediaPhoto(template, caption=f"{pe('withdraw')} <b>Cashed Out!</b> (ID: <code>{game_id}</code>)\n\nYou won <b>${winnings:.2f}</b> with {safe_picks} correct picks!\nMultiplier: <b>{multiplier:.2f}x</b>", parse_mode=ParseMode.HTML),
+                InputMediaPhoto(template, caption=f"{pe('withdraw')} <b>Cashed Out!</b> (ID: <code>{game_id}</code>)\n\nYou won <b>{dformat(winnings)}</b> with {safe_picks} correct picks!\nMultiplier: <b>{multiplier:.2f}x</b>", parse_mode=ParseMode.HTML),
                 reply_markup=kb
             )
         else:
             await query.edit_message_text(
-                f"{pe('withdraw')} <b>Cashed Out!</b> (ID: <code>{game_id}</code>)\n\nYou won <b>${winnings:.2f}</b> with {safe_picks} correct picks!\nMultiplier: <b>{multiplier:.2f}x</b>",
+                f"{pe('withdraw')} <b>Cashed Out!</b> (ID: <code>{game_id}</code>)\n\nYou won <b>{dformat(winnings)}</b> with {safe_picks} correct picks!\nMultiplier: <b>{multiplier:.2f}x</b>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb
             )
@@ -555,7 +555,7 @@ async def mines_rebet_double_callback(update: Update, context: ContextTypes.DEFA
 
     mines_text = (
         f"{pe('bomb')} <b>Mines Game Started!</b> (ID: <code>{game_id}</code>)\n\n"
-        f"Bet: <b>${bet_amount:.2f}</b> | Mines: <b>{num_mines}</b>\n"
+        f"Bet: <b>{dformat(bet_amount)}</b> | Mines: <b>{num_mines}</b>\n"
         f"Pick tiles to find gems! Avoid the mines!\n\n"
         f"Tap tiles to reveal, or use Random button."
     )

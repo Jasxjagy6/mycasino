@@ -137,14 +137,14 @@ async def highlow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Add Higher button only if not King (13)
     if current_card != 13:
-        row1.append(apply_button_style(InlineKeyboardButton("Higher ({high_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_high"), 'primary'))
+        row1.append(apply_button_style(InlineKeyboardButton(f"Higher ({high_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_high"), 'primary'))
 
     # Add Lower button only if not Ace (1)
     if current_card != 1:
-        row1.append(apply_button_style(InlineKeyboardButton("Lower ({low_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_low"), 'success'))
+        row1.append(apply_button_style(InlineKeyboardButton(f"Lower ({low_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_low"), 'success'))
 
     # Row 2: Tie button
-    row2 = [apply_button_style(InlineKeyboardButton("Tie ({tie_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_tie"), 'primary')]
+    row2 = [apply_button_style(InlineKeyboardButton(f"Tie ({tie_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_tie"), 'primary')]
 
     # Row 3: Skip Card button only (no cashout on first card)
     row3 = [apply_button_style(InlineKeyboardButton("Skip Card", callback_data=f"hl_skip_{game_id}"), 'primary')]
@@ -162,7 +162,7 @@ async def highlow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"🎴 <b>High-Low Game Started!</b> (ID: <code>{game_id}</code>)\n\n"
-        f"{pe('money')} Bet: ${bet:.2f}\n"
+        f"{pe('money')} Bet: {dformat(bet)}\n"
         f"{pe('cards')} Current Card: <b>{card_name}</b>\n"
         f"{pe('chart')} Cards remaining: {len(deck)}\n\n"
         f"{mult_text}",
@@ -236,15 +236,15 @@ async def highlow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Build keyboard - row 1: Higher/Lower, row 2: Tie, row 3: Skip/Cashout
             row1 = []
             if new_card != 13:
-                row1.append(apply_button_style(InlineKeyboardButton("Higher ({high_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_high"), 'primary'))
+                row1.append(apply_button_style(InlineKeyboardButton(f"Higher ({high_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_high"), 'primary'))
             if new_card != 1:
-                row1.append(apply_button_style(InlineKeyboardButton("Lower ({low_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_low"), 'success'))
+                row1.append(apply_button_style(InlineKeyboardButton(f"Lower ({low_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_low"), 'success'))
 
-            row2 = [apply_button_style(InlineKeyboardButton("Tie ({tie_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_tie"), 'primary')]
+            row2 = [apply_button_style(InlineKeyboardButton(f"Tie ({tie_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_tie"), 'primary')]
 
             row3 = [
                 apply_button_style(InlineKeyboardButton("Skip Card", callback_data=f"hl_skip_{game_id}"), 'primary'),
-                apply_button_style(InlineKeyboardButton("Cash Out (${win_amount:.2f})", callback_data=f"hl_cashout_{game_id}"), 'success')
+                apply_button_style(InlineKeyboardButton("Cash Out ({dformat(win_amount)})", callback_data=f"hl_cashout_{game_id}"), 'success')
             ]
 
             keyboard = [row1, row2, row3]
@@ -260,7 +260,7 @@ async def highlow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"⏭️ <b>Card Skipped!</b>\n\n"
                 f"{pe('cards')} New Current Card: <b>{card_name}</b>\n"
-                f"{pe('money')} Current Win: <b>${win_amount:.2f}</b>\n"
+                f"{pe('money')} Current Win: <b>{dformat(win_amount)}</b>\n"
                 f"{pe('fire')} Streak: {game['streak']}\n"
                 f"{pe('stats')} Current Multiplier: {game['current_multiplier']:.2f}x\n"
                 f"{pe('chart')} Cards remaining: {len(game['deck'])}\n\n"
@@ -316,15 +316,15 @@ async def highlow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     # Build keyboard - row 1: Higher/Lower, row 2: Tie, row 3: Skip/Cashout
                     row1 = []
                     if next_card != 13:
-                        row1.append(apply_button_style(InlineKeyboardButton("Higher ({high_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_high"), 'primary'))
+                        row1.append(apply_button_style(InlineKeyboardButton(f"Higher ({high_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_high"), 'primary'))
                     if next_card != 1:
-                        row1.append(apply_button_style(InlineKeyboardButton("Lower ({low_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_low"), 'success'))
+                        row1.append(apply_button_style(InlineKeyboardButton(f"Lower ({low_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_low"), 'success'))
 
-                    row2 = [apply_button_style(InlineKeyboardButton("Tie ({tie_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_tie"), 'primary')]
+                    row2 = [apply_button_style(InlineKeyboardButton(f"Tie ({tie_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_tie"), 'primary')]
 
                     row3 = [
                         apply_button_style(InlineKeyboardButton("Skip Card", callback_data=f"hl_skip_{game_id}"), 'primary'),
-                        apply_button_style(InlineKeyboardButton("Cash Out (${win_amount:.2f})", callback_data=f"hl_cashout_{game_id}"), 'success')
+                        apply_button_style(InlineKeyboardButton("Cash Out ({dformat(win_amount)})", callback_data=f"hl_cashout_{game_id}"), 'success')
                     ]
 
                     keyboard = [row1, row2, row3]
@@ -340,7 +340,7 @@ async def highlow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.edit_message_text(
                         f"{pe('win')} <b>Correct!</b> The next card is {card_name}!\n\n"
                         f"{pe('cards')} Current Card: <b>{card_name}</b>\n"
-                        f"{pe('money')} Current Win: <b>${win_amount:.2f}</b>\n"
+                        f"{pe('money')} Current Win: <b>{dformat(win_amount)}</b>\n"
                         f"{pe('fire')} Streak: {game['streak']}\n"
                         f"{pe('stats')} Current Total Multiplier: {game['current_multiplier']:.2f}x\n"
                         f"{pe('chart')} Cards remaining: {len(game['deck'])}\n\n"
@@ -407,7 +407,7 @@ async def highlow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await query.edit_message_text(
                 f"{pe('withdraw')} <b>Cashed Out!</b>\n\n"
-                f"{pe('win')} You won <b>${win_amount:.2f}</b>!\n"
+                f"{pe('win')} You won <b>{dformat(win_amount)}</b>!\n"
                 f"{pe('fire')} Final streak: {game['streak']}\n"
                 f"{pe('stats')} Final multiplier: {game['current_multiplier']:.2f}x\n"
                 f"ID: <code>{game_id}</code>",
@@ -512,11 +512,11 @@ async def highlow_rebet_double_callback(update: Update, context: ContextTypes.DE
     # Build keyboard - row 1: Higher/Lower, row 2: Tie, row 3: Skip
     row1 = []
     if current_card != 13:
-        row1.append(apply_button_style(InlineKeyboardButton("Higher ({high_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_high"), 'primary'))
+        row1.append(apply_button_style(InlineKeyboardButton(f"Higher ({high_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_high"), 'primary'))
     if current_card != 1:
-        row1.append(apply_button_style(InlineKeyboardButton("Lower ({low_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_low"), 'success'))
+        row1.append(apply_button_style(InlineKeyboardButton(f"Lower ({low_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_low"), 'success'))
 
-    row2 = [apply_button_style(InlineKeyboardButton("Tie ({tie_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_tie"), 'primary')]
+    row2 = [apply_button_style(InlineKeyboardButton(f"Tie ({tie_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_tie"), 'primary')]
     row3 = [apply_button_style(InlineKeyboardButton("Skip Card", callback_data=f"hl_skip_{game_id}"), 'primary')]
 
     keyboard = [row1, row2, row3]
@@ -531,7 +531,7 @@ async def highlow_rebet_double_callback(update: Update, context: ContextTypes.DE
 
     await query.edit_message_text(
         f"🎴 <b>High-Low Game Started!</b> (ID: <code>{game_id}</code>)\n\n"
-        f"{pe('money')} Bet: ${bet:.2f}\n"
+        f"{pe('money')} Bet: {dformat(bet)}\n"
         f"?? Current Card: <b>{card_name}</b>\n"
         f"{pe('chart')} Cards remaining: {len(deck)}\n\n"
         f"{mult_text}",

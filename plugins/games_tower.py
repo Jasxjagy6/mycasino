@@ -194,7 +194,7 @@ async def tower_intro(update: Update, context: ContextTypes.DEFAULT_TYPE, bet_am
 
     intro_text = (
         f"{pe('tower')} <b>Tower Climb</b>\n\n"
-        f"{pe('bet')} <b>Bet Amount:</b> ${bet_amount:.2f}\n"
+        f"{pe('bet')} <b>Bet Amount:</b> {dformat(bet_amount)}\n"
         f"{pe('target')} <b>Difficulty:</b> {diff_config['name']} ({diff_config['risk']} risk)\n"
         f"{pe('chart')} <b>Tiles per floor:</b> {diff_config['tiles']}\n"
         f"{pe('trophy')} <b>Floors to climb:</b> 9\n"
@@ -583,12 +583,12 @@ async def handle_tower_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         kb = InlineKeyboardMarkup([[rebet_btn, double_btn], [pf_button]])
         if template:
             await query.edit_message_media(
-                InputMediaPhoto(template, caption=f"{pe('trophy')} <b>Tower Conquered!</b>\nID: <code>{game_id}</code>\n\n{pe('win')} YOU REACHED THE TOP!\n{pe('money')} Winnings: <b>${winnings:.2f}</b>\n{pe('stats')} Final Multiplier: {multiplier}x\n{pe('tower')} All 9 floors completed!", parse_mode=ParseMode.HTML),
+                InputMediaPhoto(template, caption=f"{pe('trophy')} <b>Tower Conquered!</b>\nID: <code>{game_id}</code>\n\n{pe('win')} YOU REACHED THE TOP!\n{pe('money')} Winnings: <b>{dformat(winnings)}</b>\n{pe('stats')} Final Multiplier: {multiplier}x\n{pe('tower')} All 9 floors completed!", parse_mode=ParseMode.HTML),
                 reply_markup=kb
             )
         else:
             await query.edit_message_text(
-                f"{pe('trophy')} <b>Tower Conquered!</b>\nID: <code>{game_id}</code>\n\n{pe('win')} YOU REACHED THE TOP!\n{pe('money')} Winnings: <b>${winnings:.2f}</b>\n{pe('stats')} Final Multiplier: {multiplier}x\n{pe('tower')} All 9 floors completed!",
+                f"{pe('trophy')} <b>Tower Conquered!</b>\nID: <code>{game_id}</code>\n\n{pe('win')} YOU REACHED THE TOP!\n{pe('money')} Winnings: <b>{dformat(winnings)}</b>\n{pe('stats')} Final Multiplier: {multiplier}x\n{pe('tower')} All 9 floors completed!",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb
             )
@@ -639,7 +639,7 @@ async def handle_tower_cashout(update: Update, context: ContextTypes.DEFAULT_TYP
                                result_data=f"Cashed out at floor {current_floor}, Multiplier: {multiplier}x, Config: {game['tower_config']}")
 
     # Answer the callback query first
-    await query.answer(f"{pe('money')} Cashed out ${winnings:.2f}!")
+    await query.answer(f"{pe('money')} Cashed out {dformat(winnings)}!")
 
     # Send template
     username = f"@{user.username}" if user.username else f"User{user.id}"
@@ -661,12 +661,12 @@ async def handle_tower_cashout(update: Update, context: ContextTypes.DEFAULT_TYP
     kb = InlineKeyboardMarkup([[rebet_btn, double_btn], [pf_button]])
     if template:
         await query.edit_message_media(
-            InputMediaPhoto(template, caption=f"{pe('withdraw')} <b>Cashed Out!</b>\nID: <code>{game_id}</code>\n\n{pe('win')} Winnings: <b>${winnings:.2f}</b>\n{pe('stats')} Multiplier: {multiplier}x\n{pe('tower')} Floors climbed: {current_floor}/9", parse_mode=ParseMode.HTML),
+            InputMediaPhoto(template, caption=f"{pe('withdraw')} <b>Cashed Out!</b>\nID: <code>{game_id}</code>\n\n{pe('win')} Winnings: <b>{dformat(winnings)}</b>\n{pe('stats')} Multiplier: {multiplier}x\n{pe('tower')} Floors climbed: {current_floor}/9", parse_mode=ParseMode.HTML),
             reply_markup=kb
         )
     else:
         await query.edit_message_text(
-            f"{pe('withdraw')} <b>Cashed Out!</b>\nID: <code>{game_id}</code>\n\n{pe('win')} Winnings: <b>${winnings:.2f}</b>\n{pe('stats')} Multiplier: {multiplier}x\n{pe('tower')} Floors climbed: {current_floor}/9",
+            f"{pe('withdraw')} <b>Cashed Out!</b>\nID: <code>{game_id}</code>\n\n{pe('win')} Winnings: <b>{dformat(winnings)}</b>\n{pe('stats')} Multiplier: {multiplier}x\n{pe('tower')} Floors climbed: {current_floor}/9",
             parse_mode=ParseMode.HTML,
             reply_markup=kb
         )
@@ -761,7 +761,7 @@ async def tower_rebet_double_callback(update: Update, context: ContextTypes.DEFA
     tower_text = (
         f"{pe('tower')} <b>Tower Climb</b>\n"
         f"ID: <code>{game_id}</code>\n\n"
-        f"{pe('money')} Bet: ${bet_amount:.2f}\n"
+        f"{pe('money')} Bet: {dformat(bet_amount)}\n"
         f"{pe('target')} Difficulty: {TOWER_DIFFICULTY_CONFIG[difficulty]['name']}\n"
         f"{pe('chart')} Floor: 0/9\n"
         f"{pe('gem')} Multiplier: 0.90x\n\n"
