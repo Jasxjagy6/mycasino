@@ -19,6 +19,7 @@ import os
 from typing import Callable, Optional, TYPE_CHECKING
 
 from runtime.admin_handlers import register_admin_handlers
+from runtime.antispam import install_antispam
 from runtime.plugin_loader import PluginManager, install, is_installed
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -66,6 +67,7 @@ def register_runtime(
         install(manager)
 
     register_admin_handlers(application, manager, is_admin=is_admin)
+    install_antispam(application)
     application.bot_data["plugin_manager"] = manager
     setattr(application, _RUNTIME_FLAG, True)
 

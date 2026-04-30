@@ -268,7 +268,7 @@ LINK_SUPPORT = "https://t.me/jashanxjagy"  # Support link (e.g., "https://t.me/y
 
 ROULETTE_IMAGE = "roulette_table.jpg"  # Change this to your image filename
 
-WIN_BROADCAST_CHANNEL_ID = "@playcasinowins"  # Example: "-1003848853417" or "@mychannel" or leave empty to disable
+WIN_BROADCAST_CHANNEL_ID = _get_env_or_default('WIN_BROADCAST_CHANNEL_ID', "-1003848853417")  # Channel id (preferred) or @username; empty disables.
 
 SURPRISE_DROP_GROUP = "@playcsino"
 

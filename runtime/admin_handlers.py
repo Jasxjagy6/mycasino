@@ -220,9 +220,82 @@ def register_admin_handlers(
                 f"<code>{qs['stream']}</code> len=<code>{qs['length']}</code> "
                 f"groups=<code>{qs['groups']}</code>"
             )
+        try:
+            from runtime import antispam as _as
+            asd = _as.get_stats()
+            lines.append(
+                "\u2022 antispam: "
+                f"tracked=<code>{asd['tracked_users']}</code> "
+                f"cooldowns=<code>{asd['active_cooldowns']}</code> "
+                f"silenced=<code>{asd['callbacks_silenced']}</code> "
+                f"foreign=<code>{asd['foreign_callbacks_silenced']}</code>"
+            )
+        except Exception:  # pragma: no cover
+            pass
+        try:
+            from core import win_broadcaster as _wb
+            wb = _wb.get_stats()
+            lines.append(
+                "\u2022 win broadcast: "
+                f"channel=<code>{wb['channel']}</code> "
+                f"queued=<code>{wb['queued']}</code> "
+                f"dropped=<code>{wb['dropped']}</code> "
+                f"helpers=<code>{wb['helper_pool_size']}</code> "
+                f"worker=<code>{'on' if wb['worker_alive'] else 'off'}</code>"
+            )
+        except Exception:  # pragma: no cover
+            pass
         await update.message.reply_text(
             "\n".join(lines), parse_mode=ParseMode.HTML
         )
+
+    async def _refreshcore_cmd(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Reload one or more core modules (those not in plugins/) and
+        re-hoist their public names into every split module so the new
+        code is reachable from late-bound plugin handlers."""
+        if not await _guard(update):
+            return
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /refreshcore <module> [<module> ...]\n"
+                "Examples: /refreshcore core.wallet\n"
+                "          /refreshcore core.win_broadcaster runtime.antispam"
+            )
+            return
+        import importlib, sys as _sys
+        results = []
+        for raw in context.args:
+            modname = raw.strip()
+            try:
+                if modname in _sys.modules:
+                    importlib.reload(_sys.modules[modname])
+                    action = "reloaded"
+                else:
+                    importlib.import_module(modname)
+                    action = "loaded"
+                results.append(f"\u2705 {modname} {action}")
+            except Exception as e:  # noqa: BLE001
+                logger.exception("/refreshcore %s failed", modname)
+                results.append(f"\u274c {modname}: {type(e).__name__}: {e}")
+        # Re-hoist core.* symbols into every split module so late-bound
+        # references in already-loaded plugins see the new functions.
+        try:
+            from core import foundation as _f
+            if hasattr(_f, "_wireup"):
+                _f._wireup()
+                results.append("\u2705 _wireup re-applied")
+        except Exception as e:  # noqa: BLE001
+            results.append(f"\u26a0 _wireup failed: {e}")
+        # Make sure antispam middleware is installed.
+        try:
+            from runtime.antispam import install_antispam
+            install_antispam(application)
+            results.append("\u2705 antispam installed")
+        except Exception as e:  # noqa: BLE001
+            results.append(f"\u26a0 antispam install failed: {e}")
+        await update.message.reply_text("\n".join(results))
 
     handlers = [
         CommandHandler("reload", _reload_cmd),
@@ -231,6 +304,7 @@ def register_admin_handlers(
         CommandHandler("unloadplugin", _unload_cmd),
         CommandHandler("listplugins", _list_cmd),
         CommandHandler("runtimestatus", _status_cmd),
+        CommandHandler("refreshcore", _refreshcore_cmd),
     ]
     for h in handlers:
         application.add_handler(h, group=group)

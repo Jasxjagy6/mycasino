@@ -371,6 +371,21 @@ async def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False,
     asyncio.create_task(check_and_award_achievements(user_id, context, multiplier))
     asyncio.create_task(check_and_award_level_up(user_id, context))
 
+    # Broadcast every win to the public channel via a helper bot. Wrapped
+    # in a try/except so a broadcast failure can never break gameplay.
+    if win and win_amount and win_amount > 0:
+        try:
+            from core import win_broadcaster
+            win_broadcaster.schedule_win_broadcast(
+                user_id=user_id,
+                game_type=game_type,
+                bet_usd=amount,
+                win_usd=win_amount,
+                multiplier=multiplier,
+            )
+        except Exception as _e:
+            logging.debug(f"Win broadcast scheduling failed: {_e}")
+
 def check_username_bonus(user_id):
     """Check if a user has the bot username tag in their Telegram name.
     Returns True if the user gets the 5% extra bonus."""

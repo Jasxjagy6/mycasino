@@ -259,20 +259,68 @@ class HotReloadManager:
         Some plugins are loaded by the legacy ``main()`` flow (the
         monolith era) instead of going through ``manager.load()``.  When
         an admin asks to reload one of those, walk the live application
-        handlers and pick out the ones whose callback's ``__module__``
-        matches ``plugins.<name>`` — those are the handlers the plugin
-        owns and we need to remove them on reload.
+        handlers and pick out the ones that belong to ``plugins.<name>``.
+
+        A callback "belongs" to the plugin if any of:
+
+        * ``cb.__module__`` equals the plugin's full module name; OR
+        * ``cb`` is an object identity match (``is``) for one of the
+          functions defined in the plugin's module dict; OR
+        * ``cb`` is a wrapper produced by a decorator (``check_banned``,
+          ``check_maintenance``) that closes over a function whose
+          ``__module__`` matches the plugin — found by walking
+          ``cb.__closure__``.
+
+        This handles the common pattern in this casino where plugin
+        functions are wrapped by decorators living in ``core.foundation``
+        but the underlying ``func`` is defined in the plugin module.
         """
         full = self._full_module_name(name)
         module = sys.modules.get(full)
         if module is None:
             return None
+        # Build a set of function objects exported by the plugin module
+        # (and not just re-exported via ``from core.foundation import *``).
+        own_funcs = set()
+        for k, v in module.__dict__.items():
+            if k.startswith("__"):
+                continue
+            if callable(v) and getattr(v, "__module__", "") == full:
+                own_funcs.add(id(v))
         record = PluginRecord(name=name, module=module)
+
+        def _belongs(cb, _depth: int = 0, _seen: Optional[set] = None) -> bool:
+            if cb is None or _depth > 8:
+                return False
+            cb_mod = getattr(cb, "__module__", "")
+            if cb_mod == full:
+                return True
+            if id(cb) in own_funcs:
+                return True
+            if _seen is None:
+                _seen = set()
+            if id(cb) in _seen:
+                return False
+            _seen.add(id(cb))
+            # Decorator pattern: walk closure cells recursively.  Each
+            # decorator stacks another wrapper, so the real function may
+            # be several layers deep.
+            closure = getattr(cb, "__closure__", None) or ()
+            for cell in closure:
+                try:
+                    val = cell.cell_contents
+                except ValueError:
+                    continue
+                if not callable(val):
+                    continue
+                if _belongs(val, _depth + 1, _seen):
+                    return True
+            return False
+
         for group, handlers in (self._application.handlers or {}).items():
             for h in handlers:
                 cb = getattr(h, "callback", None)
-                cb_mod = getattr(cb, "__module__", "") if cb else ""
-                if cb_mod == full:
+                if _belongs(cb):
                     record.add_handler_record(h, group)
         return record
 
