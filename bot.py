@@ -1827,67 +1827,360 @@ DASHBOARD_CONFIG = {
 
 ## NEW FEATURE - Currency System (Refactored for Multi-Currency Crypto) ##
 # Legacy fiat rates kept for backward compat with display-only code
+# ============================================================
+# MULTI-CURRENCY DISPLAY SYSTEM
+# ------------------------------------------------------------
+# Two orthogonal concepts live here:
+#
+#   1. ACTIVE WALLET CURRENCY -> which crypto actually sits in
+#      the user's wallet and gets debited/credited. One of
+#      SUPPORTED_CRYPTOS. Returned by get_active_currency().
+#
+#   2. DISPLAY CURRENCY       -> the unit the user sees on every
+#      screen and types bets in. Can be a fiat code
+#      (USD/INR/EUR/GBP) or any SUPPORTED_CRYPTOS code. Returned
+#      by get_display_currency(). Stored as
+#      user_stats[uid]["display_currency"] (default "USD").
+#
+# The internal ledger stays USD-denominated. Every display/parse
+# path funnels through the helpers below so amounts are always
+# consistent regardless of which currency the user picked.
+# ============================================================
+
+# Fiat currencies supported for display/bet-input only.
+# Rates are USD -> currency (1 USD = N units of that currency).
+# Seeded with reasonable defaults and refreshed live from a
+# public FX API; see update_live_fiat_rates() below.
+SUPPORTED_FIATS = ["USD", "INR", "EUR", "GBP"]
+
+# "Display" = all currencies a user can choose to view their
+# balance / enter bets in. Keep cryptos first so the wallet
+# default (USDT) is offered before fiat alternatives.
+SUPPORTED_DISPLAY_CURRENCIES = list(SUPPORTED_CRYPTOS) + SUPPORTED_FIATS
+
+# Legacy name kept so older call sites keep working; values are
+# overwritten by update_live_fiat_rates() at runtime.
 CURRENCY_RATES = {
     "USD": 1.0,
     "INR": 83.12,
     "EUR": 0.92,
-    "GBP": 0.79
+    "GBP": 0.79,
 }
+LIVE_FIAT_RATES = dict(CURRENCY_RATES)  # USD -> fiat, refreshed on the fly
 
 CURRENCY_SYMBOLS = {
+    # Fiat
     "USD": "$",
-    "INR": "₹",
-    "EUR": "€",
-    "GBP": "£"
+    "INR": "\u20B9",   # ₹
+    "EUR": "\u20AC",   # €
+    "GBP": "\u00A3",   # £
+    # Crypto (short visual tags used before the amount)
+    "USDT": "\u20AE",  # ₮
+    "BTC":  "\u20BF",  # ₿
+    "ETH":  "\u039E",  # Ξ
+    "SOL":  "\u25CE",  # ◎
+    "BNB":  "\u25C6",  # ◆
+    "TRX":  "\u25C8",  # ◈
+    "LTC":  "\u0141",  # Ł
 }
 
+# Maps display currency -> PREMIUM_EMOJI_IDS key so we can pe(...)
+# the right icon next to amounts.
+CURRENCY_EMOJI_KEY = {
+    "USD":  "balance",
+    "INR":  "money",
+    "EUR":  "money",
+    "GBP":  "money",
+    "USDT": "usdt",
+    "BTC":  "btc",
+    "ETH":  "eth",
+    "SOL":  "sol",
+    "BNB":  "bnb",
+    "TRX":  "trx",
+    "LTC":  "ltc",
+}
+
+# Fiats that use the Indian lakh/crore numbering system for
+# compact formatting. Everything else uses short-scale K/M/B/T.
+_INDIAN_SCALE_CURRENCIES = {"INR"}
+
+
+def get_display_currency(user_id) -> str:
+    """Return the user's preferred display currency.
+
+    Falls back to their active crypto wallet (so existing users
+    who never picked a display currency keep seeing amounts in
+    their wallet coin instead of a sudden switch to USD)."""
+    try:
+        stats = user_stats.get(user_id, {}) or {}
+        pref = stats.get("display_currency")
+        if isinstance(pref, str) and pref.upper() in SUPPORTED_DISPLAY_CURRENCIES:
+            return pref.upper()
+    except Exception:
+        pass
+    try:
+        active = get_active_currency(user_id)
+        if active in SUPPORTED_DISPLAY_CURRENCIES:
+            return active
+    except Exception:
+        pass
+    return "USD"
+
+
+def set_display_currency(user_id, currency: str) -> bool:
+    """Persist the user's chosen display currency."""
+    currency = (currency or "").upper()
+    if currency not in SUPPORTED_DISPLAY_CURRENCIES:
+        return False
+    try:
+        user_stats.setdefault(user_id, {})["display_currency"] = currency
+    except Exception:
+        return False
+    try:
+        save_user_data(user_id)
+    except Exception:
+        pass
+    return True
+
+
+def _rate_usd_to(currency: str) -> float:
+    """1 USD -> N units of the given currency. Always > 0."""
+    currency = (currency or "USD").upper()
+    if currency == "USD":
+        return 1.0
+    if currency in SUPPORTED_CRYPTOS:
+        price = float(LIVE_PRICES.get(currency, 0.0) or 0.0)
+        # LIVE_PRICES stores coin->USD (i.e. 1 coin = price USD),
+        # so 1 USD = 1/price of that coin.
+        if price <= 0:
+            return 0.0
+        return 1.0 / price
+    rate = float(LIVE_FIAT_RATES.get(currency, CURRENCY_RATES.get(currency, 0.0)) or 0.0)
+    return rate if rate > 0 else 0.0
+
+
+def convert_usd_to_display(amount_usd: float, currency: str) -> float:
+    """Convert a USD amount into the given display currency."""
+    rate = _rate_usd_to(currency)
+    if rate <= 0:
+        return 0.0
+    return float(amount_usd) * rate
+
+
+def convert_display_to_usd(amount: float, currency: str) -> float:
+    """Convert a display-currency amount back to USD."""
+    rate = _rate_usd_to(currency)
+    if rate <= 0:
+        return 0.0
+    return float(amount) / rate
+
+
 def convert_currency(amount_usd, to_currency="USD"):
-    """Convert amount from USD to target currency (for display only)"""
-    return amount_usd * CURRENCY_RATES.get(to_currency, 1.0)
+    """Legacy helper - USD -> target currency (display only)."""
+    return convert_usd_to_display(amount_usd, to_currency)
+
 
 def convert_to_usd(amount, from_currency="USD"):
-    """Convert amount from any currency to USD"""
-    return amount / CURRENCY_RATES.get(from_currency, 1.0)
+    """Legacy helper - any currency -> USD."""
+    return convert_display_to_usd(amount, from_currency)
+
+
+def _decimal_places(currency: str) -> int:
+    c = (currency or "USD").upper()
+    if c in SUPPORTED_FIATS:
+        return 2
+    return CRYPTO_PRECISION.get(c, 5) if "CRYPTO_PRECISION" in globals() else 5
+
+
+def format_compact(amount: float, currency: str = "USD") -> str:
+    """Compact large-number format, currency-aware.
+
+    Indian-system (INR): K (thousand), L (lakh=1e5), Cr (crore=1e7).
+    Short-scale (everything else): K, M (1e6), B (1e9), T (1e12).
+    Small amounts fall back to the full decimal form with the right
+    precision for the currency.
+    """
+    c = (currency or "USD").upper()
+    sign = "-" if amount < 0 else ""
+    a = abs(float(amount))
+    if c in _INDIAN_SCALE_CURRENCIES:
+        if a >= 1_00_00_000:       # >= 1 crore
+            s = f"{a/1_00_00_000:.2f}Cr"
+        elif a >= 1_00_000:        # >= 1 lakh
+            s = f"{a/1_00_000:.2f}L"
+        elif a >= 1_000:
+            s = f"{a/1_000:.2f}K"
+        else:
+            s = f"{a:,.2f}"
+    else:
+        if a >= 1_000_000_000_000:
+            s = f"{a/1_000_000_000_000:.2f}T"
+        elif a >= 1_000_000_000:
+            s = f"{a/1_000_000_000:.2f}B"
+        elif a >= 1_000_000:
+            s = f"{a/1_000_000:.2f}M"
+        elif a >= 1_000:
+            s = f"{a/1_000:.2f}K"
+        else:
+            dp = _decimal_places(c)
+            s = f"{a:,.{min(dp,2)}f}" if c in SUPPORTED_FIATS else f"{a:,.2f}"
+    # Trim pointless trailing zeros (e.g. 6.00L -> 6L, 6.30L -> 6.3L)
+    if "." in s and any(ch.isalpha() for ch in s):
+        head, tail = s.split(".", 1)
+        letters = "".join(ch for ch in tail if ch.isalpha())
+        digits  = "".join(ch for ch in tail if ch.isdigit())
+        digits  = digits.rstrip("0")
+        s = f"{head}.{digits}{letters}" if digits else f"{head}{letters}"
+    return f"{sign}{s}"
+
+
+def format_display_amount(
+    amount_usd: float,
+    currency: str = "USD",
+    compact: bool = False,
+    with_symbol: bool = True,
+) -> str:
+    """Render a USD-denominated amount in the chosen display currency.
+
+    When ``compact`` is True uses format_compact (K/L/Cr/M/B/T).
+    Otherwise uses full 2dp (fiat) or CRYPTO_PRECISION (crypto).
+    """
+    c = (currency or "USD").upper()
+    disp = convert_usd_to_display(float(amount_usd or 0.0), c)
+    sym = CURRENCY_SYMBOLS.get(c, "")
+    if compact:
+        body = format_compact(disp, c)
+    else:
+        if c in SUPPORTED_FIATS:
+            body = f"{disp:,.2f}"
+        else:
+            dp = CRYPTO_PRECISION.get(c, 5)
+            body = f"{disp:,.{dp}f}"
+    if not with_symbol or not sym:
+        return body
+    if c in SUPPORTED_FIATS:
+        return f"{sym}{body}"
+    # Crypto: "0.012345 BTC" reads better than "₿0.012345"
+    return f"{body} {c}"
+
+
+def format_for_user(
+    user_id,
+    amount_usd: float,
+    compact: bool = False,
+    with_usdt_estimate: bool = False,
+) -> str:
+    """User-facing display helper.
+
+    Used for every group/DM message that shows a balance, bet,
+    win, or wager. When ``with_usdt_estimate`` is True and the
+    user's display currency isn't USDT, appends
+    ``(~ X.XX USDT)`` — exactly the format the group chats use.
+    """
+    cur = get_display_currency(user_id)
+    head = format_display_amount(amount_usd, cur, compact=compact)
+    if with_usdt_estimate and cur != "USDT":
+        usdt_val = convert_usd_to_display(float(amount_usd or 0.0), "USDT")
+        tail_body = format_compact(usdt_val, "USDT") if compact else f"{usdt_val:,.2f}"
+        return f"{head} (~ {tail_body} USDT)"
+    return head
+
 
 def format_currency(amount_usd, currency="USD"):
-    """Format amount in USD display"""
-    return f"${amount_usd:,.2f}"
+    """Legacy helper - always returns the amount in the given currency.
+
+    Kept USD-only-looking signature for backwards compat but now
+    respects the currency argument. Most call sites pass a user's
+    currency here already (e.g. get_user_currency(...))."""
+    c = (currency or "USD").upper()
+    if c not in SUPPORTED_DISPLAY_CURRENCIES:
+        return f"${float(amount_usd or 0.0):,.2f}"
+    return format_display_amount(amount_usd, c, compact=False, with_symbol=True)
 
 
 def format_compact_usd(amount_usd):
-    """Format large numbers in compact form: $1.2K, $1.2M, $1.2B, $1.2T"""
-    abs_amount = abs(amount_usd)
-    if abs_amount >= 1_000_000_000_000:  # Trillion
-        compact = f"${amount_usd / 1_000_000_000_000:.1f}T"
-    elif abs_amount >= 1_000_000_000:  # Billion
-        compact = f"${amount_usd / 1_000_000_000:.1f}B"
-    elif abs_amount >= 1_000_000:  # Million
-        compact = f"${amount_usd / 1_000_000:.1f}M"
-    elif abs_amount >= 1_000:  # Thousand
-        compact = f"${amount_usd / 1_000:.1f}K"
-    else:
-        compact = f"${amount_usd:,.2f}"
-    return compact
+    """Legacy USD compact format - now a thin wrapper.
+
+    Existing callers passed raw USD amounts; keep that contract.
+    """
+    return "$" + format_compact(float(amount_usd or 0.0), "USD")
+
+
+def format_compact_for_user(user_id, amount_usd, with_usdt_estimate: bool = False) -> str:
+    """Compact version of format_for_user (used by leaderboards/stats)."""
+    return format_for_user(user_id, amount_usd, compact=True, with_usdt_estimate=with_usdt_estimate)
+
+
+async def update_live_fiat_rates():
+    """Background task: refresh USD -> fiat rates every 30 min.
+
+    Uses open.er-api.com (free, no key). Rates stay cached between
+    refreshes; if the fetch fails we keep the last-known values so
+    bets never see a zero rate.
+    """
+    global LIVE_FIAT_RATES
+    while True:
+        try:
+            client = await _get_http_client()
+            resp = await client.get(
+                "https://open.er-api.com/v6/latest/USD", timeout=15.0
+            )
+            if resp.status_code == 200:
+                payload = resp.json() or {}
+                rates = payload.get("rates") or {}
+                updated = {"USD": 1.0}
+                for code in SUPPORTED_FIATS:
+                    if code == "USD":
+                        continue
+                    val = rates.get(code)
+                    if isinstance(val, (int, float)) and val > 0:
+                        updated[code] = float(val)
+                if len(updated) > 1:
+                    LIVE_FIAT_RATES.update(updated)
+                    CURRENCY_RATES.update(updated)
+                    logging.info(
+                        "Live FX rates updated: %s",
+                        {k: f"{v:.4f}" for k, v in updated.items()},
+                    )
+            else:
+                logging.warning("Fiat FX API returned status %s", resp.status_code)
+        except Exception as e:
+            logging.warning(f"Failed to fetch live fiat rates: {e}")
+        await asyncio.sleep(30 * 60)  # 30 minutes
+
 
 def parse_bet_amount(amount_str: str, user_id: int) -> tuple:
     """
-    Parse bet amount from user input (always in USD).
-    Checks active crypto balance. Returns (amount_in_usd, amount_in_usd, 'USD').
-    SECURITY: Validates against NaN, Inf, negative, and excessive values.
+    Parse a bet amount from user input.
+
+    Interprets the number in the user's DISPLAY currency (so
+    ``/bj 500`` with display_currency=INR means ₹500, not $500)
+    and converts it to USD internally — the rest of the ledger
+    stays USD-denominated.
+
+    Returns ``(amount_in_usd, amount_in_display, display_currency)``.
+
+    SECURITY: Rejects NaN/Inf/zero/negative/absurd values.
     """
     import math as _math_parse
+    display_currency = get_display_currency(user_id)
     balance_usd = get_active_balance_usd(user_id)
 
-    amount_str = amount_str.lower().strip()
+    s = (amount_str or "").lower().strip()
 
-    if amount_str == 'all':
+    if s == "all":
         amount_usd = balance_usd
-    elif amount_str in ('half', '1/2'):
+        amount_display = convert_usd_to_display(amount_usd, display_currency)
+    elif s in ("half", "1/2"):
         amount_usd = balance_usd / 2
+        amount_display = convert_usd_to_display(amount_usd, display_currency)
     else:
-        amount_usd = float(amount_str)
+        try:
+            amount_display = float(s)
+        except ValueError:
+            raise ValueError(f"Invalid bet amount: {amount_str!r}")
+        amount_usd = convert_display_to_usd(amount_display, display_currency)
 
-    # SECURITY: Reject NaN, Inf, negative, zero, and absurdly large values
     if _math_parse.isnan(amount_usd) or _math_parse.isinf(amount_usd):
         raise ValueError("Invalid bet amount: NaN or Inf")
     if amount_usd <= 0:
@@ -1895,14 +2188,21 @@ def parse_bet_amount(amount_str: str, user_id: int) -> tuple:
     if amount_usd > 1_000_000_000:  # $1B sanity cap
         raise ValueError("Bet amount exceeds maximum")
 
-    # Round to 2 decimal places to prevent float precision exploits
     amount_usd = round(amount_usd, 2)
-
-    return amount_usd, amount_usd, "USD"
+    return amount_usd, amount_display, display_currency
 
 def get_user_currency(user_id):
-    """Get user's active crypto currency (replaces old fiat currency getter)"""
-    return get_active_currency(user_id)
+    """Legacy shim.
+
+    Historically this returned the user's active crypto (which is what
+    ``get_active_currency`` returns). Display call sites used that
+    return value to format amounts, which broke as soon as we added
+    a separate "display currency" concept. Every remaining caller of
+    this function is a display call site, so we point it at the
+    display currency. Wallet / ledger call sites have always used
+    ``get_active_currency`` directly.
+    """
+    return get_display_currency(user_id)
 
 
 ## NEW FEATURE - Achievements ##
@@ -9207,14 +9507,22 @@ async def generate_dashboard_image(user_id: int, context: ContextTypes.DEFAULT_T
             except (ValueError, AttributeError):
                 join_date = join_date[:10] if len(join_date) > 10 else join_date
 
+        # Render amounts in the user's chosen display currency (e.g.
+        # \u20B9500 for INR) rather than hard-coded USD. We pick the
+        # compact formatter so long lifetime numbers fit inside the card.
+        bal_str = format_compact_for_user(user_id, balance)
+        last_win_str = (
+            format_compact_for_user(user_id, last_win) if last_win > 0 else "Play to win!"
+        )
+
         text_data = {
             "name": first_name,
             "user_id": str(user_id),
             "username": f"@{username}",
             "bot_username": f"@{bot_username}",
             "level": level_data['name'],
-            "balance": f"${balance:,.2f}",
-            "last_win": f"${last_win:,.2f}" if last_win > 0 else "Play to win!",
+            "balance": bal_str,
+            "last_win": last_win_str,
             "member_since": join_date,
         }
 
@@ -9629,7 +9937,18 @@ async def generate_stats_image(user_id: int, context: ContextTypes.DEFAULT_TYPE,
             gwr = (gdata["wins"] / ggames * 100) if ggames > 0 else 0
             gpnl = gdata["pnl"]
             display_name = get_display_name(gname)
-            game_list.append({"name": display_name, "games": ggames, "wr": gwr, "pnl": gpnl, "pnl_positive": gpnl >= 0})
+            # Pre-format pnl in the viewer's display currency; keep raw
+            # float too so the renderer knows whether it's positive.
+            g_sign = "+" if gpnl >= 0 else "-"
+            g_str = f"{g_sign}{format_compact_for_user(user_id, abs(gpnl))}"
+            game_list.append({
+                "name": display_name,
+                "games": ggames,
+                "wr": gwr,
+                "pnl": gpnl,
+                "pnl_str": g_str,
+                "pnl_positive": gpnl >= 0,
+            })
 
         # Calculate rank from ALL users by wagered amount.
         # PERFORMANCE: Previously this iterated every user_stats entry and
@@ -9642,6 +9961,12 @@ async def generate_stats_image(user_id: int, context: ContextTypes.DEFAULT_TYPE,
         user_rank = _get_cached_wagered_rank(user_id)
         rank_str = f"#{user_rank}" if user_rank else "#---"
 
+        # Pre-format every monetary field in the user's DISPLAY
+        # currency (compact). The renderer prefers the *_str keys
+        # and falls back to USD formatting for backwards compat.
+        _fmt = lambda amt: format_compact_for_user(user_id, amt)
+        pnl_sign = "+" if total_pnl >= 0 else ""
+
         text_data = {
             "first_name": first_name,
             "username": f"@{username}" if username else "@user",
@@ -9653,13 +9978,18 @@ async def generate_stats_image(user_id: int, context: ContextTypes.DEFAULT_TYPE,
             "period_label": "30d",
             "total_games": total_games,
             "total_wagered": total_wagered,
+            "total_wagered_str": _fmt(total_wagered),
             "total_pnl": total_pnl,
+            "total_pnl_str": f"{pnl_sign}{_fmt(total_pnl)}",
             "pnl_positive": total_pnl >= 0,
             "win_rate": win_rate,
             "avg_bet": avg_bet,
+            "avg_bet_str": _fmt(avg_bet),
             "biggest_win": biggest_win,
+            "biggest_win_str": f"+{_fmt(biggest_win)}",
             "biggest_win_game": biggest_win_game,
             "total_bonuses": total_bonuses,
+            "total_bonuses_str": _fmt(total_bonuses),
             "fav_game": fav_game,
         }
 
@@ -9934,30 +10264,34 @@ def _render_stats_sync(text_data, game_list, pvp_entries, profile_pic_data):
             lbw = draw.textlength(label, font=fTileLb)
             draw.text((val_cx - lbw / 2, y0 + 60), label, fill=C_MUTED, font=fTileLb)
 
-        # Row 1
+        # Row 1 - prefer pre-formatted display-currency strings; fall
+        # back to USD if they weren't provided (old callers).
         total_pnl = text_data.get("total_pnl", 0.0)
-        pnl_pos = total_pnl >= 0
+        pnl_pos = text_data.get("pnl_positive", total_pnl >= 0)
+        wagered_str = text_data.get("total_wagered_str") or f"${text_data.get('total_wagered', 0):,.2f}"
+        pnl_str = text_data.get("total_pnl_str") or f"{'+' if pnl_pos else ''}${total_pnl:,.2f}"
+        avg_str = text_data.get("avg_bet_str") or f"${text_data.get('avg_bet', 0):,.2f}"
+        big_str = text_data.get("biggest_win_str") or f"+${text_data.get('biggest_win', 0.0):,.2f}"
+        bonus_str = text_data.get("total_bonuses_str") or f"${text_data.get('total_bonuses', 0.0) or 0.0:,.2f}"
+
         _draw_tile(0, 0, text_data.get("total_games", 0), "GAMES PLAYED",
                    C_GRAY, C_WHITE, "⌬")
-        _draw_tile(1, 0, f"${text_data.get('total_wagered', 0):,.2f}", "TOTAL WAGERED",
+        _draw_tile(1, 0, wagered_str, "TOTAL WAGERED",
                    C_BLUE, C_BLUE, "$")
         _draw_tile(2, 0, f"{text_data.get('win_rate', 0):.1f}%", "WIN RATE",
                    C_GOLD, C_GOLD, "◷")
-        pnl_str = f"{'+' if pnl_pos else ''}${total_pnl:,.2f}"
         _draw_tile(3, 0, pnl_str, "NET P&L",
                    C_GREEN if pnl_pos else C_RED,
                    C_GREEN if pnl_pos else C_RED, "▣")
         # Row 2
-        _draw_tile(0, 1, f"${text_data.get('avg_bet', 0):,.2f}", "AVG BET",
+        _draw_tile(0, 1, avg_str, "AVG BET",
                    C_BLUE, C_BLUE, "✎")
-        biggest = text_data.get("biggest_win", 0.0)
-        _draw_tile(1, 1, f"+${biggest:,.2f}", "BIGGEST WIN",
+        _draw_tile(1, 1, big_str, "BIGGEST WIN",
                    C_GOLD, C_GOLD, "♛")
         fav = text_data.get("fav_game", "—") or "—"
         _draw_tile(2, 1, str(fav)[:14], "FAV GAME",
                    C_GRAY, C_WHITE, "♦")
-        bonuses = text_data.get("total_bonuses", 0.0) or 0.0
-        _draw_tile(3, 1, f"${bonuses:,.2f}", "BONUSES",
+        _draw_tile(3, 1, bonus_str, "BONUSES",
                    C_PURPLE, C_PURPLE, "🎁")
 
         # ── GAME BREAKDOWN TABLE ─────────────────────────────────
@@ -10008,10 +10342,10 @@ def _render_stats_sync(text_data, game_list, pvp_entries, profile_pic_data):
                 wr_color = C_GREEN if wr >= 50 else C_RED
                 draw.text((col_wr, BR_Y0 + 12), f"{wr:.1f}%",
                           fill=wr_color, font=fBody)
-                # P&L right-aligned.
+                # P&L right-aligned (prefer pre-formatted display-currency str).
                 pnl = entry.get("pnl", 0.0)
                 pnl_color = C_GREEN if pnl >= 0 else C_RED
-                pnl_str = f"{'+' if pnl >= 0 else '-'}${abs(pnl):,.2f}"
+                pnl_str = entry.get("pnl_str") or f"{'+' if pnl >= 0 else '-'}${abs(pnl):,.2f}"
                 draw.text((col_pnl, BR_Y0 + 12), pnl_str,
                           fill=pnl_color, font=fBody, anchor="ra")
                 BR_Y0 += 36
@@ -10121,6 +10455,17 @@ async def generate_leaderboard_image(context, period='all_time', viewing_user_id
         # Use functools.partial so the kwargs (notably ``top_avatars``) are
         # forwarded into the executor without relying on positional ordering.
         from functools import partial as _lb_partial
+
+        # Render the amounts in the VIEWING user's display currency
+        # (compact-formatted). Pinned to that user so everyone sees the
+        # leaderboard in whatever unit they chose.
+        if viewing_user_id is not None:
+            def _leader_formatter(v, _uid=viewing_user_id):
+                return format_compact_for_user(_uid, v)
+            lb_value_formatter = _leader_formatter
+        else:
+            lb_value_formatter = None
+
         result = await loop.run_in_executor(
             _image_executor,
             _lb_partial(
@@ -10130,6 +10475,7 @@ async def generate_leaderboard_image(context, period='all_time', viewing_user_id
                 section_title,
                 user_rank,
                 user_wagered,
+                value_formatter=lb_value_formatter,
                 top_avatars=top_avatars,
             ),
         )
@@ -11547,15 +11893,24 @@ async def send_insufficient_balance_message(update: Update, message: str = None,
 
 def format_balance_with_locked(user_id: int, currency: str = "USD") -> str:
     """
-    Format multi-currency portfolio balance including locked funds in active games.
-    Shows total portfolio value in USD and per-coin breakdown.
+    Format the user's portfolio using their chosen DISPLAY currency.
+
+    Every headline line shows
+        <symbol><amount in display currency> (~ N.NN USDT)
+    which is the format the user asked for in group chats, and
+    also renders the per-coin breakdown of what actually sits in
+    the wallet so users can still see which crypto they hold.
     """
     wallet = ensure_wallet_dict(user_id)
     total_usd = get_total_balance_usd(user_id)
     active_coin = get_active_currency(user_id)
+    disp = get_display_currency(user_id)
+    disp_sym = CURRENCY_SYMBOLS.get(disp, "")
 
-    # Build multi-line balance
-    lines = [f"{pe('briefcase')} Total Portfolio: ${total_usd:,.2f}\n"]
+    # Total in the user's display currency + USDT estimate.
+    total_display = format_for_user(user_id, total_usd, compact=False, with_usdt_estimate=(disp != "USDT"))
+    lines = [f"{pe('briefcase')} Total Portfolio: <b>{total_display}</b>\n"]
+
     for coin, amount in wallet.items():
         if amount > 0 or coin == active_coin:
             price = LIVE_PRICES.get(coin, 1.0)
@@ -11563,9 +11918,13 @@ def format_balance_with_locked(user_id: int, currency: str = "USD") -> str:
             symbol = CRYPTO_SYMBOLS.get(coin, "💎")
             formatted_amount = format_crypto_amount(amount, coin)
             if usd_val > 0.001 or coin == active_coin:
-                lines.append(f"{symbol} {coin}: ${usd_val:,.2f} ({formatted_amount} {coin})")
+                # Show the crypto holding AND what it's worth in the user's display currency.
+                disp_val = format_display_amount(usd_val, disp, compact=False)
+                lines.append(f"{symbol} {coin}: {disp_val} ({formatted_amount} {coin})")
 
     lines.append(f"\n{pe('diamond')} Active Currency: {active_coin}")
+    if disp != active_coin:
+        lines.append(f"{pe('settings')} Display Currency: {disp_sym}{disp}")
 
     locked_info = get_locked_balance_in_games(user_id)
 
@@ -11579,7 +11938,7 @@ def format_balance_with_locked(user_id: int, currency: str = "USD") -> str:
 
         locked_parts = []
         for game_type, amount in game_totals.items():
-            locked_parts.append(f"${amount:,.2f} in game ( {game_type} )")
+            locked_parts.append(f"{format_display_amount(amount, disp)} in game ( {game_type} )")
 
         locked_str = " + ".join(locked_parts)
         lines.append(f"{pe('lock')} Locked: {locked_str}")
@@ -11831,7 +12190,7 @@ JACKPOT_DEFAULT_THRESHOLD_USD = 100.0    # 7-day wager required to be eligible
 JACKPOT_DEFAULT_ACCUM_RATE = 0.002        # 0.2 % of every bet -> jackpot
 JACKPOT_DRAW_HOUR_IST = 17                # 5:30 PM IST
 JACKPOT_DRAW_MINUTE_IST = 30
-JACKPOT_ANNOUNCE_CHAT = os.environ.get("JACKPOT_ANNOUNCE_CHAT", "@PlayCasino")
+JACKPOT_ANNOUNCE_CHAT = os.environ.get("JACKPOT_ANNOUNCE_CHAT", "@playcsino")
 JACKPOT_HISTORY_LIMIT = 50
 
 # IST is UTC+5:30, no daylight savings.
@@ -12101,36 +12460,62 @@ async def _jackpot_run_draw(application):
             logging.error(f"Failed to render jackpot winner image: {e}")
             img_buf = None
 
+        # Next-draw timestamp, shown in IST (this is the draw cadence).
+        next_draw_dt = _jackpot_next_draw_dt(now_utc)
+        next_draw_ist = (next_draw_dt + _JACKPOT_IST_OFFSET).strftime("%b %d, %Y \u2022 %H:%M IST")
+
+        # Public broadcast shows the amount in USD (common denominator)
+        # because the announcement chat contains users on all different
+        # display currencies. Premium emojis throughout.
+        mention = f"@{uname}" if uname else f"<a href=\"tg://user?id={uid}\">player</a>"
         caption = (
-            f"\U0001F389 <b>JACKPOT WINNER!</b>\n\n"
-            f"@{uname} just won <b>${amount_won:,.2f}</b> from the daily jackpot!\n\n"
-            f"Play more, wager more, and you could be next."
+            f"{pe('trophy')} <b>JACKPOT WINNER!</b> {pe('fire')}\n\n"
+            f"{mention} just won <b>${amount_won:,.2f}</b> from the daily jackpot! {pe('money')}\n\n"
+            f"{pe('refresh')} The jackpot pool has been <b>reset to zero</b>.\n"
+            f"{pe('clock')} Next draw: <b>{next_draw_ist}</b> \u2014 every bet counts!\n\n"
+            f"{pe('rocket')} Play more, wager more, and you could be next."
         )
 
+        posted_msg_id = None
         try:
             if img_buf is not None:
-                await application.bot.send_photo(
+                sent = await application.bot.send_photo(
                     chat_id=JACKPOT_ANNOUNCE_CHAT,
                     photo=img_buf,
                     caption=caption,
                     parse_mode=ParseMode.HTML,
                 )
             else:
-                await application.bot.send_message(
+                sent = await application.bot.send_message(
                     chat_id=JACKPOT_ANNOUNCE_CHAT,
                     text=caption,
                     parse_mode=ParseMode.HTML,
                 )
+            posted_msg_id = getattr(sent, "message_id", None)
         except Exception as e:
             logging.error(f"Failed to announce jackpot winner in {JACKPOT_ANNOUNCE_CHAT}: {e}")
 
-        # Best-effort DM to the winner.
+        # Pin the winner announcement so it stays visible until the next draw.
+        if posted_msg_id is not None:
+            try:
+                await application.bot.pin_chat_message(
+                    chat_id=JACKPOT_ANNOUNCE_CHAT,
+                    message_id=posted_msg_id,
+                    disable_notification=False,
+                )
+            except Exception as e:
+                logging.warning(
+                    f"Failed to pin jackpot winner message in {JACKPOT_ANNOUNCE_CHAT}: {e}"
+                )
+
+        # Best-effort DM to the winner, in THEIR display currency.
         try:
+            winner_display = format_for_user(uid, amount_won, with_usdt_estimate=True)
             await application.bot.send_message(
                 chat_id=uid,
                 text=(
-                    f"\U0001F389 You just won the daily jackpot — "
-                    f"<b>${amount_won:,.2f}</b> has been credited to your wallet."
+                    f"{pe('trophy')} You just won the daily jackpot \u2014 "
+                    f"<b>{winner_display}</b> has been credited to your wallet. {pe('money')}"
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -16329,7 +16714,7 @@ async def handle_dealer_turn(query, context, game_id, bot_uname: str = "Casino")
         winnings = game["bet_amount"] * 1.94
         credit_wallet(user_id, winnings)
         result_text_plain = "Dealer Busts! You Win!"
-        result_pe_text = f"{pe('win')} Dealer busts! You win ${winnings:.2f}!"
+        result_pe_text = f"{pe('win')} Dealer busts! You win {format_for_user(user.id, winnings)}!"
         result_color_tuple = BJ_WIN_COLOR
         game['win'] = True
         await update_stats_on_bet(user_id, game_id, original_bet, True, multiplier=1.94, context=context)
@@ -17494,10 +17879,10 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if win:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+        result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
-        result_text = f"{pe('lose')} You lose ${bet_amount:.2f}. Better luck next time!"
+        result_text = f"{pe('lose')} You lose {format_for_user(user.id, bet_amount)}. Better luck next time!"
         await update_stats_on_bet(user.id, game_id, bet_amount, False, context=context)
 
     # Note: nonce was incremented at game start for provably fair
@@ -17674,7 +18059,7 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if win:
             winnings = rebet_amount * multiplier
             credit_wallet(user.id, winnings)
-            result_text = f"{pe('win')} You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+            result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
             await update_stats_on_bet(user.id, game_id, rebet_amount, True, multiplier=multiplier, context=context)
         else:
             result_text = f"{pe('lose')} You lose ${rebet_amount:.2f}. Better luck next time!"
@@ -17982,10 +18367,10 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if win:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+        result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
-        result_text = f"{pe('lose')} You lose ${bet_amount:.2f}. Better luck next time!"
+        result_text = f"{pe('lose')} You lose {format_for_user(user.id, bet_amount)}. Better luck next time!"
         await update_stats_on_bet(user.id, game_id, bet_amount, False, context=context)
 
     # Note: nonce was incremented at game start for provably fair
@@ -18121,7 +18506,7 @@ async def dice_roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if win:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+        result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} You lose ${bet_amount:.2f}. Try again!"
@@ -18314,7 +18699,7 @@ async def _play_classic_rush(update, context, user, chosen_number, bet_amount):
     if matches >= 2:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} You win ${winnings:.2f}! ({matches} hits, {multiplier}x)"
+        result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! ({matches} hits, {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} Only {matches} match(es). Need 2+ to win!"
@@ -18389,7 +18774,7 @@ async def _play_odd_even_rush(update, context, user, choice, bet_amount):
     if matches >= 4:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} You win ${winnings:.2f}! ({matches} matches, {multiplier}x)"
+        result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! ({matches} matches, {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} Only {matches} matches. Need 4+ to win!"
@@ -18463,7 +18848,7 @@ async def _play_high_low_rush(update, context, user, choice, bet_amount):
     if matches >= 4:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} You win ${winnings:.2f}! ({matches} matches, {multiplier}x)"
+        result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! ({matches} matches, {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} Only {matches} matches. Need 4+ to win!"
@@ -18558,7 +18943,7 @@ async def _play_rainbow_rush(update, context, user, bet_amount):
     if is_win:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} RAINBOW! You win ${winnings:.2f}! (55x)"
+        result_text = f"{pe('win')} RAINBOW! You win {format_for_user(user.id, winnings)}! (55x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} {unique_count}/6 unique. Need all 6 different!"
@@ -18654,7 +19039,7 @@ async def _play_blaze_rush(update, context, user, bet_amount):
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
         parity = "All Odd" if all_odd else "All Even"
-        result_text = f"{pe('win')} BLAZE! {parity}! You win ${winnings:.2f}! (25x)"
+        result_text = f"{pe('win')} BLAZE! {parity}! You win {format_for_user(user.id, winnings)}! (25x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         odd_count = sum(1 for r in results if r in odd_numbers)
@@ -19655,7 +20040,7 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if win:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} {win_type}\nYou win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+        result_text = f"{pe('win')} {win_type}\nYou win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} No match! You lose ${bet_amount:.2f}\nTry again for the jackpot!"
@@ -19773,7 +20158,7 @@ async def slots_rebet_double_callback(update: Update, context: ContextTypes.DEFA
     if win:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} {win_type}\nYou win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+        result_text = f"{pe('win')} {win_type}\nYou win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} No match! You lose ${bet_amount:.2f}\nTry again for the jackpot!"
@@ -25411,7 +25796,7 @@ async def pvb_timeout_finish_job(context: ContextTypes.DEFAULT_TYPE):
         if user_id in active_pvb_games:
             del active_pvb_games[user_id]
 
-        text += f"{pe('lose')} Bot wins the match ({game['bot_score']}-{game['user_score']}). You lost ${bet_amount:.2f}."
+        text += f"{pe('lose')} Bot wins the match ({game['bot_score']}-{game['user_score']}). You lost {format_for_user(user_id, bet_amount)}."
 
         # Send final match result
         try:
@@ -25544,10 +25929,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from
     # Get user level
     level_data = get_user_level(user.id)
 
-    # Get user currency for display
-    user_currency = get_user_currency(user.id)
+    # Get user's DISPLAY currency (what they want to see amounts in,
+    # not the wallet crypto). Every amount below is rendered compact
+    # so huge lifetime numbers don't break the layout.
+    user_currency = get_display_currency(user.id)
     balance = get_total_balance_usd(user.id)
-    formatted_balance = format_currency(balance, user_currency)
+    formatted_balance = format_compact_for_user(user.id, balance, with_usdt_estimate=(user_currency != "USDT"))
 
     if is_group and stats_view == '24h':
         # Calculate 24hr stats from game_sessions
@@ -25579,7 +25966,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from
                 continue
 
         win_rate = (wins_24h / bets_24h * 100) if bets_24h > 0 else 0
-        formatted_wagered = format_currency(wagered_24h, user_currency)
+        formatted_wagered = format_compact_for_user(user.id, wagered_24h)
 
         text = (
             f"{pe('chart')} <b>Your Stats - Last 24 Hours</b>\n\n"
@@ -25598,17 +25985,18 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from
         total_withdrawals = sum(w['amount'] for w in stats.get('withdrawals', []))
 
         total_wagered = stats.get('bets', {}).get('amount', 0.0)
-        formatted_wagered = format_currency(total_wagered, user_currency)
-        formatted_deposits = format_currency(total_deposits, user_currency)
-        formatted_withdrawals = format_currency(total_withdrawals, user_currency)
-        formatted_tips_received = format_currency(stats.get('tips_received', {}).get('amount', 0.0), user_currency)
-        formatted_tips_sent = format_currency(stats.get('tips_sent', {}).get('amount', 0.0), user_currency)
-        formatted_rain = format_currency(stats.get('rain_received', {}).get('amount', 0.0), user_currency)
-        formatted_pnl = format_currency(stats.get('pnl', 0.0), user_currency)
+        _fmt = lambda amt: format_compact_for_user(user.id, amt)
+        formatted_wagered = _fmt(total_wagered)
+        formatted_deposits = _fmt(total_deposits)
+        formatted_withdrawals = _fmt(total_withdrawals)
+        formatted_tips_received = _fmt(stats.get('tips_received', {}).get('amount', 0.0))
+        formatted_tips_sent = _fmt(stats.get('tips_sent', {}).get('amount', 0.0))
+        formatted_rain = _fmt(stats.get('rain_received', {}).get('amount', 0.0))
+        formatted_pnl = _fmt(stats.get('pnl', 0.0))
 
         referral_count = len(stats.get('referral', {}).get('referred_users', []))
         referral_commission = stats.get('referral', {}).get('commission_earned', 0.0)
-        formatted_commission = format_currency(referral_commission, user_currency)
+        formatted_commission = _fmt(referral_commission)
 
         achievement_count = len(stats.get('achievements', []))
 
@@ -26127,15 +26515,22 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ],
         ]
 
-        # Simplified balance: Balance: $X (X' COIN)
+        # Group format: <premium_emoji> <symbol> <amount in display currency> (~ X.XX USDT)
         active_coin = get_active_currency(user.id)
         balance_usd = get_active_balance_usd(user.id)
         wallet = ensure_wallet_dict(user.id)
         crypto_balance = wallet.get(active_coin, 0.0)
         formatted_crypto = format_crypto_amount(crypto_balance, active_coin)
 
+        disp = get_display_currency(user.id)
+        display_str = format_for_user(
+            user.id, balance_usd, compact=False,
+            with_usdt_estimate=(disp != "USDT"),
+        )
+        cur_emoji = pe(CURRENCY_EMOJI_KEY.get(disp, 'balance'))
         text = (
-            f"{pe('balance')} <b>Balance:</b> ${balance_usd:,.2f} ({formatted_crypto} {active_coin})"
+            f"{cur_emoji} <b>Balance:</b> {display_str}"
+            f"\n{pe('gem')} Wallet: {formatted_crypto} {active_coin}"
         )
 
         reply_markup = create_styled_keyboard(keyboard)
@@ -26433,7 +26828,29 @@ async def generate_history_image(user_id: int, context, page: int = 0):
         # Profile pic
         profile_pic = await _get_cached_profile_picture(context, user_id)
 
-        # Offload to thread
+        # Pre-compute per-row bet/profit strings in the user's display
+        # currency so the PIL renderer doesn't need to know about FX rates.
+        row_data = []
+        for gid in page_games:
+            game = game_sessions.get(gid, {}) or {}
+            bet_amount = game.get('bet_amount', 0.0)
+            multiplier = game.get('multiplier', 0)
+            is_win = game.get('win', False)
+            profit = bet_amount * multiplier - bet_amount if multiplier else -bet_amount
+            row_data.append({
+                "gid": gid,
+                "game_type": game.get('game_type', 'unknown').replace('_', ' ').title(),
+                "bet_amount": bet_amount,
+                "bet_str": format_compact_for_user(user_id, bet_amount),
+                "multiplier": multiplier,
+                "profit": profit,
+                "profit_str": f"{'+' if profit >= 0 else '-'}{format_compact_for_user(user_id, abs(profit))}",
+                "win": is_win,
+                "status": game.get('status', 'unknown'),
+            })
+
+        wagered_str = format_compact_for_user(user_id, total_wagered)
+
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             _image_executor,
@@ -26446,9 +26863,11 @@ async def generate_history_image(user_id: int, context, page: int = 0):
                 "total_wins": total_wins,
                 "total_losses": total_losses,
                 "total_wagered": total_wagered,
+                "total_wagered_str": wagered_str,
                 "total_games": total_games,
                 "page": page,
                 "page_games": page_games,
+                "row_data": row_data,
                 "bot_username": bot_username,
             },
             profile_pic,
@@ -26518,11 +26937,12 @@ def _render_history_sync(data: dict, profile_pic):
         box_h = 55
         gap = 15
 
+        wagered_disp = data.get('total_wagered_str') or f"${data['total_wagered']:,.2f}"
         stats_data = [
             ("TOTAL BETS", str(data['total_bets']), (0, 231, 1)),
             ("WINS", str(data['total_wins']), (34, 197, 94)),
             ("LOSSES", str(data['total_losses']), (239, 68, 68)),
-            ("WAGERED", f"${data['total_wagered']:,.2f}", (255, 215, 0))
+            ("WAGERED", wagered_disp, (255, 215, 0)),
         ]
 
         for i, (label, value, color) in enumerate(stats_data):
@@ -26557,41 +26977,48 @@ def _render_history_sync(data: dict, profile_pic):
             draw.text((850, y_games), "ID", fill=(90, 106, 122), font=font_tiny)
             y_games += 22
 
+            # Prefer pre-formatted per-row strings (display currency) if
+            # the caller supplied them.
+            row_data = data.get('row_data') or []
             for idx, gid in enumerate(page_games):
-                game = game_sessions.get(gid, {})
-                if not game:
-                    continue
+                # Pre-computed row (display-currency aware) if available.
+                row = row_data[idx] if idx < len(row_data) else None
+                if row is None:
+                    game = game_sessions.get(gid, {})
+                    if not game:
+                        continue
+                    bet_amount = game.get('bet_amount', 0.0)
+                    multiplier = game.get('multiplier', 0)
+                    is_win = game.get('win', False)
+                    profit = bet_amount * multiplier - bet_amount if multiplier else -bet_amount
+                    game_type = game.get('game_type', 'unknown').replace('_', ' ').title()
+                    bet_str = f"${bet_amount:.2f}"
+                    profit_str = f"{'+'if profit>=0 else ''}${profit:.2f}"
+                else:
+                    bet_amount = row['bet_amount']
+                    multiplier = row['multiplier']
+                    is_win = row['win']
+                    profit = row['profit']
+                    game_type = row['game_type']
+                    bet_str = row['bet_str']
+                    profit_str = row['profit_str']
 
                 game_num = total_games - (page * HISTORY_ITEMS_PER_PAGE + idx)
-                game_type = game.get('game_type', 'unknown').replace('_', ' ').title()
-                bet_amount = game.get('bet_amount', 0.0)
-                multiplier = game.get('multiplier', 0)
-                is_win = game.get('win', False)
-                profit = bet_amount * multiplier - bet_amount if multiplier else -bet_amount
-                status = game.get('status', 'unknown')
 
                 row_y = y_games + idx * 28
-                # Alternating row background
                 if idx % 2 == 0:
                     draw.rectangle((25, row_y - 2, W - 25, row_y + 24), fill=(20, 35, 50))
 
-                # Number
                 draw.text((30, row_y), f"#{game_num}", fill=(176, 196, 216), font=font_tiny)
-                # Game type
                 draw.text((70, row_y), game_type[:20], fill=(255, 255, 255), font=font_tiny)
-                # Bet
-                draw.text((280, row_y), f"${bet_amount:.2f}", fill=(176, 196, 216), font=font_tiny)
-                # Multiplier
+                draw.text((280, row_y), bet_str, fill=(176, 196, 216), font=font_tiny)
                 mult_color = (0, 231, 1) if multiplier >= 1 else (239, 68, 68)
                 draw.text((430, row_y), f"{multiplier:.2f}x" if multiplier else "N/A", fill=mult_color, font=font_tiny)
-                # Profit
                 profit_color = (0, 231, 1) if profit >= 0 else (239, 68, 68)
-                draw.text((560, row_y), f"{'+'if profit>=0 else ''}${profit:.2f}", fill=profit_color, font=font_tiny)
-                # Result
+                draw.text((560, row_y), profit_str, fill=profit_color, font=font_tiny)
                 result_text = "WIN" if is_win else "LOSS"
                 result_color = (0, 231, 1) if is_win else (239, 68, 68)
                 draw.text((720, row_y), result_text, fill=result_color, font=font_tiny)
-                # Game ID (truncated)
                 draw.text((850, row_y), str(gid)[:10], fill=(90, 106, 122), font=font_tiny)
 
         # Footer
@@ -27329,7 +27756,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 asyncio.ensure_future(resolve_sidebets_for_match(active_pvb_game_id, "p2", context))
                 await update_stats_on_bet(user.id, game['id'], game['bet_amount'], False, context=context)
                 # AIORateLimiter handles per-chat pacing; manual sleep removed.
-                await update.message.reply_text(f"{pe('lose')} {user.mention_html()}, Bot wins the match ({game['bot_score']}-{game['user_score']}). You lost ${game['bet_amount']:.2f}.", parse_mode=ParseMode.HTML)
+                await update.message.reply_text(f"{pe('lose')} {user.mention_html()}, Bot wins the match ({game['bot_score']}-{game['user_score']}). You lost {format_for_user(user.id, game['bet_amount'])}.", parse_mode=ParseMode.HTML)
                 context.chat_data.pop(f"active_pvb_game_{user.id}", None)
                 if user.id in active_pvb_games:
                     del active_pvb_games[user.id]
@@ -27951,9 +28378,17 @@ async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user_id = None
     target_username = None
 
+    # Parse tip amount in the sender's DISPLAY currency so /tip @x 500
+    # means "500 of whatever currency I've chosen".
+    display_currency = get_display_currency(user.id)
+    disp_sym = CURRENCY_SYMBOLS.get(display_currency, "")
+
+    raw_amount_str = None
     if update.message.reply_to_message and len(message_text) == 2:
         try:
-            tip_amount = float(message_text[1])
+            raw_amount_str = message_text[1]
+            tip_amount_display = float(raw_amount_str)
+            tip_amount_usd = convert_display_to_usd(tip_amount_display, display_currency)
             target_user_id = update.message.reply_to_message.from_user.id
             target_username = update.message.reply_to_message.from_user.username
         except (ValueError, IndexError):
@@ -27962,7 +28397,9 @@ async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif len(message_text) == 3:
         try:
             target_username_str = normalize_username(message_text[1])
-            tip_amount = float(message_text[2])
+            raw_amount_str = message_text[2]
+            tip_amount_display = float(raw_amount_str)
+            tip_amount_usd = convert_display_to_usd(tip_amount_display, display_currency)
             target_user_id = username_to_userid.get(target_username_str)
             if not target_user_id:
                 try:
@@ -27989,16 +28426,21 @@ async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id == target_user_id and not is_owner:
         await update.message.reply_text("You cannot tip yourself.")
         return
-    if tip_amount <= 0:
+    if tip_amount_usd <= 0:
         await update.message.reply_text("Tip amount must be positive.")
         return
 
     # Calculate crypto equivalent for confirmation
     active_coin = get_active_currency(user.id)
     price = LIVE_PRICES.get(active_coin, 1.0)
-    crypto_amount = tip_amount / price
+    crypto_amount = tip_amount_usd / price
     formatted_crypto = format_crypto_amount(crypto_amount, active_coin)
     tipped_user_mention = f"@{target_username}" if target_username else f"User (ID: {target_user_id})"
+
+    # Display the tip in the sender's currency, plus a USDT estimate so
+    # the receiver can eyeball the value regardless of their own setting.
+    sender_display_str = format_display_amount(tip_amount_usd, display_currency)
+    usdt_estimate_str = format_display_amount(tip_amount_usd, "USDT")
 
     # Store tip data for confirmation
     tip_id = f"{user.id}_{target_user_id}_{int(datetime.now(timezone.utc).timestamp())}"
@@ -28007,27 +28449,36 @@ async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'sender_id': user.id,
         'target_user_id': target_user_id,
         'target_username': target_username,
-        'tip_amount_usd': tip_amount,
+        'tip_amount_usd': tip_amount_usd,
+        'tip_amount_display': tip_amount_display,
+        'display_currency': display_currency,
         'crypto_amount': crypto_amount,
         'coin': active_coin,
         'is_owner': is_owner,
     }
 
-    # Send confirmation message with inline buttons
-    keyboard = [
-        [
-            InlineKeyboardButton("Confirm", callback_data=f"confirm_tip_{tip_id}"),
-            InlineKeyboardButton("Cancel", callback_data=f"cancel_tip_{tip_id}")
-        ]
-    ]
+    # Colorful premium-emoji confirm (green) / cancel (red) buttons.
+    keyboard = [[
+        apply_button_style(
+            InlineKeyboardButton(f"✅ Confirm", callback_data=f"confirm_tip_{tip_id}"),
+            'success',
+            peb('check'),
+        ),
+        apply_button_style(
+            InlineKeyboardButton(f"❌ Cancel", callback_data=f"cancel_tip_{tip_id}"),
+            'danger',
+            peb('cross'),
+        ),
+    ]]
     await update.message.reply_text(
-        f"{pe('warning')} <b>Confirm Tip</b> ⚠️\n\n"
-        f"{pe('balance')} Sending: <b>${tip_amount:.2f}</b>\n"
-        f"{pe('gem')} Actual: <b>{formatted_crypto} {active_coin}</b>\n"
-        f"👤 To: {tipped_user_mention}\n\n"
+        f"{pe('warning')} <b>Confirm Tip</b>\n\n"
+        f"{pe(CURRENCY_EMOJI_KEY.get(display_currency, 'balance'))} "
+        f"Sending: <b>{sender_display_str}</b> (~ {usdt_estimate_str} USDT)\n"
+        f"{pe('gem')} Wallet debit: <b>{formatted_crypto} {active_coin}</b>\n"
+        f"{pe('user')} To: {tipped_user_mention}\n\n"
         f"Please confirm or cancel.",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=create_styled_keyboard(keyboard),
     )
 
 
@@ -28058,6 +28509,7 @@ async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         coin = pending_tip['coin']
         crypto_amount = pending_tip['crypto_amount']
         is_owner = pending_tip['is_owner']
+        sender_currency = pending_tip.get('display_currency', get_display_currency(user.id))
 
         # ATOMIC balance check + deduct to prevent race conditions
         if not is_owner:
@@ -28083,15 +28535,23 @@ async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
         formatted_crypto = format_crypto_amount(crypto_amount, coin)
         tipped_user_mention = f"@{target_username}" if target_username else f"user (ID: {target_user_id})"
+        sender_str = format_display_amount(tip_amount, sender_currency)
+        usdt_str = format_display_amount(tip_amount, "USDT")
         await query.edit_message_text(
             f"{pe('check')} Tip sent to {tipped_user_mention}!\n"
-            f"{pe('balance')} ${tip_amount:.2f} ({formatted_crypto} {coin})",
+            f"{pe(CURRENCY_EMOJI_KEY.get(sender_currency, 'balance'))} "
+            f"{sender_str} (~ {usdt_str} USDT)  \u2014  {formatted_crypto} {coin}",
             parse_mode=ParseMode.HTML
         )
         try:
+            # Show the receiver the tip in THEIR preferred currency.
+            receiver_str = format_for_user(target_user_id, tip_amount, with_usdt_estimate=True)
             await context.bot.send_message(
                 chat_id=target_user_id,
-                text=f"You received a tip of ${tip_amount:.2f} ({formatted_crypto} {coin}) from {user.mention_html()}!",
+                text=(
+                    f"{pe('gift')} You received a tip of <b>{receiver_str}</b> "
+                    f"({formatted_crypto} {coin}) from {user.mention_html()}!"
+                ),
                 parse_mode=ParseMode.HTML
             )
         except Exception as e:
@@ -29492,42 +29952,48 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Default view is all-time
     view = context.user_data.get('leaderboard_view', 'all_time')
 
+    # Leaderboard amounts are rendered in the VIEWING user's display
+    # currency, compact-formatted so big numbers collapse to
+    # e.g. 6.3L (INR) or $1.2M (USD) instead of bleeding across the row.
+    def _fmt(amt_usd):
+        return format_compact_for_user(user_id, amt_usd)
+
     # Get leaderboard data
     if view == 'all_time':
-        title = "\U0001F3C6 <b>Top 10 Players - All Time</b> \U0001F3C6"
+        title = f"{pe('trophy')} <b>Top 10 Players - All Time</b> {pe('trophy')}"
         data = leaderboard_data["all_time"]
         msg = f"{title}\n\n"
         if data:
             for i, (uid, username, wagered) in enumerate(data):
                 rank_sym = ["🥇", "🥈", "🥉"][i] if i < 3 else f"#{i+1}"
                 display_name = get_privacy_display_name(uid, username)
-                msg += f"{rank_sym} {display_name} - <b>${wagered:,.2f}</b>\n"
+                msg += f"{rank_sym} {display_name} - <b>{_fmt(wagered)}</b>\n"
         else:
             msg += "No data available yet.\n"
     elif view == 'weekly':
-        title = "\U0001F4C5 <b>Top 10 Players - This Week</b> \U0001F4C5"
+        title = f"{pe('weekly')} <b>Top 10 Players - This Week</b> {pe('weekly')}"
         data = leaderboard_data["weekly"]
         msg = f"{title}\n\n"
         if data:
             for i, (uid, username, wagered) in enumerate(data):
                 rank_sym = ["🥇", "🥈", "🥉"][i] if i < 3 else f"#{i+1}"
                 display_name = get_privacy_display_name(uid, username)
-                msg += f"{rank_sym} {display_name} - <b>${wagered:,.2f}</b>\n"
+                msg += f"{rank_sym} {display_name} - <b>{_fmt(wagered)}</b>\n"
         else:
             msg += "No data available yet.\n"
     elif view == 'monthly':
-        title = "\U0001F4C6 <b>Top 10 Players - This Month</b> \U0001F4C6"
+        title = f"{pe('monthly')} <b>Top 10 Players - This Month</b> {pe('monthly')}"
         data = leaderboard_data["monthly"]
         msg = f"{title}\n\n"
         if data:
             for i, (uid, username, wagered) in enumerate(data):
                 rank_sym = ["🥇", "🥈", "🥉"][i] if i < 3 else f"#{i+1}"
                 display_name = get_privacy_display_name(uid, username)
-                msg += f"{rank_sym} {display_name} - <b>${wagered:,.2f}</b>\n"
+                msg += f"{rank_sym} {display_name} - <b>{_fmt(wagered)}</b>\n"
         else:
             msg += "No data available yet.\n"
     elif view == 'highest_wins':
-        title = "\U0001F4B0 <b>Highest Wins - This Month</b> \U0001F4B0"
+        title = f"{pe('money')} <b>Highest Wins - This Month</b> {pe('money')}"
         data = leaderboard_data["highest_wins"]
         msg = f"{title}\n\n"
         if data:
@@ -29535,7 +30001,7 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
                 rank_sym = ["🥇", "🥈", "🥉"][i] if i < 3 else f"#{i+1}"
                 display_name = get_privacy_display_name(uid, username)
                 date_str = timestamp.strftime("%Y-%m-%d") if isinstance(timestamp, datetime) else str(timestamp)[:10]
-                msg += f"{rank_sym} {display_name} - <b>${win_amount:,.2f}</b>\n   Game: {game_type.upper()} | Date: {date_str}\n\n"
+                msg += f"{rank_sym} {display_name} - <b>{_fmt(win_amount)}</b>\n   Game: {game_type.upper()} | Date: {date_str}\n\n"
         else:
             msg += "No wins recorded yet.\n"
 
@@ -29583,12 +30049,13 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             user_rank = "Unranked"
             user_wagered = 0.0
 
-    # Add user rank to message
+    # Add user rank to message (wagered in user's display currency, compact).
+    wagered_str = format_compact_for_user(user_id, user_wagered)
     rank_display = ""
     if isinstance(user_rank, int):
-        rank_display = f"\n\U0001F4CA <b>Your Rank: #{user_rank}</b> - ${user_wagered:,.2f} wagered"
+        rank_display = f"\n{pe('chart')} <b>Your Rank: #{user_rank}</b> - {wagered_str} wagered"
     else:
-        rank_display = f"\n\U0001F4CA <b>Your Rank:</b> Unranked - ${user_wagered:,.2f} wagered"
+        rank_display = f"\n{pe('chart')} <b>Your Rank:</b> Unranked - {wagered_str} wagered"
 
     msg += rank_display
 
@@ -30800,7 +31267,12 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from
     stats["last_daily_claim"] = str(datetime.now(timezone.utc))
     save_user_data(user.id)
 
-    text = get_text("daily_claim_success", lang, amount=bonus_amount)
+    # Show the bonus amount in the user's display currency.
+    bonus_display = format_for_user(user.id, bonus_amount)
+    try:
+        text = get_text("daily_claim_success", lang, amount=bonus_display)
+    except Exception:
+        text = f"{pe('gift')} Daily bonus claimed: {bonus_display}!"
     reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("Back to Bonuses", callback_data="main_bonuses")]]) if from_callback else None
 
     if from_callback:
@@ -30898,20 +31370,26 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @check_banned
 @check_maintenance
 async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /currency command - show currency selection menu directly.
+    """``/currency`` - select both the active wallet coin AND the
+    display currency (the unit you see / type bets in).
 
-    Emojis in this command use plain unicode (no premium <tg-emoji> tags)
-    because invalid custom emoji IDs cause Telegram to reject the message
-    with MESSAGE_HAS_INVALID_CUSTOM_EMOJI_ID, which was surfacing as
-    "an error occurred" for users.
+    The display currency can be any fiat (USD/INR/EUR/GBP) or any
+    supported crypto. Picking e.g. INR means every balance, bet,
+    stat, leaderboard and tip is shown in \u20B9, while the wallet
+    itself still holds whichever crypto you deposited in.
     """
     user = update.effective_user
     await ensure_user_in_wallets(user.id, user.username, context=context)
 
     current_currency = get_active_currency(user.id)
-    user_lang = get_user_lang(user.id)
+    current_display = get_display_currency(user.id)
     keyboard = []
 
+    # --- Active wallet crypto ---
+    keyboard.append([InlineKeyboardButton(
+        f"\U0001F4B0 Wallet currency (what you hold)",
+        callback_data="noop_cur_header_wallet",
+    )])
     for curr in SUPPORTED_CRYPTOS:
         bal = ensure_wallet_dict(user.id).get(curr, 0.0)
         price = LIVE_PRICES.get(curr, 1.0)
@@ -30919,13 +31397,29 @@ async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = f"{curr}"
         if curr == current_currency:
-            text += " \u2713"  # checkmark
+            text += " \u2713"
         text += f"  (${usd_val:,.2f})"
 
         keyboard.append([apply_button_style(
             InlineKeyboardButton(text, callback_data=f"setcurrency_{curr}"),
             'success' if curr == current_currency else 'primary',
-            None  # No custom emoji IDs to prevent Telegram API errors
+            None,
+        )])
+
+    # --- Display currency (fiat + crypto) ---
+    keyboard.append([InlineKeyboardButton(
+        f"\U0001F310 Display currency (what you see)",
+        callback_data="noop_cur_header_display",
+    )])
+    for curr in SUPPORTED_DISPLAY_CURRENCIES:
+        sym = CURRENCY_SYMBOLS.get(curr, "")
+        label = f"{sym} {curr}" if sym else curr
+        if curr == current_display:
+            label += " \u2713"
+        keyboard.append([apply_button_style(
+            InlineKeyboardButton(label, callback_data=f"setdisplay_{curr}"),
+            'success' if curr == current_display else 'primary',
+            None,
         )])
 
     keyboard.append([apply_button_style(
@@ -30934,12 +31428,15 @@ async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )])
 
     current_symbol = CRYPTO_SYMBOLS.get(current_currency, "\U0001F4B0")
+    disp_symbol = CURRENCY_SYMBOLS.get(current_display, "")
     sent = await update.message.reply_text(
-        f"\U0001F4B0 <b>Select Active Currency</b>\n\n"
-        f"Current: {current_symbol} <b>{current_currency}</b>\n\n"
-        f"Choose your active crypto currency below.\n"
-        f"All bets, tips, and games will use the selected currency.\n\n"
-        f"\u26A0\uFE0F <i>Your balance in each coin is separate (segregated wallets).</i>",
+        f"\U0001F4B0 <b>Select Currency</b>\n\n"
+        f"Wallet: {current_symbol} <b>{current_currency}</b>\n"
+        f"Display: {disp_symbol} <b>{current_display}</b>\n\n"
+        f"\u2022 <b>Wallet</b> is which crypto your balance actually sits in.\n"
+        f"\u2022 <b>Display</b> is the unit every balance / bet / stat is shown in.\n"
+        f"   Picking INR means <code>/bj 500</code> bets \u20B9500 (not $500).\n\n"
+        f"\u26A0\uFE0F <i>Your wallet balance in each coin is segregated.</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=create_styled_keyboard(keyboard)
     )
@@ -30949,10 +31446,14 @@ async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @check_banned
 @check_maintenance
 async def currency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle crypto currency selection (active currency)"""
+    """Handle currency selection callbacks.
+
+    ``setcurrency_<coin>``  -> active wallet crypto
+    ``setdisplay_<code>``   -> display currency (fiat or crypto)
+    ``noop_cur_header_*``   -> header rows (ignore, keep menu open)
+    """
     query = update.callback_query
 
-    # Check menu ownership BEFORE answering
     if not check_menu_ownership(query, context):
         await query.answer("This menu is not for you.", show_alert=True)
         return
@@ -30960,18 +31461,40 @@ async def currency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     user = query.from_user
-    currency_code = query.data.split('_')[1].upper()
     await ensure_user_in_wallets(user.id, user.username, context=context)
 
-    if currency_code in SUPPORTED_CRYPTOS:
-        user_stats[user.id]["active_currency"] = currency_code
-        save_user_data(user.id)
-        symbol = CRYPTO_SYMBOLS.get(currency_code, "💎")
-        await query.answer(f"Active currency set to {symbol} {currency_code}", show_alert=True)
-        # Go back to settings menu
-        await settings_command(update, context)
-    else:
-        await query.answer("Invalid currency code.", show_alert=True)
+    data = query.data or ""
+
+    if data.startswith("noop_cur_header"):
+        return
+
+    if data.startswith("setdisplay_"):
+        code = data.split("_", 1)[1].upper()
+        if set_display_currency(user.id, code):
+            sym = CURRENCY_SYMBOLS.get(code, "")
+            await query.answer(f"Display currency set to {sym} {code}", show_alert=True)
+            # Refresh the menu in place.
+            try:
+                await currency_command(update, context)
+            except Exception:
+                pass
+        else:
+            await query.answer("Invalid display currency.", show_alert=True)
+        return
+
+    if data.startswith("setcurrency_"):
+        currency_code = data.split("_", 1)[1].upper()
+        if currency_code in SUPPORTED_CRYPTOS:
+            user_stats[user.id]["active_currency"] = currency_code
+            save_user_data(user.id)
+            symbol = CRYPTO_SYMBOLS.get(currency_code, "💎")
+            await query.answer(f"Active currency set to {symbol} {currency_code}", show_alert=True)
+            await settings_command(update, context)
+        else:
+            await query.answer("Invalid currency code.", show_alert=True)
+        return
+
+    await query.answer("Unknown action.", show_alert=True)
 
 ## NEW FEATURE - Surprise Code Drop System ##
 surprise_drops = {}  # {code: {amount, wager_requirement, claimed_by, claimed_by_username, timestamp, chat_id, message_id, status}}
@@ -33505,6 +34028,9 @@ async def post_init(application: Application):
 
         # Start the live price engine (MEXC API, every 5 minutes)
         application.create_task(update_live_prices())
+
+        # Start the live fiat FX rates engine (USD -> INR/EUR/GBP, every 30 min)
+        application.create_task(update_live_fiat_rates())
 
         # Start the raffle monitoring task
         application.create_task(monitor_raffles_task(application))
@@ -36265,7 +36791,7 @@ def main():
 
     # 8. User settings and info handlers
     app.add_handler(CallbackQueryHandler(settings_callback_handler, pattern=r"^settings_", block=False))
-    app.add_handler(CallbackQueryHandler(currency_callback, pattern=r"^setcurrency_", block=False))
+    app.add_handler(CallbackQueryHandler(currency_callback, pattern=r"^(setcurrency_|setdisplay_|noop_cur_header)", block=False))
     app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang_", block=False))
     app.add_handler(CallbackQueryHandler(stats_view_callback, pattern=r"^stats_(24h|alltime)_", block=False))
     app.add_handler(CallbackQueryHandler(users_navigation_callback, pattern=r"^users_", block=False))
