@@ -863,6 +863,7 @@ PREMIUM_EMOJI_IDS = {
     "deposit":     ("5406745015365943482", "⬇️"),  # FinanceEmoji - downward arrow
     "withdraw":    ("5445355530111437729", "📤"),  # FinanceEmoji - outgoing arrow
     "balance":     ("5409048419211682843", "💵"),
+    "dollar":      ("5409048419211682843", "💲"),  # Premium dollar — used for all fiat display
     "usdt":        ("5282947801703017118", "💵"),  # USDT - Tether green logo
     "btc":         ("5283206889332684532", "\u20bf"), # BTC - Bitcoin orange logo
     "eth":         ("5282987987003465794", "\u039e"), # ETH - Ethereum diamond logo
@@ -1458,7 +1459,10 @@ DASHBOARD_CONFIG = {
 
 SUPPORTED_FIATS = ["USD", "INR", "EUR", "GBP"]
 
-SUPPORTED_DISPLAY_CURRENCIES = list(SUPPORTED_CRYPTOS) + SUPPORTED_FIATS
+# Display currency is the unit users see for balances, bets, stats and
+# leaderboards.  Restricted to the four supported fiats; users still
+# hold real crypto in their wallet, but they read it in INR/USD/EUR/GBP.
+SUPPORTED_DISPLAY_CURRENCIES = list(SUPPORTED_FIATS)
 
 CURRENCY_RATES = {
     "USD": 1.0,
@@ -1486,10 +1490,14 @@ CURRENCY_SYMBOLS = {
 }
 
 CURRENCY_EMOJI_KEY = {
-    "USD":  "balance",
-    "INR":  "money",
-    "EUR":  "money",
-    "GBP":  "money",
+    # Every fiat now uses the premium dollar emoji (PREMIUM_EMOJI_IDS['dollar'])
+    # for a consistent, on-brand "money" indicator across balances, bets
+    # and stats.  Crypto keys are kept for legacy callers that still
+    # render an active-wallet badge — they aren't used for display.
+    "USD":  "dollar",
+    "INR":  "dollar",
+    "EUR":  "dollar",
+    "GBP":  "dollar",
     "USDT": "usdt",
     "BTC":  "btc",
     "ETH":  "eth",
@@ -1504,20 +1512,15 @@ _INDIAN_SCALE_CURRENCIES = {"INR"}
 def get_display_currency(user_id) -> str:
     """Return the user's preferred display currency.
 
-    Falls back to their active crypto wallet (so existing users
-    who never picked a display currency keep seeing amounts in
-    their wallet coin instead of a sudden switch to USD)."""
+    Display currency is restricted to one of the four supported fiats
+    (INR / USD / EUR / GBP).  When a user has not picked one yet — or
+    has a stale crypto preference saved from an older build — we fall
+    back to USD so the UI never shows a non-fiat unit."""
     try:
         stats = user_stats.get(user_id, {}) or {}
         pref = stats.get("display_currency")
         if isinstance(pref, str) and pref.upper() in SUPPORTED_DISPLAY_CURRENCIES:
             return pref.upper()
-    except Exception:
-        pass
-    try:
-        active = get_active_currency(user_id)
-        if active in SUPPORTED_DISPLAY_CURRENCIES:
-            return active
     except Exception:
         pass
     return "USD"
@@ -1652,12 +1655,14 @@ def format_currency(amount_usd, currency="USD"):
     """Legacy helper - always returns the amount in the given currency.
 
     Kept USD-only-looking signature for backwards compat but now
-    respects the currency argument. Most call sites pass a user's
-    currency here already (e.g. get_user_currency(...))."""
+    respects the currency argument. Accepts any of the four display
+    fiats (INR/USD/EUR/GBP) AND any supported crypto code (so callers
+    that pass an active wallet coin still render correctly even
+    though crypto is no longer a *display* currency)."""
     c = (currency or "USD").upper()
-    if c not in SUPPORTED_DISPLAY_CURRENCIES:
-        return f"${float(amount_usd or 0.0):,.2f}"
-    return format_display_amount(amount_usd, c, compact=False, with_symbol=True)
+    if c in SUPPORTED_FIATS or c in SUPPORTED_CRYPTOS:
+        return format_display_amount(amount_usd, c, compact=False, with_symbol=True)
+    return f"${float(amount_usd or 0.0):,.2f}"
 
 async def update_live_fiat_rates():
     """Background task: refresh USD -> fiat rates every 30 min.
