@@ -38,31 +38,46 @@ async def rain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = update.message.text.strip().split()
     logging.info(f"[RAIN] Args: {args}")
     if len(args) < 2:
+        disp_currency = get_display_currency(user.id)
+        disp_sym = CURRENCY_SYMBOLS.get(disp_currency, "$")
         await update.message.reply_text(
             "Usage: /rain <b>&lt;amount&gt;</b> [<b>&lt;currency&gt;</b>]\n\n"
             "Examples:\n"
-            "• <code>/rain 10</code> — Rain $10 worth of your active currency\n"
+            f"• <code>/rain 100</code> — Rain {disp_sym}100 (your display currency)\n"
             "• <code>/rain 5 USDT</code> — Rain 5 USDT\n"
             "• <code>/rain 0.01 ETH</code> — Rain 0.01 ETH",
             parse_mode=ParseMode.HTML
         )
         return
 
-    # Parse amount
-    try:
-        amount = float(args[1])
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text(f"{pe('cross')} Invalid amount. Please enter a positive number.", parse_mode=ParseMode.HTML)
-        return
-
-    # Parse currency (default to active currency)
-    if len(args) >= 3:
-        currency = args[2].upper()
+    # If only an amount is given, interpret it as the user's display
+    # currency (parity with bets, tips and leaderboards) and rain it
+    # in USDT — the bot's most stable settlement coin.
+    if len(args) == 2:
+        try:
+            disp_currency = get_display_currency(user.id)
+            amount_disp = float(args[1])
+            if amount_disp <= 0:
+                raise ValueError
+            amount_usd = convert_display_to_usd(amount_disp, disp_currency)
+            usdt_price = LIVE_PRICES.get("USDT", 1.0) or 1.0
+            amount = amount_usd / usdt_price
+            currency = "USDT"
+        except ValueError:
+            await update.message.reply_text(f"{pe('cross')} Invalid amount. Please enter a positive number.", parse_mode=ParseMode.HTML)
+            return
+        logging.info(f"[RAIN] Amount (display→USDT): {amount_disp} {disp_currency} → {amount} USDT")
     else:
-        currency = get_active_currency(user.id)
-    logging.info(f"[RAIN] Amount: {amount}, Currency: {currency}")
+        # Explicit currency: keep classic behaviour (raw crypto amount).
+        try:
+            amount = float(args[1])
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(f"{pe('cross')} Invalid amount. Please enter a positive number.", parse_mode=ParseMode.HTML)
+            return
+        currency = args[2].upper()
+        logging.info(f"[RAIN] Amount: {amount}, Currency: {currency}")
 
     # Validate currency exists in wallet
     wallet = ensure_wallet_dict(user.id)
@@ -308,23 +323,17 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ],
         ]
 
-        # Group format: <premium_emoji> <symbol> <amount in display currency> (~ X.XX USDT)
-        active_coin = get_active_currency(user.id)
+        # Group format: ONLY the user's display-currency balance.  We
+        # intentionally drop the crypto wallet line — groups are public
+        # and people don't want their wallet coin or balance leaking.
         balance_usd = get_active_balance_usd(user.id)
-        wallet = ensure_wallet_dict(user.id)
-        crypto_balance = wallet.get(active_coin, 0.0)
-        formatted_crypto = format_crypto_amount(crypto_balance, active_coin)
-
         disp = get_display_currency(user.id)
         display_str = format_for_user(
             user.id, balance_usd, compact=False,
-            with_usdt_estimate=(disp != "USDT"),
+            with_usdt_estimate=False,
         )
-        cur_emoji = pe(CURRENCY_EMOJI_KEY.get(disp, 'balance'))
-        text = (
-            f"{cur_emoji} <b>Balance:</b> {display_str}"
-            f"\n{pe('gem')} Wallet: {formatted_crypto} {active_coin}"
-        )
+        cur_emoji = pe(CURRENCY_EMOJI_KEY.get(disp, 'dollar'))
+        text = f"{cur_emoji} <b>Balance:</b> {display_str}"
 
         reply_markup = create_styled_keyboard(keyboard)
 

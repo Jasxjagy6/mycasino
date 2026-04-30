@@ -3220,10 +3220,8 @@ async def crash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         bet_amount_str = args[1].lower()
-        if bet_amount_str == 'all':
-            bet_amount = get_active_balance_usd(user.id)
-        else:
-            bet_amount = float(bet_amount_str)
+        # Display-currency aware (parity with blackjack/tower).
+        bet_amount, _bet_disp, _disp_cur = parse_bet_amount(bet_amount_str, user.id)
 
         auto_cashout = None
         if len(args) >= 3:
@@ -3349,10 +3347,8 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         bet_amount_str = args[1].lower()
-        if bet_amount_str == 'all':
-            bet_amount = get_active_balance_usd(user.id)
-        else:
-            bet_amount = float(bet_amount_str)
+        # Display-currency aware (parity with blackjack/tower).
+        bet_amount, _bet_disp, _disp_cur = parse_bet_amount(bet_amount_str, user.id)
     except ValueError:
         await update.message.reply_text("Invalid amount.")
         return
@@ -3442,10 +3438,8 @@ async def scratch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         bet_amount_str = args[1].lower()
-        if bet_amount_str == 'all':
-            bet_amount = get_active_balance_usd(user.id)
-        else:
-            bet_amount = float(bet_amount_str)
+        # Display-currency aware (parity with blackjack/tower).
+        bet_amount, _bet_disp, _disp_cur = parse_bet_amount(bet_amount_str, user.id)
     except ValueError:
         await update.message.reply_text("Invalid amount.")
         return
@@ -3531,10 +3525,8 @@ async def coinchain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         bet_amount_str = args[1].lower()
-        if bet_amount_str == 'all':
-            bet_amount = get_active_balance_usd(user.id)
-        else:
-            bet_amount = float(bet_amount_str)
+        # Display-currency aware (parity with blackjack/tower).
+        bet_amount, _bet_disp, _disp_cur = parse_bet_amount(bet_amount_str, user.id)
     except ValueError:
         await update.message.reply_text("Invalid amount.")
         return
@@ -5419,22 +5411,15 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_lang = get_user_lang(user.id)
         await query.answer(get_text("error_occurred", user_lang), show_alert=True)
 
-@check_banned
-@check_maintenance
-async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """``/currency`` - select both the active wallet coin AND the
-    display currency (the unit you see / type bets in).
+def _build_currency_menu(user_id):
+    """Build the (text, keyboard) pair for the /currency menu.
 
-    The display currency can be any fiat (USD/INR/EUR/GBP) or any
-    supported crypto. Picking e.g. INR means every balance, bet,
-    stat, leaderboard and tip is shown in \u20B9, while the wallet
-    itself still holds whichever crypto you deposited in.
-    """
-    user = update.effective_user
-    await ensure_user_in_wallets(user.id, user.username, context=context)
-
-    current_currency = get_active_currency(user.id)
-    current_display = get_display_currency(user.id)
+    Reused by both the command handler and the callback handler so
+    selecting a currency can edit the same message in place — the
+    selected option visually flips from blue (primary) to green
+    (success) without spawning a new menu."""
+    current_currency = get_active_currency(user_id)
+    current_display = get_display_currency(user_id)
     keyboard = []
 
     # --- Active wallet crypto ---
@@ -5443,7 +5428,7 @@ async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         callback_data="noop_cur_header_wallet",
     )])
     for curr in SUPPORTED_CRYPTOS:
-        bal = ensure_wallet_dict(user.id).get(curr, 0.0)
+        bal = ensure_wallet_dict(user_id).get(curr, 0.0)
         price = LIVE_PRICES.get(curr, 1.0)
         usd_val = bal * price if curr != 'USDT' else bal
 
@@ -5458,7 +5443,7 @@ async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             None,
         )])
 
-    # --- Display currency (fiat + crypto) ---
+    # --- Display currency (fiat only: INR / USD / EUR / GBP) ---
     keyboard.append([InlineKeyboardButton(
         f"\U0001F310 Display currency (what you see)",
         callback_data="noop_cur_header_display",
@@ -5470,6 +5455,8 @@ async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label += " \u2713"
         keyboard.append([apply_button_style(
             InlineKeyboardButton(label, callback_data=f"setdisplay_{curr}"),
+            # Selected display currency flips from primary (blue) to
+            # success (green) the moment the user taps it.
             'success' if curr == current_display else 'primary',
             None,
         )])
@@ -5481,16 +5468,36 @@ async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     current_symbol = CRYPTO_SYMBOLS.get(current_currency, "\U0001F4B0")
     disp_symbol = CURRENCY_SYMBOLS.get(current_display, "")
-    sent = await update.message.reply_text(
+    text = (
         f"\U0001F4B0 <b>Select Currency</b>\n\n"
         f"Wallet: {current_symbol} <b>{current_currency}</b>\n"
         f"Display: {disp_symbol} <b>{current_display}</b>\n\n"
         f"\u2022 <b>Wallet</b> is which crypto your balance actually sits in.\n"
         f"\u2022 <b>Display</b> is the unit every balance / bet / stat is shown in.\n"
         f"   Picking INR means <code>/bj 500</code> bets \u20B9500 (not $500).\n\n"
-        f"\u26A0\uFE0F <i>Your wallet balance in each coin is segregated.</i>",
+        f"\u26A0\uFE0F <i>Your wallet balance in each coin is segregated.</i>"
+    )
+    return text, create_styled_keyboard(keyboard)
+
+
+@check_banned
+@check_maintenance
+async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """``/currency`` - select both the active wallet coin AND the
+    display currency (the unit you see / type bets in).
+
+    Display currency is restricted to one of the four supported
+    fiats (INR / USD / EUR / GBP).  Wallet currency stays whichever
+    crypto you deposited in.
+    """
+    user = update.effective_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+
+    text, reply_markup = _build_currency_menu(user.id)
+    sent = await update.message.reply_text(
+        text,
         parse_mode=ParseMode.HTML,
-        reply_markup=create_styled_keyboard(keyboard)
+        reply_markup=reply_markup,
     )
     set_menu_owner(sent, user.id)
 
@@ -5523,10 +5530,16 @@ async def currency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         code = data.split("_", 1)[1].upper()
         if set_display_currency(user.id, code):
             sym = CURRENCY_SYMBOLS.get(code, "")
-            await query.answer(f"Display currency set to {sym} {code}", show_alert=True)
-            # Refresh the menu in place.
+            await query.answer(f"Display currency set to {sym} {code}")
+            # Edit the same message so the selected option visually
+            # flips from blue (primary) to green (success) right away.
             try:
-                await currency_command(update, context)
+                text, reply_markup = _build_currency_menu(user.id)
+                await query.edit_message_text(
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
+                )
             except Exception:
                 pass
         else:
@@ -5539,8 +5552,16 @@ async def currency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_stats[user.id]["active_currency"] = currency_code
             save_user_data(user.id)
             symbol = CRYPTO_SYMBOLS.get(currency_code, "💎")
-            await query.answer(f"Active currency set to {symbol} {currency_code}", show_alert=True)
-            await settings_command(update, context)
+            await query.answer(f"Active currency set to {symbol} {currency_code}")
+            try:
+                text, reply_markup = _build_currency_menu(user.id)
+                await query.edit_message_text(
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
+                )
+            except Exception:
+                pass
         else:
             await query.answer("Invalid currency code.", show_alert=True)
         return
@@ -6965,10 +6986,8 @@ async def start_game_conversation_from_command(update: Update, context: ContextT
 
         try:
             bet_amount_str = context.args[0].lower()
-            if bet_amount_str == 'all':
-                bet_amount = get_active_balance_usd(user.id)
-            else:
-                bet_amount = float(bet_amount_str)
+            # Display-currency aware (parity with blackjack/tower).
+            bet_amount, _bet_disp, _disp_cur = parse_bet_amount(bet_amount_str, user.id)
         except ValueError:
             await update.message.reply_text("Invalid bet amount. Usage: /mines <amount>\nExample: /mines 10")
             return ConversationHandler.END
