@@ -2192,8 +2192,17 @@ def parse_bet_amount(amount_str: str, user_id: int) -> tuple:
     return amount_usd, amount_display, display_currency
 
 def get_user_currency(user_id):
-    """Get user's active crypto currency (replaces old fiat currency getter)"""
-    return get_active_currency(user_id)
+    """Legacy shim.
+
+    Historically this returned the user's active crypto (which is what
+    ``get_active_currency`` returns). Display call sites used that
+    return value to format amounts, which broke as soon as we added
+    a separate "display currency" concept. Every remaining caller of
+    this function is a display call site, so we point it at the
+    display currency. Wallet / ledger call sites have always used
+    ``get_active_currency`` directly.
+    """
+    return get_display_currency(user_id)
 
 
 ## NEW FEATURE - Achievements ##
@@ -16705,7 +16714,7 @@ async def handle_dealer_turn(query, context, game_id, bot_uname: str = "Casino")
         winnings = game["bet_amount"] * 1.94
         credit_wallet(user_id, winnings)
         result_text_plain = "Dealer Busts! You Win!"
-        result_pe_text = f"{pe('win')} Dealer busts! You win ${winnings:.2f}!"
+        result_pe_text = f"{pe('win')} Dealer busts! You win {format_for_user(user.id, winnings)}!"
         result_color_tuple = BJ_WIN_COLOR
         game['win'] = True
         await update_stats_on_bet(user_id, game_id, original_bet, True, multiplier=1.94, context=context)
@@ -17870,10 +17879,10 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if win:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+        result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
-        result_text = f"{pe('lose')} You lose ${bet_amount:.2f}. Better luck next time!"
+        result_text = f"{pe('lose')} You lose {format_for_user(user.id, bet_amount)}. Better luck next time!"
         await update_stats_on_bet(user.id, game_id, bet_amount, False, context=context)
 
     # Note: nonce was incremented at game start for provably fair
@@ -18050,7 +18059,7 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if win:
             winnings = rebet_amount * multiplier
             credit_wallet(user.id, winnings)
-            result_text = f"{pe('win')} You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+            result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
             await update_stats_on_bet(user.id, game_id, rebet_amount, True, multiplier=multiplier, context=context)
         else:
             result_text = f"{pe('lose')} You lose ${rebet_amount:.2f}. Better luck next time!"
@@ -18358,10 +18367,10 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if win:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+        result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
-        result_text = f"{pe('lose')} You lose ${bet_amount:.2f}. Better luck next time!"
+        result_text = f"{pe('lose')} You lose {format_for_user(user.id, bet_amount)}. Better luck next time!"
         await update_stats_on_bet(user.id, game_id, bet_amount, False, context=context)
 
     # Note: nonce was incremented at game start for provably fair
@@ -18497,7 +18506,7 @@ async def dice_roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if win:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+        result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} You lose ${bet_amount:.2f}. Try again!"
@@ -18690,7 +18699,7 @@ async def _play_classic_rush(update, context, user, chosen_number, bet_amount):
     if matches >= 2:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} You win ${winnings:.2f}! ({matches} hits, {multiplier}x)"
+        result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! ({matches} hits, {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} Only {matches} match(es). Need 2+ to win!"
@@ -18765,7 +18774,7 @@ async def _play_odd_even_rush(update, context, user, choice, bet_amount):
     if matches >= 4:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} You win ${winnings:.2f}! ({matches} matches, {multiplier}x)"
+        result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! ({matches} matches, {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} Only {matches} matches. Need 4+ to win!"
@@ -18839,7 +18848,7 @@ async def _play_high_low_rush(update, context, user, choice, bet_amount):
     if matches >= 4:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} You win ${winnings:.2f}! ({matches} matches, {multiplier}x)"
+        result_text = f"{pe('win')} You win {format_for_user(user.id, winnings)}! ({matches} matches, {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} Only {matches} matches. Need 4+ to win!"
@@ -18934,7 +18943,7 @@ async def _play_rainbow_rush(update, context, user, bet_amount):
     if is_win:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} RAINBOW! You win ${winnings:.2f}! (55x)"
+        result_text = f"{pe('win')} RAINBOW! You win {format_for_user(user.id, winnings)}! (55x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} {unique_count}/6 unique. Need all 6 different!"
@@ -19030,7 +19039,7 @@ async def _play_blaze_rush(update, context, user, bet_amount):
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
         parity = "All Odd" if all_odd else "All Even"
-        result_text = f"{pe('win')} BLAZE! {parity}! You win ${winnings:.2f}! (25x)"
+        result_text = f"{pe('win')} BLAZE! {parity}! You win {format_for_user(user.id, winnings)}! (25x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         odd_count = sum(1 for r in results if r in odd_numbers)
@@ -20031,7 +20040,7 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if win:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} {win_type}\nYou win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+        result_text = f"{pe('win')} {win_type}\nYou win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} No match! You lose ${bet_amount:.2f}\nTry again for the jackpot!"
@@ -20149,7 +20158,7 @@ async def slots_rebet_double_callback(update: Update, context: ContextTypes.DEFA
     if win:
         winnings = bet_amount * multiplier
         credit_wallet(user.id, winnings)
-        result_text = f"{pe('win')} {win_type}\nYou win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+        result_text = f"{pe('win')} {win_type}\nYou win {format_for_user(user.id, winnings)}! (Multiplier: {multiplier}x)"
         await update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
         result_text = f"{pe('lose')} No match! You lose ${bet_amount:.2f}\nTry again for the jackpot!"
@@ -25787,7 +25796,7 @@ async def pvb_timeout_finish_job(context: ContextTypes.DEFAULT_TYPE):
         if user_id in active_pvb_games:
             del active_pvb_games[user_id]
 
-        text += f"{pe('lose')} Bot wins the match ({game['bot_score']}-{game['user_score']}). You lost ${bet_amount:.2f}."
+        text += f"{pe('lose')} Bot wins the match ({game['bot_score']}-{game['user_score']}). You lost {format_for_user(user_id, bet_amount)}."
 
         # Send final match result
         try:
@@ -27707,7 +27716,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 asyncio.ensure_future(resolve_sidebets_for_match(active_pvb_game_id, "p2", context))
                 await update_stats_on_bet(user.id, game['id'], game['bet_amount'], False, context=context)
                 # AIORateLimiter handles per-chat pacing; manual sleep removed.
-                await update.message.reply_text(f"{pe('lose')} {user.mention_html()}, Bot wins the match ({game['bot_score']}-{game['user_score']}). You lost ${game['bet_amount']:.2f}.", parse_mode=ParseMode.HTML)
+                await update.message.reply_text(f"{pe('lose')} {user.mention_html()}, Bot wins the match ({game['bot_score']}-{game['user_score']}). You lost {format_for_user(user.id, game['bet_amount'])}.", parse_mode=ParseMode.HTML)
                 context.chat_data.pop(f"active_pvb_game_{user.id}", None)
                 if user.id in active_pvb_games:
                     del active_pvb_games[user.id]
@@ -31182,7 +31191,12 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from
     stats["last_daily_claim"] = str(datetime.now(timezone.utc))
     save_user_data(user.id)
 
-    text = get_text("daily_claim_success", lang, amount=bonus_amount)
+    # Show the bonus amount in the user's display currency.
+    bonus_display = format_for_user(user.id, bonus_amount)
+    try:
+        text = get_text("daily_claim_success", lang, amount=bonus_display)
+    except Exception:
+        text = f"{pe('gift')} Daily bonus claimed: {bonus_display}!"
     reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("Back to Bonuses", callback_data="main_bonuses")]]) if from_callback else None
 
     if from_callback:
