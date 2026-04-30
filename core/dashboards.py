@@ -310,11 +310,12 @@ def _render_dashboard_sync(text_data: dict, profile_pic):
                                        radius=4, fill=(190, 0, 75))
                 draw.text((bdg_x + 5, bdg_y + 2), badge, fill=(255, 255, 255), font=f_bdg)
 
-        # Card 1: Balance (green border) - ALWAYS displayed in USD ($)
+        # Card 1: Balance (green border).  bal_str already comes
+        # pre-formatted in the user's display currency (e.g. "₹500.00",
+        # "€20.00", "$12.50") from format_compact_for_user — do NOT
+        # prepend an extra "$" here or it stacks two symbols
+        # ("$₹500.00").
         bal_str = text_data.get("balance", "$0.00")
-        # Ensure it starts with $
-        if bal_str and not bal_str.startswith("$"):
-            bal_str = "$" + bal_str
         draw_card(
             x=MARGIN,
             label="Your Balance",
@@ -324,10 +325,9 @@ def _render_dashboard_sync(text_data: dict, profile_pic):
             value_color=(0, 255, 90),
         )
 
-        # Card 2: Last Win (orange/gold border) - ALWAYS displayed in USD ($)
+        # Card 2: Last Win — same rule: render the pre-formatted value
+        # as-is.  Only the "Play to win!" placeholder skips the symbol.
         lw_str = text_data.get("last_win", "Play to win!")
-        if lw_str and lw_str not in ("Play to win!",) and not lw_str.startswith("$"):
-            lw_str = "$" + lw_str
         draw_card(
             x=MARGIN + CARD_W + GAP,
             label="Last Win",
