@@ -36332,6 +36332,21 @@ def main():
     if rate_limiter is not None:
         app_builder = app_builder.rate_limiter(rate_limiter)
     app = app_builder.build()
+
+    # ===== ZERO-DOWNTIME RUNTIME =====
+    # Wires admin /reload, /reloadall, /listplugins commands and (when
+    # MYCASINO_AUTOLOAD_PLUGINS=1) auto-loads every module under
+    # plugins/ at startup. The runtime module never imports bot.py, so
+    # it is itself reloadable in development. See docs/ZERO_DOWNTIME.md.
+    try:
+        from runtime import register_runtime as _register_runtime
+        _register_runtime(app, is_admin=is_admin)
+    except Exception as _e:
+        logging.warning(
+            f"Zero-downtime runtime not installed: {type(_e).__name__}: {_e}",
+            exc_info=True,
+        )
+
     # Conversation handlers
     admin_handler = ConversationHandler(
         entry_points=[
@@ -39346,6 +39361,62 @@ async def admin_gift_code_create_step4(update: Update, context: ContextTypes.DEF
     except ValueError:
         await update.message.reply_text("Invalid number. Please enter 0 or a positive number.")
         return ADMIN_GIFT_CODE_WAGER
+
+
+# ============================================================================
+# Worker-mode application factory used by ``runtime.queue_worker``.
+#
+# The decoupled (Redis Stream) architecture runs N stateless worker
+# processes that each build their own ``Application`` and pull updates
+# off the queue.  Because the heavy command/conversation handlers in
+# ``main()`` are defined inline (not as standalone factories), the
+# worker uses a SLIM Application that only carries:
+#
+#   * the same ApplicationBuilder tuning as the polling/webhook bot,
+#   * the zero-downtime runtime (admin /reload, /listplugins, ...),
+#   * every plugin under ``plugins/`` auto-loaded on startup.
+#
+# Casino features that need to run in worker mode should live as
+# plugins under ``plugins/`` so they are discovered here.  This is the
+# clean separation the prompt's "decoupled architecture" approach
+# requires: receiver -> Redis -> N workers -> plugins.
+# ============================================================================
+def _build_worker_application():
+    """Factory referenced by ``MYCASINO_APP_FACTORY`` (default).
+
+    Returns a fully-built :class:`telegram.ext.Application` with the
+    zero-downtime runtime installed and all plugins auto-loaded.
+    """
+    builder = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(512)
+        .get_updates_pool_timeout(30)
+        .get_updates_connect_timeout(15)
+        .get_updates_read_timeout(15)
+        .get_updates_write_timeout(15)
+        .connection_pool_size(512)
+        .pool_timeout(30)
+        .connect_timeout(15)
+        .read_timeout(30)
+        .write_timeout(30)
+    )
+    rate_limiter = create_optional_rate_limiter()
+    if rate_limiter is not None:
+        builder = builder.rate_limiter(rate_limiter)
+    app = builder.build()
+
+    try:
+        from runtime import register_runtime as _register_runtime
+        _register_runtime(app, is_admin=is_admin, autoload_plugins=True)
+    except Exception as _e:
+        logging.warning(
+            f"Worker: zero-downtime runtime not installed: "
+            f"{type(_e).__name__}: {_e}",
+            exc_info=True,
+        )
+    return app
+
 
 if __name__ == "__main__":
     try:
