@@ -4621,24 +4621,83 @@ async def clear_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
 @check_banned
 @check_maintenance
 async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle tip confirmation/cancellation inline buttons."""
+    """Handle tip confirmation/cancellation inline buttons.
+
+    Ownership of the menu is determined from the ``tip_id`` embedded in
+    the callback_data (which always begins with the sender's user_id),
+    NOT from ``context.user_data``.  The pending tip's full payload is
+    looked up first in the module-level ``pending_tips`` registry (which
+    survives plugin /reload and PTB context resets) and only falls back
+    to ``context.user_data`` for legacy entries.  Previously the menu
+    was incorrectly rejecting the rightful sender as "not for you"
+    whenever the in-memory ``user_data`` dict was missing.
+    """
     query = update.callback_query
     user = query.from_user
-    data = query.data
+    data = query.data or ""
 
-    pending_tip = context.user_data.get('pending_tip')
-    if not pending_tip or pending_tip['sender_id'] != user.id:
+    # Parse action + tip_id directly from callback_data
+    if data.startswith("confirm_tip_"):
+        action = "confirm"
+        tip_id = data[len("confirm_tip_"):]
+    elif data.startswith("cancel_tip_"):
+        action = "cancel"
+        tip_id = data[len("cancel_tip_"):]
+    else:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
+    # Ownership: the sender's user_id is the first token of tip_id
+    # ("{sender_id}_{target_id}_{timestamp}").  Validate against the
+    # tapping user BEFORE touching any storage so we never leak data.
+    sender_id_from_tipid = None
+    try:
+        sender_id_from_tipid = int(tip_id.split("_", 1)[0])
+    except (ValueError, IndexError):
+        sender_id_from_tipid = None
+
+    if sender_id_from_tipid is not None and sender_id_from_tipid != user.id:
         await query.answer("This menu is not for you.", show_alert=True)
+        return
+
+    # Fetch the pending tip data — try the module-level registry first.
+    pending_tip = pending_tips.get(tip_id)
+    if pending_tip is None:
+        legacy = context.user_data.get('pending_tip')
+        if legacy and legacy.get('tip_id') == tip_id:
+            pending_tip = legacy
+
+    # Final ownership check from stored payload (defence in depth).
+    if pending_tip is not None and pending_tip.get('sender_id') != user.id:
+        await query.answer("This menu is not for you.", show_alert=True)
+        return
+
+    if pending_tip is None:
+        # Either expired/cleaned up or the tip_id was malformed but the
+        # sender_id check above already passed (i.e. the tapping user
+        # is most likely the rightful sender).  Tell them politely
+        # rather than the misleading "not for you".
+        await query.answer("This tip request has expired. Please run /tip again.", show_alert=True)
+        try:
+            await query.edit_message_text(
+                f"{pe('cross')} This tip request has expired. Please run /tip again."
+            )
+        except Exception:
+            pass
         return
 
     await query.answer()
 
-    if data.startswith("cancel_tip_"):
+    if action == "cancel":
+        pending_tips.pop(tip_id, None)
         context.user_data.pop('pending_tip', None)
         await query.edit_message_text(f"{pe('cross')} Tip cancelled.")
         return
 
-    if data.startswith("confirm_tip_"):
+    if action == "confirm":
         tip_amount = pending_tip['tip_amount_usd']
         target_user_id = pending_tip['target_user_id']
         target_username = pending_tip['target_username']
@@ -4652,7 +4711,11 @@ async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             try:
                 crypto_deducted, deducted_coin = await deduct_wallet_safe(user.id, tip_amount, coin)
             except ValueError:
-                await query.edit_message_text(f"{pe('cross')} Insufficient balance. Tip cancelled.", parse_mode=ParseMode.HTML)
+                await query.edit_message_text(
+                    f"{pe('cross')} Insufficient balance. Tip cancelled.",
+                    parse_mode=ParseMode.HTML,
+                )
+                pending_tips.pop(tip_id, None)
                 context.user_data.pop('pending_tip', None)
                 return
         await ensure_user_in_wallets(target_user_id, target_username, context=context)
@@ -4673,12 +4736,15 @@ async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         tipped_user_mention = f"@{target_username}" if target_username else f"user (ID: {target_user_id})"
         sender_str = format_display_amount(tip_amount, sender_currency)
         usdt_str = format_display_amount(tip_amount, "USDT")
-        await query.edit_message_text(
-            f"{pe('check')} Tip sent to {tipped_user_mention}!\n"
-            f"{pe(CURRENCY_EMOJI_KEY.get(sender_currency, 'balance'))} "
-            f"{sender_str} (~ {usdt_str} USDT)  \u2014  {formatted_crypto} {coin}",
-            parse_mode=ParseMode.HTML
-        )
+        try:
+            await query.edit_message_text(
+                f"{pe('check')} Tip sent to {tipped_user_mention}!\n"
+                f"{pe(CURRENCY_EMOJI_KEY.get(sender_currency, 'balance'))} "
+                f"{sender_str} (~ {usdt_str} USDT)  \u2014  {formatted_crypto} {coin}",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as edit_exc:
+            logging.warning(f"tip_confirm: failed to edit confirmation message: {edit_exc}")
         try:
             # Show the receiver the tip in THEIR preferred currency.
             receiver_str = format_for_user(target_user_id, tip_amount, with_usdt_estimate=True)
@@ -4693,6 +4759,7 @@ async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception as e:
             logging.warning(f"Failed to send tip notification to {target_user_id}: {e}")
 
+        pending_tips.pop(tip_id, None)
         context.user_data.pop('pending_tip', None)
 
 @check_banned

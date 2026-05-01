@@ -1056,7 +1056,12 @@ async def handle_dealer_turn(query, context, game_id, bot_uname: str = "Casino")
         winnings = game["bet_amount"] * 1.94
         credit_wallet(user_id, winnings)
         result_text_plain = "Dealer Busts! You Win!"
-        result_pe_text = f"{pe('win')} Dealer busts! You win {format_for_user(user.id, winnings)}!"
+        # NOTE: must use the local `user_id` parameter — there is no `user`
+        # object in this function's scope.  Using `user.id` here previously
+        # raised NameError *after* credit_wallet() had already credited the
+        # win, leaving the game stuck in 'active' status with the player's
+        # balance updated but no message edit and no completion (#blackjack-stand-bug).
+        result_pe_text = f"{pe('win')} Dealer busts! You win {format_for_user(user_id, winnings)}!"
         result_color_tuple = BJ_WIN_COLOR
         game['win'] = True
         await update_stats_on_bet(user_id, game_id, original_bet, True, multiplier=1.94, context=context)
@@ -1084,39 +1089,74 @@ async def handle_dealer_turn(query, context, game_id, bot_uname: str = "Casino")
         # Push still counts towards leaderboard wagering
         await update_stats_on_bet(user_id, game_id, original_bet, False, multiplier=0, context=context)
 
+    # Finalise the game state FIRST so a follow-up exception (telegram
+    # timeout, image render failure, etc.) cannot leave the session
+    # stuck in 'active' with the wallet already credited.
     update_pnl(user_id)
     save_user_data(user_id)
     game["status"] = 'completed'
     increment_user_nonce(user_id)
 
     # Store provably fair record
-    store_provably_fair_record(game_id, "blackjack", game["server_seed"], game["client_seed"], game["nonce"],
-                               result_data=f"Player: {player_value}, Dealer: {dealer_value}")
+    try:
+        store_provably_fair_record(
+            game_id, "blackjack", game["server_seed"], game["client_seed"], game["nonce"],
+            result_data=f"Player: {player_value}, Dealer: {dealer_value}",
+        )
+    except Exception as exc:  # pragma: no cover - PF record is best-effort
+        logging.warning(f"blackjack: failed to store PF record for {game_id}: {exc}")
 
     # Add provably fair button
     keyboard = [[await create_provably_fair_button(game_id, context)]]
 
-    bj_image = await async_generate_bj_image(
-        player_hand=game["player_hand"],
-        dealer_hand=game["dealer_hand"],
-        show_dealer_hole=True,
-        player_value=player_value,
-        dealer_value=dealer_value,
-        player_username=None,
-        bet_amount=game["bet_amount"],
-        bot_username=bot_uname,
-        player_profile_pic=await _get_cached_profile_picture(context, user_id),
-        result_text=result_text_plain,
-        result_color=result_color_tuple,
-    )
-    caption = (
-        f"{pe('cards')} <b>Blackjack{double_text}</b> — ID: <code>{game_id}</code>\n\n"
-        f"{result_pe_text}"
-    )
-    await query.edit_message_media(
-        media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        bj_image = await async_generate_bj_image(
+            player_hand=game["player_hand"],
+            dealer_hand=game["dealer_hand"],
+            show_dealer_hole=True,
+            player_value=player_value,
+            dealer_value=dealer_value,
+            player_username=None,
+            bet_amount=game["bet_amount"],
+            bot_username=bot_uname,
+            player_profile_pic=await _get_cached_profile_picture(context, user_id),
+            result_text=result_text_plain,
+            result_color=result_color_tuple,
+        )
+        caption = (
+            f"{pe('cards')} <b>Blackjack{double_text}</b> — ID: <code>{game_id}</code>\n\n"
+            f"{result_pe_text}"
+        )
+        await query.edit_message_media(
+            media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as exc:
+        # Game is already completed and wallet already settled — the only
+        # thing left is the on-screen update.  Fall back to a plain-text
+        # caption so the player sees the final result instead of being
+        # stuck on the in-progress card image.
+        logging.error(
+            f"blackjack: failed to edit final media for game {game_id}: {exc}",
+            exc_info=True,
+        )
+        try:
+            await query.edit_message_caption(
+                caption=(
+                    f"{pe('cards')} <b>Blackjack{double_text}</b> — ID: <code>{game_id}</code>\n\n"
+                    f"{result_pe_text}"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        except Exception:
+            try:
+                await query.message.reply_text(
+                    f"{pe('cards')} Blackjack{double_text} — Game <code>{game_id}</code> finished.\n\n{result_pe_text}",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
 
 def get_card_name(card_value, with_emoji=True):
     """Convert card value to name, optionally with emoji"""
