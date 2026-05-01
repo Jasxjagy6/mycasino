@@ -775,6 +775,18 @@ user_stats = {}
 
 game_sessions = {} # Replaces matches, mines_games, coin_flip_games, etc.
 
+# Module-level registry for pending /tip confirmations.  Stored here (in
+# core.foundation, which is NOT touched by /reload <plugin>) so the data
+# survives plugin hot-reloads, blue-green deploys and any context where
+# context.user_data has been recreated since the /tip command was issued.
+# Key: tip_id (str, "{sender_id}_{target_id}_{ts}").
+# Value: dict with sender_id/target_user_id/tip_amount_usd/coin/...
+pending_tips: dict = {}
+
+# Time-to-live for an unconfirmed /tip request.  After this many seconds
+# the entry is considered expired and is rejected by tip_confirm_callback.
+PENDING_TIP_TTL_SECONDS = 24 * 60 * 60  # 24 hours
+
 active_pvb_games = {} # NEW: Track active PvB games per user (fallback to context.chat_data)
 
 awaiting_single_emoji_bet = {} # Track users awaiting single emoji bet amount (user_id -> game_key)

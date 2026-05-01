@@ -647,9 +647,19 @@ async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_display_str = format_display_amount(tip_amount_usd, display_currency)
     usdt_estimate_str = format_display_amount(tip_amount_usd, "USDT")
 
-    # Store tip data for confirmation
+    # Store tip data for confirmation.
+    #
+    # We keep the existing per-user `context.user_data['pending_tip']`
+    # entry (for backwards compatibility / single-process deployments)
+    # AND mirror it into the module-level `pending_tips` registry in
+    # core.foundation, keyed by tip_id.  The module-level registry
+    # survives /reload of plugins, blue-green deploys, and any context
+    # in which PTB recreated `context.user_data` between the /tip
+    # command and the user tapping Confirm/Cancel.  Without this
+    # mirror, the rightful sender was being told "This menu is not for
+    # you." whenever the in-memory user_data dict had been recycled.
     tip_id = f"{user.id}_{target_user_id}_{int(datetime.now(timezone.utc).timestamp())}"
-    context.user_data['pending_tip'] = {
+    pending_tip_entry = {
         'tip_id': tip_id,
         'sender_id': user.id,
         'target_user_id': target_user_id,
@@ -660,7 +670,19 @@ async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'crypto_amount': crypto_amount,
         'coin': active_coin,
         'is_owner': is_owner,
+        'created_ts': int(datetime.now(timezone.utc).timestamp()),
     }
+    context.user_data['pending_tip'] = pending_tip_entry
+    pending_tips[tip_id] = pending_tip_entry
+
+    # Opportunistic GC: drop stale entries so the dict can't grow
+    # unbounded if users routinely abandon /tip prompts.
+    _cutoff = int(datetime.now(timezone.utc).timestamp()) - PENDING_TIP_TTL_SECONDS
+    for _stale_id in [
+        _tid for _tid, _td in list(pending_tips.items())
+        if _td.get('created_ts', 0) < _cutoff
+    ]:
+        pending_tips.pop(_stale_id, None)
 
     # Colorful premium-emoji confirm (green) / cancel (red) buttons.
     keyboard = [[
