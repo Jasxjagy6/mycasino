@@ -1,7 +1,54 @@
 """Auto-split from bot.py — plugins.wallet_commands."""
 from __future__ import annotations
 import re as _re
+from core import foundation as _foundation  # for late-bound module-level lookups
 from core.foundation import *  # noqa: F401, F403
+
+
+def _ensure_pending_tips_registry():
+    """Return the shared ``(pending_tips, PENDING_TIP_TTL_SECONDS)`` from
+    ``core.foundation``, attaching them lazily if the live foundation
+    module was loaded before the registry was added.
+
+    This makes ``/tip`` resilient to the deployment scenario where this
+    plugin has been ``/reload``-ed but ``core.foundation`` is still the
+    older in-memory revision (``core.foundation`` is intentionally NOT
+    reloaded by ``/refreshcore`` in production because re-running its
+    body would reset ``user_stats``/``user_wallets`` and lose live data).
+    Without this, the new tip code raised ``NameError: name
+    'pending_tips' is not defined`` and PTB's global error_handler
+    replied with "An error occurred. Please try again."
+    """
+    reg = getattr(_foundation, "pending_tips", None)
+    if not isinstance(reg, dict):
+        reg = {}
+        try:
+            _foundation.pending_tips = reg
+        except Exception:
+            pass
+    ttl = getattr(_foundation, "PENDING_TIP_TTL_SECONDS", None)
+    if not isinstance(ttl, int) or ttl <= 0:
+        ttl = 24 * 60 * 60
+        try:
+            _foundation.PENDING_TIP_TTL_SECONDS = ttl
+        except Exception:
+            pass
+    # Also expose on this module's globals so unqualified references in
+    # the rest of this file resolve, even though `from core.foundation
+    # import *` may not have picked them up.
+    globals().setdefault("pending_tips", reg)
+    globals()["pending_tips"] = reg
+    globals()["PENDING_TIP_TTL_SECONDS"] = ttl
+    return reg, ttl
+
+
+# Best-effort eager init at import time so other functions in this
+# module can use the registry directly. The runtime call inside
+# tip_command is the real safety net.
+try:
+    _ensure_pending_tips_registry()
+except Exception:
+    pass
 
 # In-memory side-table for rain metadata that doesn't fit the DB schema
 # (min wager-required, total USD value of the rain pool, creator's
@@ -577,9 +624,32 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @check_banned
 @check_maintenance
 async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send another user a tip in your active currency.
+
+    The body is wrapped in a try/except so that if any helper raises
+    (e.g. wallet load failed, currency rate stale, Telegram returned a
+    BadRequest on the inline-keyboard render), the rightful sender gets
+    a precise error message instead of PTB's global "An error occurred."
+    fallback that the user complained about.
+    """
+    try:
+        return await _tip_command_impl(update, context)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("/tip failed for user %s: %s", update.effective_user.id, exc)
+        try:
+            await update.message.reply_text(
+                f"{pe('cross')} /tip failed: <code>{type(exc).__name__}: {exc}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+
+async def _tip_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending_tips_reg, PENDING_TTL = _ensure_pending_tips_registry()
     user = update.effective_user
     await ensure_user_in_wallets(user.id, user.username, context=context)
-    message_text = update.message.text.strip().split()
+    message_text = (update.message.text or "").strip().split()
     target_user_id = None
     target_username = None
 
@@ -615,7 +685,15 @@ async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(f"User {target_username_str} not found.")
                     return
             else:
-                target_username = user_stats[target_user_id]['userinfo']['username']
+                # user_stats may not have a 'userinfo' subdict for very
+                # old / partially-migrated rows — fall back to the
+                # canonical-form username we already have.
+                target_username = (
+                    user_stats.get(target_user_id, {})
+                    .get('userinfo', {})
+                    .get('username')
+                    or target_username_str.lstrip('@')
+                )
         except (ValueError, IndexError):
             await update.message.reply_text("Usage: /tip @username amount")
             return
@@ -673,16 +751,16 @@ async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'created_ts': int(datetime.now(timezone.utc).timestamp()),
     }
     context.user_data['pending_tip'] = pending_tip_entry
-    pending_tips[tip_id] = pending_tip_entry
+    pending_tips_reg[tip_id] = pending_tip_entry
 
     # Opportunistic GC: drop stale entries so the dict can't grow
     # unbounded if users routinely abandon /tip prompts.
-    _cutoff = int(datetime.now(timezone.utc).timestamp()) - PENDING_TIP_TTL_SECONDS
+    _cutoff = int(datetime.now(timezone.utc).timestamp()) - PENDING_TTL
     for _stale_id in [
-        _tid for _tid, _td in list(pending_tips.items())
+        _tid for _tid, _td in list(pending_tips_reg.items())
         if _td.get('created_ts', 0) < _cutoff
     ]:
-        pending_tips.pop(_stale_id, None)
+        pending_tips_reg.pop(_stale_id, None)
 
     # Colorful premium-emoji confirm (green) / cancel (red) buttons.
     keyboard = [[

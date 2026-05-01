@@ -1,6 +1,41 @@
 """Auto-split from bot.py — plugins.general."""
 from __future__ import annotations
+from core import foundation as _foundation  # for late-bound module-level lookups
 from core.foundation import *  # noqa: F401, F403
+
+
+def _ensure_pending_tips_registry():
+    """Mirror of plugins.wallet_commands._ensure_pending_tips_registry.
+
+    Lazily attaches ``pending_tips`` / ``PENDING_TIP_TTL_SECONDS`` onto
+    the live ``core.foundation`` module if a hot-reload of this plugin
+    happened against an older foundation revision (foundation itself
+    cannot be reloaded in production because that would reset
+    ``user_stats``/``user_wallets``).
+    """
+    reg = getattr(_foundation, "pending_tips", None)
+    if not isinstance(reg, dict):
+        reg = {}
+        try:
+            _foundation.pending_tips = reg
+        except Exception:
+            pass
+    ttl = getattr(_foundation, "PENDING_TIP_TTL_SECONDS", None)
+    if not isinstance(ttl, int) or ttl <= 0:
+        ttl = 24 * 60 * 60
+        try:
+            _foundation.PENDING_TIP_TTL_SECONDS = ttl
+        except Exception:
+            pass
+    globals()["pending_tips"] = reg
+    globals()["PENDING_TIP_TTL_SECONDS"] = ttl
+    return reg, ttl
+
+
+try:
+    _ensure_pending_tips_registry()
+except Exception:
+    pass
 
 @check_banned
 @check_maintenance
@@ -4631,7 +4666,26 @@ async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     to ``context.user_data`` for legacy entries.  Previously the menu
     was incorrectly rejecting the rightful sender as "not for you"
     whenever the in-memory ``user_data`` dict was missing.
+
+    Wrapped in try/except so any unexpected handler error answers the
+    callback (preventing the spinning loader) and reports the cause to
+    the rightful sender instead of falling through to PTB's global
+    "An error occurred." catch-all.
     """
+    try:
+        return await _tip_confirm_impl(update, context)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("tip_confirm_callback failed: %s", exc)
+        try:
+            await update.callback_query.answer(
+                f"Tip failed: {type(exc).__name__}", show_alert=True,
+            )
+        except Exception:
+            pass
+
+
+async def _tip_confirm_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending_tips_reg, _ = _ensure_pending_tips_registry()
     query = update.callback_query
     user = query.from_user
     data = query.data or ""
@@ -4664,7 +4718,7 @@ async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     # Fetch the pending tip data — try the module-level registry first.
-    pending_tip = pending_tips.get(tip_id)
+    pending_tip = pending_tips_reg.get(tip_id)
     if pending_tip is None:
         legacy = context.user_data.get('pending_tip')
         if legacy and legacy.get('tip_id') == tip_id:
@@ -4692,7 +4746,7 @@ async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     if action == "cancel":
-        pending_tips.pop(tip_id, None)
+        pending_tips_reg.pop(tip_id, None)
         context.user_data.pop('pending_tip', None)
         await query.edit_message_text(f"{pe('cross')} Tip cancelled.")
         return
@@ -4715,7 +4769,7 @@ async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"{pe('cross')} Insufficient balance. Tip cancelled.",
                     parse_mode=ParseMode.HTML,
                 )
-                pending_tips.pop(tip_id, None)
+                pending_tips_reg.pop(tip_id, None)
                 context.user_data.pop('pending_tip', None)
                 return
         await ensure_user_in_wallets(target_user_id, target_username, context=context)
@@ -4759,7 +4813,7 @@ async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception as e:
             logging.warning(f"Failed to send tip notification to {target_user_id}: {e}")
 
-        pending_tips.pop(tip_id, None)
+        pending_tips_reg.pop(tip_id, None)
         context.user_data.pop('pending_tip', None)
 
 @check_banned

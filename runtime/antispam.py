@@ -73,6 +73,15 @@ _foreign_silenced_count = 0
 
 _TRAILING_USER_ID_RE = re.compile(r"_(\d{5,15})$")
 
+# Callback-data prefixes whose trailing digit blob is NOT an owner_id
+# (e.g. tip menus encode the owner as the FIRST token after the prefix
+# and end with a unix timestamp).  Letting the foreign-menu silencer
+# fire on these would silently kill the rightful sender's own buttons.
+_OWNER_FIRST_PREFIXES = (
+    "confirm_tip_",
+    "cancel_tip_",
+)
+
 
 def _evict_if_needed() -> None:
     """Trim oldest entries when our tracking dicts get too big."""
@@ -93,6 +102,12 @@ def _detect_owner_from_callback(callback_data: Optional[str]) -> Optional[int]:
     fine — they just mean the foreign-menu silencer doesn't fire for that
     callback, the per-user rate limit still applies."""
     if not callback_data:
+        return None
+    # Some callback formats encode the owner as the FIRST token (and end
+    # with a unix timestamp). Treating the trailing digits as the owner
+    # here would falsely silence the rightful sender — explicitly opt
+    # those families out.
+    if callback_data.startswith(_OWNER_FIRST_PREFIXES):
         return None
     m = _TRAILING_USER_ID_RE.search(callback_data)
     if not m:

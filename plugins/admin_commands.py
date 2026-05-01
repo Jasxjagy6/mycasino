@@ -876,23 +876,138 @@ async def set_daily_bonus_step(update: Update, context: ContextTypes.DEFAULT_TYP
     await admin_bot_settings_callback(fake_update, context)
     return ConversationHandler.END
 
-async def admin_broadcast_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
-    message_text = update.message.text
+def _classify_broadcast_payload(message) -> dict:
+    """Inspect an admin's input message and pick the right Bot API send.
+
+    Returns a dict describing how each user should receive the broadcast:
+    ``kind`` is one of ``text|photo|video|animation|document|copy``,
+    plus the parameters needed for that send call.
+
+    ``copy`` is the universal fallback — we copy the source message via
+    ``bot.copy_message`` which preserves stickers, voice notes, polls,
+    audio, and any other type without us needing a dedicated branch.
+    """
+    if message is None:
+        return {"kind": "text", "text": ""}
+
+    caption = message.caption or ""
+    caption_entities = message.caption_entities
+
+    # Photos: PTB exposes the sizes list, we want the largest.
+    if message.photo:
+        return {
+            "kind": "photo",
+            "file_id": message.photo[-1].file_id,
+            "caption": caption,
+            "caption_entities": caption_entities,
+        }
+    if message.animation:  # GIFs come through as animation
+        return {
+            "kind": "animation",
+            "file_id": message.animation.file_id,
+            "caption": caption,
+            "caption_entities": caption_entities,
+        }
+    if message.video:
+        return {
+            "kind": "video",
+            "file_id": message.video.file_id,
+            "caption": caption,
+            "caption_entities": caption_entities,
+            "supports_streaming": True,
+        }
+    if message.document:
+        return {
+            "kind": "document",
+            "file_id": message.document.file_id,
+            "caption": caption,
+            "caption_entities": caption_entities,
+        }
+    if message.text:
+        return {
+            "kind": "text",
+            "text": message.text,
+            "entities": message.entities,
+        }
+    # Stickers / voice / audio / poll / etc — fall back to copy_message.
+    return {
+        "kind": "copy",
+        "from_chat_id": message.chat_id,
+        "message_id": message.message_id,
+    }
+
+
+async def _send_broadcast_payload(bot, chat_id: int, payload: dict):
+    """Send one rendered broadcast payload to a single user.
+
+    Returns the sent message on success, or ``None`` when the destination
+    is not reachable (blocked / deactivated / chat not found). Raises
+    on transient errors so the caller can decide whether to count it as
+    a failure or retry. ``safe_send_message`` is used for the text path
+    because that helper handles HTML parse-mode fall-back; media
+    branches catch errors locally.
+    """
+    kind = payload.get("kind")
+    if kind == "text":
+        return await safe_send_message(
+            bot, chat_id, payload.get("text") or "", parse_mode=ParseMode.HTML,
+        )
+    if kind == "photo":
+        return await bot.send_photo(
+            chat_id=chat_id,
+            photo=payload["file_id"],
+            caption=payload.get("caption") or None,
+            parse_mode=ParseMode.HTML if not payload.get("caption_entities") else None,
+            caption_entities=payload.get("caption_entities") or None,
+        )
+    if kind == "video":
+        return await bot.send_video(
+            chat_id=chat_id,
+            video=payload["file_id"],
+            caption=payload.get("caption") or None,
+            parse_mode=ParseMode.HTML if not payload.get("caption_entities") else None,
+            caption_entities=payload.get("caption_entities") or None,
+            supports_streaming=payload.get("supports_streaming", True),
+        )
+    if kind == "animation":
+        return await bot.send_animation(
+            chat_id=chat_id,
+            animation=payload["file_id"],
+            caption=payload.get("caption") or None,
+            parse_mode=ParseMode.HTML if not payload.get("caption_entities") else None,
+            caption_entities=payload.get("caption_entities") or None,
+        )
+    if kind == "document":
+        return await bot.send_document(
+            chat_id=chat_id,
+            document=payload["file_id"],
+            caption=payload.get("caption") or None,
+            parse_mode=ParseMode.HTML if not payload.get("caption_entities") else None,
+            caption_entities=payload.get("caption_entities") or None,
+        )
+    if kind == "copy":
+        return await bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=payload["from_chat_id"],
+            message_id=payload["message_id"],
+        )
+    # Unknown payload — be loud in logs but never crash the runner.
+    logging.error("Broadcast: unknown payload kind %r", kind)
+    return None
+
+
+async def _run_broadcast(bot, admin_user_id: int, payload: dict, header_label: str = "Broadcast"):
+    """Fan-out worker shared by both the dashboard flow and ``/broadcast``.
+
+    Notifies the originating admin with a starting message, dispatches up
+    to 25 sends concurrently (well under Telegram's ~30 msg/s global
+    cap), pings progress every 500 sends, and posts a final summary.
+    Permanent failures (blocked/deactivated) don't burn retries thanks
+    to ``safe_send_message`` for the text path; media branches simply
+    increment the failed counter on any exception.
+    """
     all_user_ids = get_all_registered_user_ids()
     total = len(all_user_ids)
-
-    await update.message.reply_text(f"Starting broadcast to {total} users…")
-
-    # PERFORMANCE: The previous implementation was a serial for-loop with a
-    # flat 0.1 s sleep — that's ~10 messages/s so a 2000-user broadcast took
-    # 200 s and the 5000-user projection was 500 s+ per broadcast while
-    # blocking the admin handler the whole time. Telegram's global bot limit
-    # is ~30 msg/s; we stay safely under it by gating with a semaphore of 25
-    # in-flight sends plus the AIORateLimiter that PTB already wraps every
-    # call with. Permanent failures (blocked/deactivated) don't waste retries
-    # thanks to safe_send_message.
     sent = 0
     failed = 0
     sem = asyncio.Semaphore(25)
@@ -901,9 +1016,7 @@ async def admin_broadcast_step(update: Update, context: ContextTypes.DEFAULT_TYP
         nonlocal sent, failed
         async with sem:
             try:
-                res = await safe_send_message(
-                    context.bot, uid, message_text, parse_mode=ParseMode.HTML
-                )
+                res = await _send_broadcast_payload(bot, uid, payload)
                 if res is None:
                     failed += 1
                 else:
@@ -912,41 +1025,127 @@ async def admin_broadcast_step(update: Update, context: ContextTypes.DEFAULT_TYP
                 failed += 1
                 logging.debug(f"Broadcast send to {uid} failed: {e}")
 
-    # Fire the whole broadcast in a background task so the admin handler
-    # returns immediately — admin gets a progress confirmation once it's done
-    # via a DM follow-up. This also frees the conversation state so the bot
-    # isn't stuck inside an admin flow for the entire duration of the send.
-    admin_user_id = update.effective_user.id
-
-    async def _broadcast_runner():
-        tasks = [asyncio.create_task(_send_one(uid)) for uid in all_user_ids]
-        # Progress pings every 500 sends
-        progress_chat_id = admin_user_id
-        for i in range(0, len(tasks), 500):
-            batch = tasks[i:i + 500]
-            await asyncio.gather(*batch, return_exceptions=True)
-            try:
-                await context.bot.send_message(
-                    chat_id=progress_chat_id,
-                    text=(f"Broadcast progress: {sent + failed}/{total}  "
-                          f"(ok={sent} fail={failed})"),
-                )
-            except Exception:
-                pass
+    tasks = [asyncio.create_task(_send_one(uid)) for uid in all_user_ids]
+    try:
+        await bot.send_message(
+            chat_id=admin_user_id,
+            text=f"{header_label} starting → {total} users (kind={payload.get('kind')}).",
+        )
+    except Exception:
+        pass
+    for i in range(0, len(tasks), 500):
+        batch = tasks[i:i + 500]
+        await asyncio.gather(*batch, return_exceptions=True)
         try:
-            await context.bot.send_message(
-                chat_id=progress_chat_id,
-                text=(f"Broadcast finished.\n{pe('check')} Sent: {sent}\n"
-                      f"{pe('cross')} Failed: {failed}")
+            await bot.send_message(
+                chat_id=admin_user_id,
+                text=(f"{header_label} progress: {sent + failed}/{total}  "
+                      f"(ok={sent} fail={failed})"),
             )
         except Exception:
             pass
+    try:
+        await bot.send_message(
+            chat_id=admin_user_id,
+            text=(f"{header_label} finished.\n{pe('check')} Sent: {sent}\n"
+                  f"{pe('cross')} Failed: {failed}"),
+        )
+    except Exception:
+        pass
 
-    asyncio.create_task(_broadcast_runner())
 
+async def admin_broadcast_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Conversation step that fires when the admin replies to the
+    "Send the message you want to broadcast" prompt.
+
+    Now accepts text, photos, videos, animations (GIFs), documents, and
+    falls back to ``copy_message`` for anything else (stickers, voice,
+    audio, polls). The fan-out runs in a background task so the
+    conversation state is freed immediately and the dashboard re-opens
+    without waiting for thousands of sends to finish.
+    """
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    payload = _classify_broadcast_payload(update.message)
+    if payload.get("kind") == "text" and not (payload.get("text") or "").strip():
+        await update.message.reply_text(
+            "Empty broadcast — please send the message you want to broadcast."
+        )
+        return ADMIN_BROADCAST_MESSAGE
+    admin_user_id = update.effective_user.id
+    asyncio.create_task(
+        _run_broadcast(context.bot, admin_user_id, payload, header_label="Broadcast"),
+    )
     context.user_data.clear()
     await admin_dashboard_command(update, context)
     return ConversationHandler.END
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Top-level admin ``/broadcast`` command.
+
+    Two ways to invoke:
+
+    1. Reply to ANY message with ``/broadcast`` — the bot copies that
+       exact message to every registered user (text, photo, video, GIF,
+       document, sticker, voice, …).
+    2. ``/broadcast some text`` — sends plain text (HTML parse mode) to
+       every registered user.
+
+    Provided as a /reload-friendly alternative to the dashboard's
+    Broadcast button so admins can ship media broadcasts without
+    waiting for a process restart to update the conversation handler's
+    filter.
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("\U0001f6ab Admin only.")
+        return
+
+    reply = update.message.reply_to_message
+    args_text = (update.message.text or "")
+    # Strip the leading /broadcast (with optional @bot suffix) + any first whitespace.
+    after_cmd = ""
+    if args_text:
+        parts = args_text.split(None, 1)
+        if len(parts) == 2:
+            after_cmd = parts[1]
+
+    if reply is not None:
+        payload = _classify_broadcast_payload(reply)
+        # If the admin supplied caption text alongside a reply, override
+        # text for text replies / caption for media replies.
+        if after_cmd:
+            if payload["kind"] == "text":
+                payload["text"] = after_cmd
+                payload["entities"] = None
+            elif payload["kind"] in {"photo", "video", "animation", "document"}:
+                payload["caption"] = after_cmd
+                payload["caption_entities"] = None
+            elif payload["kind"] == "copy":
+                # copy_message doesn't support overriding caption easily;
+                # tell the admin so they can re-send with the override.
+                pass
+    else:
+        if not after_cmd.strip():
+            await update.message.reply_text(
+                "Usage:\n"
+                "  /broadcast <text>     — send text to all users\n"
+                "  Reply to a message with /broadcast — copy that message "
+                "(text/photo/video/GIF/doc/sticker) to all users\n"
+                "  Reply with /broadcast <override caption> — replace the "
+                "caption while broadcasting media",
+            )
+            return
+        payload = {"kind": "text", "text": after_cmd, "entities": None}
+
+    admin_user_id = update.effective_user.id
+    asyncio.create_task(
+        _run_broadcast(context.bot, admin_user_id, payload, header_label="Broadcast"),
+    )
+    await update.message.reply_text(
+        f"{pe('check')} Broadcast queued (kind={payload.get('kind')}). "
+        "Progress + final tally will arrive in DM.",
+    )
 
 async def admin_search_user_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return ConversationHandler.END
@@ -1362,6 +1561,7 @@ def register(ctx):
     app.add_handler(CommandHandler('admin', admin_dashboard_command, block=False))
     app.add_handler(CommandHandler('admincommands', admin_commands_list, block=False))
     app.add_handler(CommandHandler('gamestatus', game_status_command, block=False))
+    app.add_handler(CommandHandler('broadcast', broadcast_command, block=False))
     app.add_handler(CallbackQueryHandler(settings_callback_handler, pattern='^settings_', block=False))
     app.add_handler(CallbackQueryHandler(admin_actions_callback, pattern='^admin_(dashboard|users|bot_settings|toggle_maintenance|broadcast|set_house_balance|limits|gift_codes|toggle_withdrawals|pending_withdrawals|active_games|export_data)$', block=False))
     app.add_handler(CallbackQueryHandler(admin_user_search_callback, pattern='^admin_user_', block=False))

@@ -8835,7 +8835,13 @@ def main():
             ADMIN_LIMITS_SET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_limits_set_amount_step)],
             ADMIN_SET_DAILY_BONUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_daily_bonus_step)],
             ADMIN_SEARCH_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_user_step)],
-            ADMIN_BROADCAST_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_step)],
+            # Broadcast accepts text + media (photo / video / animation /
+            # document / sticker / voice / audio / poll / etc.) so admins
+            # can ship rich content. The handler routes per-message-type
+            # through ``_classify_broadcast_payload`` and falls back to
+            # ``copy_message`` for anything we don't have a dedicated
+            # branch for.
+            ADMIN_BROADCAST_MESSAGE: [MessageHandler(~filters.COMMAND, admin_broadcast_step)],
             ADMIN_GIFT_CODE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_gift_code_create_step2)],
             ADMIN_GIFT_CODE_CLAIMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_gift_code_create_step3)],
             ADMIN_GIFT_CODE_WAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_gift_code_create_step4)],
