@@ -2,6 +2,13 @@
 from __future__ import annotations
 from core.foundation import *  # noqa: F401, F403
 
+# Local imports for the upgraded /broadcast flow. These are not normally
+# part of foundation.py's star export, so import them explicitly so
+# ``/reload admin_commands`` picks up the new code without needing a
+# foundation refresh (foundation can't be reloaded in production).
+from telegram import MessageEntity  # noqa: E402  pylint: disable=wrong-import-position
+from telegram.ext import ApplicationHandlerStop  # noqa: E402  pylint: disable=wrong-import-position
+
 def ban_user(user_id: int):
     bot_settings.setdefault("banned_users", [])
     if user_id not in bot_settings["banned_users"]:
@@ -876,138 +883,257 @@ async def set_daily_bonus_step(update: Update, context: ContextTypes.DEFAULT_TYP
     await admin_bot_settings_callback(fake_update, context)
     return ConversationHandler.END
 
-def _classify_broadcast_payload(message) -> dict:
-    """Inspect an admin's input message and pick the right Bot API send.
+# ============================================================================
+#  Broadcast — admin-only, target-aware, premium-emoji-preserving
+# ============================================================================
+#
+# Design overview:
+#  * Step 1 (capture source): the admin either (a) replies to any message with
+#    /broadcast, (b) types `/broadcast <text>`, (c) sends `/broadcast` alone
+#    and is asked to send the broadcast message, or (d) clicks the dashboard
+#    "Broadcast" button and is asked the same way. In every case we end up
+#    with a Telegram message we own that becomes the *source* — we then ALWAYS
+#    use ``bot.copy_message`` to fan out, which preserves premium custom-emoji
+#    entities, formatting, media, captions, everything (sending text via
+#    ``send_message`` with ``parse_mode=HTML`` strips custom_emoji entities and
+#    is the bug the admin reported as "premium emoji becomes normal").
+#  * Step 2 (target): three inline buttons — "All Users" / "Single User"
+#    (asked for username or numeric ID) / "From List" (asked for a .txt file
+#    or pasted comma-separated IDs).
+#  * Step 3 (confirm): explicit Confirm / Cancel buttons before any fan-out.
+#  * State lives in ``context.user_data['_broadcast']`` — survives plugin
+#    /reload because PTB's user_data dict is owned by the Application object,
+#    not by the plugin module.
+#  * The `_broadcast_message_router` MessageHandler is registered in a HIGH
+#    handler group so it fires AFTER the existing admin ConversationHandler
+#    in group 0 — this avoids stomping on /admin's own input states.
 
-    Returns a dict describing how each user should receive the broadcast:
-    ``kind`` is one of ``text|photo|video|animation|document|copy``,
-    plus the parameters needed for that send call.
+_BC_KEY = '_broadcast'
+_BC_AWAITING_MSG = 'message'
+_BC_AWAITING_SINGLE = 'single_user'
+_BC_AWAITING_LIST = 'list_file'
+_BC_ROUTER_GROUP = 7  # high enough to lose ties to admin ConversationHandler
 
-    ``copy`` is the universal fallback — we copy the source message via
-    ``bot.copy_message`` which preserves stickers, voice notes, polls,
-    audio, and any other type without us needing a dedicated branch.
+
+def _bc_state(context):
+    return context.user_data.get(_BC_KEY) or {}
+
+
+def _bc_set(context, **kwargs):
+    state = context.user_data.setdefault(_BC_KEY, {})
+    state.update(kwargs)
+    return state
+
+
+def _bc_clear(context):
+    context.user_data.pop(_BC_KEY, None)
+
+
+def _bc_target_keyboard():
+    """The 3-button target chooser shown right after the source is captured."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001F4E2 Broadcast to All Users", callback_data="bc_target_all")],
+        [InlineKeyboardButton("\U0001F464 Broadcast to Single User", callback_data="bc_target_single")],
+        [InlineKeyboardButton("\U0001F4CB Broadcast to List (.txt)", callback_data="bc_target_list")],
+        [InlineKeyboardButton("\u274C Cancel", callback_data="bc_cancel")],
+    ])
+
+
+def _bc_confirm_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("\u2705 Confirm Broadcast", callback_data="bc_confirm")],
+        [InlineKeyboardButton("\u274C Cancel", callback_data="bc_cancel")],
+    ])
+
+
+async def _bc_show_target_menu(bot, chat_id, *, edit_query=None):
+    text = (
+        "\U0001F4E4 <b>Broadcast — Choose Target</b>\n\n"
+        "Your message has been captured. Pick who should receive it:"
+    )
+    if edit_query is not None:
+        try:
+            await edit_query.edit_message_text(
+                text, reply_markup=_bc_target_keyboard(), parse_mode=ParseMode.HTML,
+            )
+            return
+        except Exception:
+            pass
+    await bot.send_message(
+        chat_id=chat_id, text=text,
+        reply_markup=_bc_target_keyboard(), parse_mode=ParseMode.HTML,
+    )
+
+
+async def _bc_show_confirm(bot, chat_id, target_label, count, *, edit_query=None):
+    text = (
+        f"\u26A0\uFE0F <b>Broadcast Confirmation</b>\n\n"
+        f"<b>Target:</b> {target_label}\n"
+        f"<b>Recipients:</b> {count} user{'s' if count != 1 else ''}\n\n"
+        f"Tap <b>Confirm</b> to send — premium emojis, captions, and media "
+        f"are preserved exactly as you composed them."
+    )
+    if edit_query is not None:
+        try:
+            await edit_query.edit_message_text(
+                text, reply_markup=_bc_confirm_keyboard(), parse_mode=ParseMode.HTML,
+            )
+            return
+        except Exception:
+            pass
+    await bot.send_message(
+        chat_id=chat_id, text=text,
+        reply_markup=_bc_confirm_keyboard(), parse_mode=ParseMode.HTML,
+    )
+
+
+def _extract_after_command(message):
+    """Return ``(text, entities)`` for the substring after a leading bot command.
+
+    Telegram entity offsets are UTF-16 code units; we translate to Python
+    string indices via ``utf-16-le`` round-tripping so multi-codepoint
+    characters (custom emojis live in the supplementary plane) line up.
+    Returns ``("", None)`` when the message has no text after the command.
     """
-    if message is None:
-        return {"kind": "text", "text": ""}
+    full_text = message.text or ""
+    if not full_text:
+        return "", None
 
-    caption = message.caption or ""
-    caption_entities = message.caption_entities
+    all_entities = list(message.entities or [])
+    cmd_len_utf16 = 0
+    for ent in all_entities:
+        if ent.type == MessageEntity.BOT_COMMAND and ent.offset == 0:
+            cmd_len_utf16 = ent.offset + ent.length
+            break
 
-    # Photos: PTB exposes the sizes list, we want the largest.
-    if message.photo:
-        return {
-            "kind": "photo",
-            "file_id": message.photo[-1].file_id,
-            "caption": caption,
-            "caption_entities": caption_entities,
-        }
-    if message.animation:  # GIFs come through as animation
-        return {
-            "kind": "animation",
-            "file_id": message.animation.file_id,
-            "caption": caption,
-            "caption_entities": caption_entities,
-        }
-    if message.video:
-        return {
-            "kind": "video",
-            "file_id": message.video.file_id,
-            "caption": caption,
-            "caption_entities": caption_entities,
-            "supports_streaming": True,
-        }
-    if message.document:
-        return {
-            "kind": "document",
-            "file_id": message.document.file_id,
-            "caption": caption,
-            "caption_entities": caption_entities,
-        }
-    if message.text:
-        return {
-            "kind": "text",
-            "text": message.text,
-            "entities": message.entities,
-        }
-    # Stickers / voice / audio / poll / etc — fall back to copy_message.
-    return {
-        "kind": "copy",
-        "from_chat_id": message.chat_id,
-        "message_id": message.message_id,
-    }
+    if cmd_len_utf16 == 0:
+        # No bot_command entity — fall back to splitting at first whitespace.
+        parts = full_text.split(None, 1)
+        return (parts[1] if len(parts) > 1 else ""), None
+
+    utf16 = full_text.encode('utf-16-le')
+    # Skip a single run of ASCII spaces after the command.
+    content_start = cmd_len_utf16
+    while content_start * 2 < len(utf16):
+        cu = utf16[content_start * 2 : content_start * 2 + 2]
+        if cu == b' \x00':
+            content_start += 1
+        else:
+            break
+
+    py_start = len(utf16[: content_start * 2].decode('utf-16-le'))
+    after_cmd = full_text[py_start:]
+
+    shifted = []
+    for ent in all_entities:
+        if ent.type == MessageEntity.BOT_COMMAND and ent.offset == 0:
+            continue
+        if ent.offset >= content_start:
+            shifted.append(MessageEntity(
+                type=ent.type,
+                offset=ent.offset - content_start,
+                length=ent.length,
+                url=ent.url,
+                user=ent.user,
+                language=ent.language,
+                custom_emoji_id=ent.custom_emoji_id,
+            ))
+    return after_cmd, (shifted or None)
 
 
-async def _send_broadcast_payload(bot, chat_id: int, payload: dict):
-    """Send one rendered broadcast payload to a single user.
+def _parse_id_blob(text):
+    """Parse a free-form blob into a unique ordered list of positive Telegram IDs.
 
-    Returns the sent message on success, or ``None`` when the destination
-    is not reachable (blocked / deactivated / chat not found). Raises
-    on transient errors so the caller can decide whether to count it as
-    a failure or retry. ``safe_send_message`` is used for the text path
-    because that helper handles HTML parse-mode fall-back; media
-    branches catch errors locally.
+    Accepts commas, semicolons, whitespace, and newlines as separators.
+    Skips empty tokens and non-integers without complaining — the caller
+    surfaces an empty result as a "no valid IDs" error.
     """
-    kind = payload.get("kind")
-    if kind == "text":
-        return await safe_send_message(
-            bot, chat_id, payload.get("text") or "", parse_mode=ParseMode.HTML,
-        )
-    if kind == "photo":
-        return await bot.send_photo(
-            chat_id=chat_id,
-            photo=payload["file_id"],
-            caption=payload.get("caption") or None,
-            parse_mode=ParseMode.HTML if not payload.get("caption_entities") else None,
-            caption_entities=payload.get("caption_entities") or None,
-        )
-    if kind == "video":
-        return await bot.send_video(
-            chat_id=chat_id,
-            video=payload["file_id"],
-            caption=payload.get("caption") or None,
-            parse_mode=ParseMode.HTML if not payload.get("caption_entities") else None,
-            caption_entities=payload.get("caption_entities") or None,
-            supports_streaming=payload.get("supports_streaming", True),
-        )
-    if kind == "animation":
-        return await bot.send_animation(
-            chat_id=chat_id,
-            animation=payload["file_id"],
-            caption=payload.get("caption") or None,
-            parse_mode=ParseMode.HTML if not payload.get("caption_entities") else None,
-            caption_entities=payload.get("caption_entities") or None,
-        )
-    if kind == "document":
-        return await bot.send_document(
-            chat_id=chat_id,
-            document=payload["file_id"],
-            caption=payload.get("caption") or None,
-            parse_mode=ParseMode.HTML if not payload.get("caption_entities") else None,
-            caption_entities=payload.get("caption_entities") or None,
-        )
-    if kind == "copy":
-        return await bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=payload["from_chat_id"],
-            message_id=payload["message_id"],
-        )
-    # Unknown payload — be loud in logs but never crash the runner.
-    logging.error("Broadcast: unknown payload kind %r", kind)
-    return None
+    if not text:
+        return []
+    ids = []
+    seen = set()
+    for sep in (';', '\n', '\r', '\t'):
+        text = text.replace(sep, ',')
+    for token in text.split(','):
+        token = token.strip().lstrip('@')
+        if not token:
+            continue
+        try:
+            uid = int(token)
+        except ValueError:
+            continue
+        if uid > 0 and uid not in seen:
+            seen.add(uid)
+            ids.append(uid)
+    return ids
 
 
-async def _run_broadcast(bot, admin_user_id: int, payload: dict, header_label: str = "Broadcast"):
-    """Fan-out worker shared by both the dashboard flow and ``/broadcast``.
+async def _resolve_user_ref(bot, raw):
+    """Resolve a username (``@x`` or ``x``) or numeric ID to a user_id.
 
-    Notifies the originating admin with a starting message, dispatches up
-    to 25 sends concurrently (well under Telegram's ~30 msg/s global
-    cap), pings progress every 500 sends, and posts a final summary.
-    Permanent failures (blocked/deactivated) don't burn retries thanks
-    to ``safe_send_message`` for the text path; media branches simply
-    increment the failed counter on any exception.
+    Tries the local ``username_to_userid`` cache first, falls back to a
+    fresh ``bot.get_chat`` lookup. Returns ``None`` when the ref can't
+    be resolved.
     """
-    all_user_ids = get_all_registered_user_ids()
-    total = len(all_user_ids)
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw.lstrip('-').isdigit():
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    handle = raw if raw.startswith('@') else f'@{raw}'
+    uid = username_to_userid.get(normalize_username(handle))
+    if uid:
+        return uid
+    try:
+        chat = await bot.get_chat(handle)
+        return chat.id
+    except Exception:
+        return None
+
+
+async def _capture_source_from_message(context, message):
+    """Store ``(chat_id, message_id)`` so the broadcast worker can copy_message it."""
+    return _bc_set(
+        context,
+        source_chat_id=message.chat_id,
+        source_message_id=message.message_id,
+    )
+
+
+async def _capture_source_from_text(context, bot, admin_chat_id, text, entities):
+    """For ``/broadcast <text>`` — echo a clean preview to the admin and use that as the source.
+
+    Echoing is what lets us preserve premium / custom emojis: the entities
+    in the original ``/broadcast Hello [premium]`` command message include
+    the ``BotCommand`` entity at offset 0; we strip that, shift remaining
+    entity offsets, and re-send so the admin gets a faithful preview AND
+    we get a normal Telegram message we can ``copy_message`` from.
+    """
+    preview = await bot.send_message(
+        chat_id=admin_chat_id,
+        text=text,
+        entities=entities,
+    )
+    return _bc_set(
+        context,
+        source_chat_id=preview.chat_id,
+        source_message_id=preview.message_id,
+    )
+
+
+async def _run_broadcast_copy(bot, admin_chat_id, src_chat, src_msg, target_ids, *, label="Broadcast"):
+    """Fan out ``copy_message`` calls to ``target_ids`` with a 25-in-flight cap.
+
+    ``copy_message`` is what makes premium emoji work — it preserves all
+    formatting & entities exactly. Telegram's global bot limit is ~30 msg/s;
+    25 concurrent + PTB's AIORateLimiter keeps us under that. Permanent
+    failures (blocked/deactivated/chat-not-found) just increment the
+    counter; transient errors are retried by the rate limiter wrapper.
+    """
+    total = len(target_ids)
     sent = 0
     failed = 0
     sem = asyncio.Semaphore(25)
@@ -1016,136 +1142,403 @@ async def _run_broadcast(bot, admin_user_id: int, payload: dict, header_label: s
         nonlocal sent, failed
         async with sem:
             try:
-                res = await _send_broadcast_payload(bot, uid, payload)
-                if res is None:
-                    failed += 1
-                else:
-                    sent += 1
+                await bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=src_chat,
+                    message_id=src_msg,
+                )
+                sent += 1
             except Exception as e:
                 failed += 1
-                logging.debug(f"Broadcast send to {uid} failed: {e}")
+                logging.debug(f"Broadcast copy to {uid} failed: {e}")
 
-    tasks = [asyncio.create_task(_send_one(uid)) for uid in all_user_ids]
+    tasks = [asyncio.create_task(_send_one(uid)) for uid in target_ids]
     try:
         await bot.send_message(
-            chat_id=admin_user_id,
-            text=f"{header_label} starting → {total} users (kind={payload.get('kind')}).",
+            chat_id=admin_chat_id,
+            text=f"{label} starting \u2192 {total} recipient{'s' if total != 1 else ''}.",
         )
     except Exception:
         pass
+
     for i in range(0, len(tasks), 500):
         batch = tasks[i:i + 500]
         await asyncio.gather(*batch, return_exceptions=True)
         try:
             await bot.send_message(
-                chat_id=admin_user_id,
-                text=(f"{header_label} progress: {sent + failed}/{total}  "
-                      f"(ok={sent} fail={failed})"),
+                chat_id=admin_chat_id,
+                text=f"{label} progress: {sent + failed}/{total}  (ok={sent} fail={failed})",
             )
         except Exception:
             pass
+
     try:
         await bot.send_message(
-            chat_id=admin_user_id,
-            text=(f"{header_label} finished.\n{pe('check')} Sent: {sent}\n"
+            chat_id=admin_chat_id,
+            text=(f"{label} finished.\n{pe('check')} Sent: {sent}\n"
                   f"{pe('cross')} Failed: {failed}"),
         )
     except Exception:
         pass
 
 
-async def admin_broadcast_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Conversation step that fires when the admin replies to the
-    "Send the message you want to broadcast" prompt.
+# ---- Dashboard "Broadcast" button entry --------------------------------
 
-    Now accepts text, photos, videos, animations (GIFs), documents, and
-    falls back to ``copy_message`` for anything else (stickers, voice,
-    audio, polls). The fan-out runs in a background task so the
-    conversation state is freed immediately and the dashboard re-opens
-    without waiting for thousands of sends to finish.
+async def admin_broadcast_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fired by the admin dashboard's "Broadcast" button after the admin
+    sends the message they want to broadcast.
+
+    Captures the source message and shows the same target-chooser keyboard
+    that ``/broadcast`` uses, then ends the admin ConversationHandler
+    (the rest of the flow runs through standalone callback handlers so
+    it shares the entire UI/state machine with ``/broadcast``).
     """
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-    payload = _classify_broadcast_payload(update.message)
-    if payload.get("kind") == "text" and not (payload.get("text") or "").strip():
-        await update.message.reply_text(
+
+    msg = update.message
+    if msg is None:
+        return ConversationHandler.END
+
+    has_content = bool(
+        (msg.text and msg.text.strip())
+        or msg.photo or msg.video or msg.animation or msg.document
+        or msg.sticker or msg.voice or msg.audio or msg.video_note
+    )
+    if not has_content:
+        await msg.reply_text(
             "Empty broadcast — please send the message you want to broadcast."
         )
         return ADMIN_BROADCAST_MESSAGE
-    admin_user_id = update.effective_user.id
-    asyncio.create_task(
-        _run_broadcast(context.bot, admin_user_id, payload, header_label="Broadcast"),
-    )
-    context.user_data.clear()
-    await admin_dashboard_command(update, context)
+
+    _bc_clear(context)
+    await _capture_source_from_message(context, msg)
+    await _bc_show_target_menu(context.bot, update.effective_chat.id)
     return ConversationHandler.END
 
 
+# ---- /broadcast command entry -----------------------------------------
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Top-level admin ``/broadcast`` command.
+    """Admin-only ``/broadcast`` command. Three input modes:
 
-    Two ways to invoke:
+    1. Reply to ANY message with ``/broadcast`` — the replied-to message
+       becomes the source (preserves premium emoji, formatting, media).
+    2. ``/broadcast <text>`` — bot echoes a preview to the admin (with
+       shifted entities so custom emojis line up) and uses that preview
+       as the broadcast source.
+    3. ``/broadcast`` alone — bot prompts the admin to send the broadcast
+       message; the next non-command message in this private chat is
+       captured by ``_broadcast_message_router``.
 
-    1. Reply to ANY message with ``/broadcast`` — the bot copies that
-       exact message to every registered user (text, photo, video, GIF,
-       document, sticker, voice, …).
-    2. ``/broadcast some text`` — sends plain text (HTML parse mode) to
-       every registered user.
-
-    Provided as a /reload-friendly alternative to the dashboard's
-    Broadcast button so admins can ship media broadcasts without
-    waiting for a process restart to update the conversation handler's
-    filter.
+    All three paths land on the same target chooser → confirmation
+    workflow.
     """
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("\U0001f6ab Admin only.")
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        try:
+            await update.message.reply_text("\U0001F6AB Admin only.")
+        except Exception:
+            pass
         return
 
+    # Restrict to private DMs to avoid leaking inline target/confirm
+    # menus in groups (and to make the awaiting-message router safe).
+    if update.effective_chat and update.effective_chat.type != 'private':
+        await update.message.reply_text(
+            "\U0001F4DD Run /broadcast in a private chat with the bot."
+        )
+        return
+
+    _bc_clear(context)
+
     reply = update.message.reply_to_message
-    args_text = (update.message.text or "")
-    # Strip the leading /broadcast (with optional @bot suffix) + any first whitespace.
-    after_cmd = ""
-    if args_text:
-        parts = args_text.split(None, 1)
-        if len(parts) == 2:
-            after_cmd = parts[1]
-
     if reply is not None:
-        payload = _classify_broadcast_payload(reply)
-        # If the admin supplied caption text alongside a reply, override
-        # text for text replies / caption for media replies.
-        if after_cmd:
-            if payload["kind"] == "text":
-                payload["text"] = after_cmd
-                payload["entities"] = None
-            elif payload["kind"] in {"photo", "video", "animation", "document"}:
-                payload["caption"] = after_cmd
-                payload["caption_entities"] = None
-            elif payload["kind"] == "copy":
-                # copy_message doesn't support overriding caption easily;
-                # tell the admin so they can re-send with the override.
-                pass
-    else:
-        if not after_cmd.strip():
-            await update.message.reply_text(
-                "Usage:\n"
-                "  /broadcast <text>     — send text to all users\n"
-                "  Reply to a message with /broadcast — copy that message "
-                "(text/photo/video/GIF/doc/sticker) to all users\n"
-                "  Reply with /broadcast <override caption> — replace the "
-                "caption while broadcasting media",
-            )
-            return
-        payload = {"kind": "text", "text": after_cmd, "entities": None}
+        await _capture_source_from_message(context, reply)
+        await _bc_show_target_menu(context.bot, update.effective_chat.id)
+        return
 
-    admin_user_id = update.effective_user.id
-    asyncio.create_task(
-        _run_broadcast(context.bot, admin_user_id, payload, header_label="Broadcast"),
-    )
+    after_cmd, shifted_entities = _extract_after_command(update.message)
+    if after_cmd.strip():
+        await update.message.reply_text(
+            "\U0001F4DD <b>Preview of your broadcast:</b>", parse_mode=ParseMode.HTML,
+        )
+        await _capture_source_from_text(
+            context, context.bot, update.effective_chat.id, after_cmd, shifted_entities,
+        )
+        await _bc_show_target_menu(context.bot, update.effective_chat.id)
+        return
+
+    _bc_set(context, awaiting=_BC_AWAITING_MSG)
     await update.message.reply_text(
-        f"{pe('check')} Broadcast queued (kind={payload.get('kind')}). "
-        "Progress + final tally will arrive in DM.",
+        "\U0001F4E4 <b>Broadcast — Step 1 of 3</b>\n\n"
+        "Send me the message you want to broadcast.\n\n"
+        "Supported: text (with premium emojis), photos, videos, GIFs, "
+        "animations, documents, stickers, voice notes — anything you can "
+        "send in Telegram.\n\n"
+        "Send <code>cancel</code> to abort.",
+        parse_mode=ParseMode.HTML,
     )
+
+
+# ---- Catch-all router for awaiting input -------------------------------
+
+async def _broadcast_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the message the admin sends *while* awaiting broadcast input.
+
+    Gates strictly on (a) is_admin, (b) private chat, (c) an awaiting flag
+    set in ``context.user_data``. When none of those hold this handler is
+    a no-op — registered in a high handler group so it can't shadow the
+    admin ConversationHandler's own state-bound MessageHandlers.
+    """
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    if not update.message:
+        return
+    if update.effective_chat and update.effective_chat.type != 'private':
+        return
+
+    state = _bc_state(context)
+    awaiting = state.get('awaiting')
+    if not awaiting:
+        return
+
+    # Universal abort word — typed without the leading slash so we don't
+    # collide with the existing /cancel admin command.
+    text_lower = (update.message.text or "").strip().lower()
+    if text_lower in ('cancel', 'abort', 'stop'):
+        _bc_clear(context)
+        await update.message.reply_text(f"{pe('cross')} Broadcast cancelled.")
+        raise ApplicationHandlerStop
+
+    if awaiting == _BC_AWAITING_MSG:
+        has_content = bool(
+            (update.message.text and update.message.text.strip())
+            or update.message.photo or update.message.video or update.message.animation
+            or update.message.document or update.message.sticker
+            or update.message.voice or update.message.audio or update.message.video_note
+        )
+        if not has_content:
+            await update.message.reply_text(
+                "Empty broadcast — please send the actual message you want to broadcast."
+            )
+            raise ApplicationHandlerStop
+        await _capture_source_from_message(context, update.message)
+        state['awaiting'] = None
+        await _bc_show_target_menu(context.bot, update.effective_chat.id)
+        raise ApplicationHandlerStop
+
+    if awaiting == _BC_AWAITING_SINGLE:
+        target_id = await _resolve_user_ref(context.bot, update.message.text or "")
+        if not target_id:
+            await update.message.reply_text(
+                f"{pe('cross')} Couldn't resolve that user. Send a "
+                "<code>@username</code> or numeric Telegram ID, or type "
+                "<code>cancel</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            raise ApplicationHandlerStop
+        state['awaiting'] = None
+        state['target_kind'] = 'single'
+        state['target_ids'] = [target_id]
+        username = None
+        try:
+            chat = await context.bot.get_chat(target_id)
+            username = chat.username or chat.full_name or None
+        except Exception:
+            pass
+        label = (
+            f"@{username} (<code>{target_id}</code>)"
+            if username else f"<code>{target_id}</code>"
+        )
+        await _bc_show_confirm(context.bot, update.effective_chat.id, label, 1)
+        raise ApplicationHandlerStop
+
+    if awaiting == _BC_AWAITING_LIST:
+        ids = []
+        if update.message.document:
+            doc = update.message.document
+            mime_ok = (doc.mime_type or "").startswith("text/")
+            name_ok = (doc.file_name or "").lower().endswith(".txt")
+            if not (mime_ok or name_ok):
+                await update.message.reply_text(
+                    f"{pe('cross')} Please upload a plain-text .txt file, "
+                    "or paste the IDs as a text message."
+                )
+                raise ApplicationHandlerStop
+            try:
+                tg_file = await doc.get_file()
+                content_bytes = await tg_file.download_as_bytearray()
+                ids = _parse_id_blob(content_bytes.decode('utf-8', errors='replace'))
+            except Exception as e:
+                logging.exception("broadcast: failed to read .txt: %s", e)
+                await update.message.reply_text(
+                    f"{pe('cross')} Couldn't read that file: "
+                    f"<code>{type(e).__name__}: {e}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                raise ApplicationHandlerStop
+        elif update.message.text:
+            ids = _parse_id_blob(update.message.text)
+
+        if not ids:
+            await update.message.reply_text(
+                f"{pe('cross')} No valid Telegram IDs found. Upload a .txt file with "
+                "comma-separated numeric IDs (e.g. <code>123,456,789</code>) or "
+                "paste them as text. Whitespace, newlines, and semicolons also work.",
+                parse_mode=ParseMode.HTML,
+            )
+            raise ApplicationHandlerStop
+
+        state['awaiting'] = None
+        state['target_kind'] = 'list'
+        state['target_ids'] = ids
+        await _bc_show_confirm(
+            context.bot, update.effective_chat.id,
+            "Custom list of user IDs", len(ids),
+        )
+        raise ApplicationHandlerStop
+
+
+# ---- Target chooser callbacks -----------------------------------------
+
+def _bc_admin_guard_query(query):
+    """Return True if the callback presser is an admin; otherwise answer & deny."""
+    if not is_admin(query.from_user.id):
+        return False
+    return True
+
+
+async def bc_target_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not _bc_admin_guard_query(query):
+        await query.answer("\U0001F6AB Admin only.", show_alert=True)
+        return
+    state = _bc_state(context)
+    if not state.get('source_chat_id'):
+        await query.answer("Broadcast session expired. Run /broadcast again.", show_alert=True)
+        return
+    await query.answer()
+    user_ids = list(get_all_registered_user_ids())
+    state['target_kind'] = 'all'
+    state['target_ids'] = user_ids
+    await _bc_show_confirm(
+        context.bot, update.effective_chat.id,
+        "All registered users", len(user_ids),
+        edit_query=query,
+    )
+
+
+async def bc_target_single_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not _bc_admin_guard_query(query):
+        await query.answer("\U0001F6AB Admin only.", show_alert=True)
+        return
+    state = _bc_state(context)
+    if not state.get('source_chat_id'):
+        await query.answer("Broadcast session expired. Run /broadcast again.", show_alert=True)
+        return
+    await query.answer()
+    state['awaiting'] = _BC_AWAITING_SINGLE
+    try:
+        await query.edit_message_text(
+            "\U0001F464 <b>Broadcast — Single User</b>\n\n"
+            "Send the recipient's <code>@username</code> or numeric Telegram ID.\n\n"
+            "Type <code>cancel</code> to abort.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=("\U0001F464 Send the recipient's @username or numeric Telegram ID.\n"
+                  "Type cancel to abort."),
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def bc_target_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not _bc_admin_guard_query(query):
+        await query.answer("\U0001F6AB Admin only.", show_alert=True)
+        return
+    state = _bc_state(context)
+    if not state.get('source_chat_id'):
+        await query.answer("Broadcast session expired. Run /broadcast again.", show_alert=True)
+        return
+    await query.answer()
+    state['awaiting'] = _BC_AWAITING_LIST
+    try:
+        await query.edit_message_text(
+            "\U0001F4CB <b>Broadcast — From List</b>\n\n"
+            "Upload a <b>.txt</b> file containing comma-separated Telegram user IDs:\n"
+            "<code>123,456,789</code>\n\n"
+            "Or paste them directly as text. Whitespace, newlines, and "
+            "semicolons also work as separators.\n\n"
+            "Type <code>cancel</code> to abort.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=("\U0001F4CB Upload a .txt file with comma-separated user IDs, "
+                  "or paste them as a text message. Type cancel to abort."),
+        )
+
+
+async def bc_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not _bc_admin_guard_query(query):
+        await query.answer("\U0001F6AB Admin only.", show_alert=True)
+        return
+    state = _bc_state(context)
+    src_chat = state.get('source_chat_id')
+    src_msg = state.get('source_message_id')
+    target_ids = state.get('target_ids') or []
+    target_kind = state.get('target_kind') or 'unknown'
+    if not src_chat or not src_msg or not target_ids:
+        await query.answer("Broadcast session expired or no target picked. Run /broadcast again.",
+                           show_alert=True)
+        return
+    await query.answer("Broadcast queued!")
+    _bc_clear(context)
+
+    label = {
+        'all': "Broadcast (all users)",
+        'single': "Broadcast (single user)",
+        'list': "Broadcast (custom list)",
+    }.get(target_kind, "Broadcast")
+
+    try:
+        await query.edit_message_text(
+            f"{pe('check')} {label} queued: {len(target_ids)} recipient"
+            f"{'s' if len(target_ids) != 1 else ''}.\n"
+            "Progress + final tally will arrive in this DM.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    asyncio.create_task(_run_broadcast_copy(
+        context.bot, update.effective_chat.id,
+        src_chat, src_msg, target_ids, label=label,
+    ))
+
+
+async def bc_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not _bc_admin_guard_query(query):
+        await query.answer("\U0001F6AB Admin only.", show_alert=True)
+        return
+    _bc_clear(context)
+    await query.answer()
+    try:
+        await query.edit_message_text(f"{pe('cross')} Broadcast cancelled.")
+    except Exception:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"{pe('cross')} Broadcast cancelled.",
+        )
 
 async def admin_search_user_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return ConversationHandler.END
@@ -1562,6 +1955,22 @@ def register(ctx):
     app.add_handler(CommandHandler('admincommands', admin_commands_list, block=False))
     app.add_handler(CommandHandler('gamestatus', game_status_command, block=False))
     app.add_handler(CommandHandler('broadcast', broadcast_command, block=False))
+    # Upgraded /broadcast: target chooser + confirmation step.  All callbacks
+    # are admin-guarded internally and refuse to operate when ``_broadcast``
+    # state is missing (e.g. after a stale button press).
+    app.add_handler(CallbackQueryHandler(bc_target_all_callback, pattern=r'^bc_target_all$', block=False))
+    app.add_handler(CallbackQueryHandler(bc_target_single_callback, pattern=r'^bc_target_single$', block=False))
+    app.add_handler(CallbackQueryHandler(bc_target_list_callback, pattern=r'^bc_target_list$', block=False))
+    app.add_handler(CallbackQueryHandler(bc_confirm_callback, pattern=r'^bc_confirm$', block=False))
+    app.add_handler(CallbackQueryHandler(bc_cancel_callback, pattern=r'^bc_cancel$', block=False))
+    # Catch-all message router that captures the admin's input while the
+    # broadcast flow is awaiting a message / username / .txt file. Lives
+    # in a high handler group so the existing admin ConversationHandler in
+    # group 0 (foundation.py) gets first dibs on every message.
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & ~filters.UpdateType.EDITED, _broadcast_message_router, block=False),
+        group=_BC_ROUTER_GROUP,
+    )
     app.add_handler(CallbackQueryHandler(settings_callback_handler, pattern='^settings_', block=False))
     app.add_handler(CallbackQueryHandler(admin_actions_callback, pattern='^admin_(dashboard|users|bot_settings|toggle_maintenance|broadcast|set_house_balance|limits|gift_codes|toggle_withdrawals|pending_withdrawals|active_games|export_data)$', block=False))
     app.add_handler(CallbackQueryHandler(admin_user_search_callback, pattern='^admin_user_', block=False))

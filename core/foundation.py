@@ -8837,10 +8837,12 @@ def main():
             ADMIN_SEARCH_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_user_step)],
             # Broadcast accepts text + media (photo / video / animation /
             # document / sticker / voice / audio / poll / etc.) so admins
-            # can ship rich content. The handler routes per-message-type
-            # through ``_classify_broadcast_payload`` and falls back to
-            # ``copy_message`` for anything we don't have a dedicated
-            # branch for.
+            # can ship rich content. ``admin_broadcast_step`` captures
+            # the message as the broadcast source and hands off to the
+            # standalone ``bc_target_*`` callbacks for target selection
+            # + Confirm/Cancel — see plugins/admin_commands.py for the
+            # full state machine. ``copy_message`` is used at fan-out
+            # time so premium custom-emoji entities are preserved.
             ADMIN_BROADCAST_MESSAGE: [MessageHandler(~filters.COMMAND, admin_broadcast_step)],
             ADMIN_GIFT_CODE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_gift_code_create_step2)],
             ADMIN_GIFT_CODE_CLAIMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_gift_code_create_step3)],
