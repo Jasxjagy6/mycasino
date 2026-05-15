@@ -7189,6 +7189,16 @@ async def select_bombs_callback(update: Update, context: ContextTypes.DEFAULT_TY
             # Calculate mine positions using server seed + fresh game client seed
             mine_numbers = generate_mine_positions(seeds["server_seed"], game_client_seed, current_nonce, num_mines)
 
+            # Deduct bet atomically BEFORE creating the game session so a
+            # failed deduct cannot leave an orphan session sitting in
+            # game_sessions / user_stats with no charged stake.
+            try:
+                await deduct_wallet_safe(user.id, bet_amount)
+            except ValueError:
+                await query.answer("Insufficient balance!", show_alert=True)
+                context.user_data.clear()
+                return ConversationHandler.END
+
             game_id = generate_unique_id("MN")
             game_sessions[game_id] = {
                 "id": game_id, "game_type": "mines", "user_id": user.id, "bet_amount": bet_amount,
@@ -7202,7 +7212,6 @@ async def select_bombs_callback(update: Update, context: ContextTypes.DEFAULT_TY
             if 'game_sessions' not in user_stats[user.id]: user_stats[user.id]['game_sessions'] = []
             user_stats[user.id]['game_sessions'].append(game_id)
 
-            deduct_wallet(user.id, bet_amount)
             save_user_data(user.id)
 
             initial_text = (

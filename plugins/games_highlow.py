@@ -457,12 +457,13 @@ async def highlow_rebet_double_callback(update: Update, context: ContextTypes.DE
         await query.answer("Bet exceeds limits", show_alert=True)
         return
 
-    # Check balance
-    if get_active_balance_usd(user.id) < bet:
+    # Deduct bet atomically (per-user lock prevents double-spend across
+    # concurrent rebet/double clicks and across queue workers).
+    try:
+        await deduct_wallet_safe(user.id, bet)
+    except ValueError:
         await query.answer("Insufficient balance!", show_alert=True)
         return
-
-    deduct_wallet(user.id, bet)
     save_user_data(user.id)
 
     # Use user's provably fair seeds

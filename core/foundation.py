@@ -165,28 +165,60 @@ except ImportError:
 
 def _get_env_or_default(env_name: str, default: str, is_secret: bool = False) -> str:
     """Get value from environment variable, fallback to default.
-    SECURITY: Set env vars to override hardcoded defaults."""
+
+    SECURITY (post Phase-0 hardening):
+      • Secret values (``is_secret=True``) MUST be supplied via environment
+        variables — they are no longer hardcoded in source.  The ``default``
+        argument for secrets should always be an empty string.
+      • If a secret env var is missing, we log a CRITICAL warning so the
+        operator sees it on every restart.  Non-secret callers fall back to
+        the provided default as before.
+    """
     import os
     val = os.environ.get(env_name)
     if val:
         if is_secret:
             logging.info(f"Secret {env_name} loaded from environment")
         return val
+    if is_secret:
+        if default:
+            logging.critical(
+                f"SECURITY: secret {env_name} is using a hardcoded default. "
+                f"Set it via the environment immediately."
+            )
+        else:
+            logging.warning(
+                f"Secret {env_name} is not set in the environment. "
+                f"Features that depend on it will be disabled."
+            )
     return default
 
-BOT_TOKEN = _get_env_or_default('BOT_TOKEN', "8235772615:AAEJ8YG2psk76w8VCT7agyBl7KsxFXS5Dg8", is_secret=True)
+# ---------------------------------------------------------------------------
+# Telegram bot tokens (REQUIRED in env; no hardcoded defaults).
+# ---------------------------------------------------------------------------
+# The main bot token is mandatory — without it ApplicationBuilder will fail
+# at startup with a clear error from python-telegram-bot, which is the
+# behaviour we want.  Helper bots are optional; if a slot is left blank the
+# corresponding helper is simply disabled at init time (see _init_helper_bot).
+BOT_TOKEN = _get_env_or_default('BOT_TOKEN', "", is_secret=True)
 
-HELPER_BOT_TOKEN = _get_env_or_default('HELPER_BOT_TOKEN', "8524914117:AAE1zTiTBm2npMdVguapC0HYbjFdaM56yyY", is_secret=True)
+HELPER_BOT_TOKEN = _get_env_or_default('HELPER_BOT_TOKEN', "", is_secret=True)
 
-HELPER_BOT_2_TOKEN = _get_env_or_default('HELPER_BOT_2_TOKEN', "8530002434:AAFCzvU4wS9dvyDBKZf1vHPBhhGoyzwIFf4", is_secret=True)
+HELPER_BOT_2_TOKEN = _get_env_or_default('HELPER_BOT_2_TOKEN', "", is_secret=True)
 
-HELPER_BOT_3_TOKEN = _get_env_or_default('HELPER_BOT_3_TOKEN', "8662974400:AAFdnhGVz11nMEoaFYiiHtUSDcnousG-2L0", is_secret=True)
+HELPER_BOT_3_TOKEN = _get_env_or_default('HELPER_BOT_3_TOKEN', "", is_secret=True)
 
-HELPER_BOT_4_TOKEN = _get_env_or_default('HELPER_BOT_4_TOKEN', "8661098728:AAF0Yn9n7DkFka-olCwRxaJiL3I8UZQcDOE", is_secret=True)
+HELPER_BOT_4_TOKEN = _get_env_or_default('HELPER_BOT_4_TOKEN', "", is_secret=True)
 
-HELPER_BOT_5_TOKEN = _get_env_or_default('HELPER_BOT_5_TOKEN', "8679354746:AAESYaIOuivG3c_lTLDuJswzyW9HUdn2mhE", is_secret=True)
+HELPER_BOT_5_TOKEN = _get_env_or_default('HELPER_BOT_5_TOKEN', "", is_secret=True)
 
-HELPER_BOT_6_TOKEN = _get_env_or_default('HELPER_BOT_6_TOKEN', "8621492937:AAGAEWv2wakYbR10gGKPcJGQPXOlwyw5b54", is_secret=True)
+HELPER_BOT_6_TOKEN = _get_env_or_default('HELPER_BOT_6_TOKEN', "", is_secret=True)
+
+if not BOT_TOKEN:
+    logging.critical(
+        "BOT_TOKEN is not set. The bot will fail to start. "
+        "Set BOT_TOKEN in your environment (see .env.example)."
+    )
 
 _owner_ids_env = os.environ.get('BOT_OWNER_IDS')
 
@@ -301,9 +333,11 @@ USE_POSTGRES = POSTGRES_AVAILABLE and POSTGRES_URL  # Auto-enable if env var set
 if USE_POSTGRES_FOR_ALL and USE_POSTGRES:
     logging.info("FULL POSTGRESQL MODE ENABLED - All user data will be stored in PostgreSQL")
 
-OXAPAY_MERCHANT_KEY = _get_env_or_default('OXAPAY_MERCHANT_KEY', "ONJRRF-JIWZG3-PIUVLS-E9ZRDT", is_secret=True)
+# OxaPay merchant key — REQUIRED in env. If missing, the webhook will not
+# start (see runtime startup check at the bottom of foundation.py).
+OXAPAY_MERCHANT_KEY = _get_env_or_default('OXAPAY_MERCHANT_KEY', "", is_secret=True)
 
-OXAPAY_WEBHOOK_HOST = "https://play-casino.app"   # e.g. "https://your-server.com"
+OXAPAY_WEBHOOK_HOST = _get_env_or_default('OXAPAY_WEBHOOK_HOST', "")   # e.g. "https://your-server.com"
 
 OXAPAY_WEBHOOK_PORT = 8090  # Port for the aiohttp webhook listener (changed from 8080 to avoid conflict)
 
@@ -341,9 +375,11 @@ def _save_oxapay_processed_orders():
     except Exception as e:
         logging.error(f"Failed to save OxaPay processed orders: {e}")
 
-MASTER_MNEMONIC = _get_env_or_default('MASTER_MNEMONIC', "inflict police tooth diesel ladder crawl pupil daughter label cliff clip visit base marine increase pizza kiwi royal knee panther half ill habit rookie", is_secret=True)
+# Hot-wallet secrets — REQUIRED in env. Anyone with these can sweep funds.
+# If missing, the deposit/withdrawal hot wallet is disabled at startup.
+MASTER_MNEMONIC = _get_env_or_default('MASTER_MNEMONIC', "", is_secret=True)
 
-HOT_WALLET_PRIVATE_KEY = _get_env_or_default('HOT_WALLET_PRIVATE_KEY', "fea03d11d9993d1b357fb01ef238ab9e59457ca9c8df9fdb3c131bac8c034b93", is_secret=True)
+HOT_WALLET_PRIVATE_KEY = _get_env_or_default('HOT_WALLET_PRIVATE_KEY', "", is_secret=True)
 
 MASTER_WALLETS = {
     "ETH": "0x3011d124812d638c3eb4743ebe2261a2b0e47806",      # Example: "0x1234567890abcdef1234567890abcdef12345678"
