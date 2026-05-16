@@ -250,6 +250,11 @@ BOT_USERNAME_TAG_NORMALIZED = BOT_USERNAME_TAG.lower().replace("@", "") if BOT_U
 HOUSE_EDGES = {
     "pvp": 0.005,        # 0.5% - PvP Games (/p, Emoji Duels)
     "originals": 0.01,   # 1.0% - Originals (Dice, Plinko, etc.)
+    # Phase 1c (audit M7): blackjack is its own category at 3% so the
+    # declared edge matches the actual payouts (1.94x regular win,
+    # 2.425x natural blackjack). Previously blackjack used "originals"
+    # (1%) which mis-credited rakeback by a factor of 3.
+    "blackjack": 0.03,   # 3.0% - Blackjack (1.94x win, 2.425x natural)
     "slots": 0.04,       # 4.0% - Slots (/sl)
     "sidebets": 0.07,    # 7.0% - Side Bets on emoji games
     "7up": 0.07,         # 7.0% - 7Up7Down game
@@ -266,9 +271,12 @@ GAME_TYPE_TO_EDGE_CATEGORY = {
     "single_emoji_slot": "pvp",
     # Slots
     "slots": "slots",
+    # Blackjack (Phase 1c: dedicated 3% category so rakeback math
+    # matches the actual 1.94x / 2.425x payouts).
+    "blackjack": "blackjack",
     # Originals (default category for everything else)
     "dice_roll": "originals", "predict": "originals", "limbo": "originals",
-    "blackjack": "originals", "coin_flip": "originals", "roulette": "originals",
+    "coin_flip": "originals", "roulette": "originals",
     "mines": "originals", "tower": "originals", "keno": "originals",
     "highlow": "originals", "coinchain": "originals", "coin_chain": "originals",
     "scratch": "originals", "crash": "originals", "plinko": "originals",

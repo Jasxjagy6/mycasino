@@ -31,8 +31,13 @@ __all__ = [
     "fair_two_outcome_multiplier",
     "fair_six_outcome_multiplier",
     "limbo_factor_for_edge",
+    "fair_blackjack_win_multiplier",
+    "fair_blackjack_natural_multiplier",
+    "effective_rakeback_edge",
     "BetOutcome",
     "resolve_bet_outcome",
+    "BLACKJACK_WIN_FAIR",
+    "BLACKJACK_NATURAL_FAIR",
     "MINES_BOARD_SIZE",
 ]
 
@@ -118,6 +123,63 @@ def limbo_factor_for_edge(edge: float) -> float:
     declared house edge exactly.
     """
     return round(100.0 * (1.0 - edge), 4)
+
+
+# ---------------------------------------------------------------------
+# Blackjack constants (Phase 1c)
+# ---------------------------------------------------------------------
+#
+# Standard blackjack rules pay 1:1 on a regular win (so the player
+# receives back ``2 * bet`` including their stake) and 3:2 on a
+# natural blackjack (so the player receives back ``2.5 * bet``).
+# These are the published industry numbers — every house edge applied
+# to blackjack should be a discount on top of these fair payouts.
+
+BLACKJACK_WIN_FAIR: float = 2.0
+BLACKJACK_NATURAL_FAIR: float = 2.5
+
+
+def fair_blackjack_win_multiplier(edge: float) -> float:
+    """Regular blackjack-win payout multiplier at the given ``edge``.
+
+    ``2 * (1 - edge)`` rounded to 4 decimal places.
+    """
+    return round(BLACKJACK_WIN_FAIR * (1.0 - edge), 4)
+
+
+def fair_blackjack_natural_multiplier(edge: float) -> float:
+    """Natural-blackjack (3:2) payout multiplier at the given ``edge``.
+
+    ``2.5 * (1 - edge)`` rounded to 4 decimal places.
+    """
+    return round(BLACKJACK_NATURAL_FAIR * (1.0 - edge), 4)
+
+
+# ---------------------------------------------------------------------
+# Effective rakeback edge (Phase 1c, audit M14)
+# ---------------------------------------------------------------------
+
+
+def effective_rakeback_edge(
+    declared_edge: float,
+    jackpot_rate: float = 0.0,
+) -> float:
+    """Return the portion of the declared house edge that the *house*
+    actually keeps, after the jackpot pool skim.
+
+    Rakeback is meant to rebate a fraction of what the house keeps.
+    Because ``jackpot_rate`` of every bet flows to the jackpot pool
+    (which is paid back to users via draws, see
+    ``plugins/jackpot.py::_jackpot_credit``), the house's *retained*
+    edge is ``declared_edge - jackpot_rate``. Without this adjustment
+    the rakeback formula effectively rebates part of the jackpot pool
+    on top of itself — double-rebating the player.
+
+    Clamped to zero so a configuration where ``jackpot_rate >
+    declared_edge`` doesn't generate negative rakeback (which would
+    silently *charge* the player on every bet).
+    """
+    return max(0.0, declared_edge - jackpot_rate)
 
 
 # ---------------------------------------------------------------------

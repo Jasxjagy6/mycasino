@@ -2,6 +2,38 @@
 from __future__ import annotations
 from core.foundation import *  # noqa: F401, F403
 
+# --- Phase 1c: house-edge-aligned blackjack multipliers --------------
+# Single source of truth: ``HOUSE_EDGES['blackjack']`` (declared in
+# ``core/foundation.py``). Every blackjack payout below is computed
+# from that constant, so changing the declared edge in one place
+# re-tunes every payout in this module.
+#
+# Before this fix:
+#   * ``1.94`` (regular win) and ``2.425`` (natural blackjack) were
+#     literal numbers scattered across this file.
+#   * Blackjack was mapped to the ``originals`` HOUSE_EDGES category
+#     (1%) for rakeback even though the games actually paid a 3% edge.
+#     Rakeback was therefore credited as if the player had wagered at
+#     1% -- a factor-of-3 under-credit.
+#
+# After this fix:
+#   * The multipliers are derived from ``HOUSE_EDGES['blackjack']``
+#     (3% by default) via ``core.game_math``. Switch the declared edge
+#     to 0.01 and the regular win becomes 1.98x and the natural becomes
+#     2.475x automatically.
+#   * ``GAME_TYPE_TO_EDGE_CATEGORY['blackjack'] = 'blackjack'`` (rather
+#     than ``'originals'``) so rakeback uses the matching edge.
+from core.game_math import (
+    fair_blackjack_win_multiplier as _fair_bj_win,
+    fair_blackjack_natural_multiplier as _fair_bj_natural,
+)
+
+_BLACKJACK_EDGE = HOUSE_EDGES.get("blackjack", 0.03)
+# 1.94 at 3% edge; 1.98 at 1% edge.
+BLACKJACK_WIN_MULT = _fair_bj_win(_BLACKJACK_EDGE)
+# 2.425 at 3% edge; 2.475 at 1% edge.
+BLACKJACK_NATURAL_MULT = _fair_bj_natural(_BLACKJACK_EDGE)
+
 @check_banned
 @check_maintenance
 async def bjsplit_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -250,11 +282,15 @@ async def blackjack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         else:
-            # Blackjack pays 2.425x (3% house edge)
-            winnings_usd = bet_amount_usd * 2.425
-            winnings_currency = bet_amount_currency * 2.425
+            # Natural blackjack — multiplier derived from
+            # HOUSE_EDGES["blackjack"]. Default 2.425x at 3% edge.
+            winnings_usd = bet_amount_usd * BLACKJACK_NATURAL_MULT
+            winnings_currency = bet_amount_currency * BLACKJACK_NATURAL_MULT
             credit_wallet(user.id, winnings_usd)
-            await update_stats_on_bet(user.id, game_id, bet_amount_usd, True, multiplier=2.425, context=context)
+            await update_stats_on_bet(
+                user.id, game_id, bet_amount_usd, True,
+                multiplier=BLACKJACK_NATURAL_MULT, context=context,
+            )
             update_pnl(user.id)
             save_user_data(user.id)
             bj_image = await async_generate_bj_image(
@@ -982,20 +1018,21 @@ async def _resolve_split_game(query, context, game_id, bot_uname):
             continue
 
         if dealer_value > 21:
-            # Dealer busted - hand wins
-            winnings = bet * 1.94
+            # Dealer busted - hand wins. BLACKJACK_WIN_MULT is derived
+            # from HOUSE_EDGES["blackjack"] (default 1.94 at 3% edge).
+            winnings = bet * BLACKJACK_WIN_MULT
             total_winnings += winnings
             credit_wallet(user_id, winnings)
             results.append(f"Hand {i+1}: Win +{dformat(winnings)}")
             game['win'] = True
-            per_hand_outcomes.append((bet, "win", 1.94))
+            per_hand_outcomes.append((bet, "win", BLACKJACK_WIN_MULT))
         elif player_value > dealer_value:
-            winnings = bet * 1.94
+            winnings = bet * BLACKJACK_WIN_MULT
             total_winnings += winnings
             credit_wallet(user_id, winnings)
             results.append(f"Hand {i+1}: Win +{dformat(winnings)}")
             game['win'] = True
-            per_hand_outcomes.append((bet, "win", 1.94))
+            per_hand_outcomes.append((bet, "win", BLACKJACK_WIN_MULT))
         elif player_value < dealer_value:
             results.append(f"Hand {i+1}: Loss (-{dformat(bet)})")
             if not game.get('win'):
@@ -1097,8 +1134,9 @@ async def handle_dealer_turn(query, context, game_id, bot_uname: str = "Casino")
     dealer_value = calculate_hand_value(game["dealer_hand"])
 
     if dealer_value > 21:
-        # Regular win pays 1.94x (3% house edge)
-        winnings = game["bet_amount"] * 1.94
+        # Regular win — BLACKJACK_WIN_MULT is derived from
+        # HOUSE_EDGES["blackjack"] (default 1.94 at 3% edge).
+        winnings = game["bet_amount"] * BLACKJACK_WIN_MULT
         credit_wallet(user_id, winnings)
         result_text_plain = "Dealer Busts! You Win!"
         # NOTE: must use the local `user_id` parameter — there is no `user`
@@ -1109,7 +1147,10 @@ async def handle_dealer_turn(query, context, game_id, bot_uname: str = "Casino")
         result_pe_text = f"{pe('win')} Dealer busts! You win {format_for_user(user_id, winnings)}!"
         result_color_tuple = BJ_WIN_COLOR
         game['win'] = True
-        await update_stats_on_bet(user_id, game_id, original_bet, True, multiplier=1.94, context=context)
+        await update_stats_on_bet(
+            user_id, game_id, original_bet, True,
+            multiplier=BLACKJACK_WIN_MULT, context=context,
+        )
     elif dealer_value > player_value:
         result_text_plain = "Dealer Wins"
         result_pe_text = f"{pe('lose')} Dealer wins with {dealer_value}. You lose ${game['bet_amount']:.2f}"
@@ -1117,14 +1158,18 @@ async def handle_dealer_turn(query, context, game_id, bot_uname: str = "Casino")
         game['win'] = False
         await update_stats_on_bet(user_id, game_id, original_bet, False, context=context)
     elif player_value > dealer_value:
-        # Regular win pays 1.94x (3% house edge)
-        winnings = game["bet_amount"] * 1.94
+        # Regular win — BLACKJACK_WIN_MULT derived from
+        # HOUSE_EDGES["blackjack"] (default 1.94 at 3% edge).
+        winnings = game["bet_amount"] * BLACKJACK_WIN_MULT
         credit_wallet(user_id, winnings)
         result_text_plain = "You Win!"
         result_pe_text = f"{pe('win')} You win! {dformat(winnings)}"
         result_color_tuple = BJ_WIN_COLOR
         game['win'] = True
-        await update_stats_on_bet(user_id, game_id, original_bet, True, multiplier=1.94, context=context)
+        await update_stats_on_bet(
+            user_id, game_id, original_bet, True,
+            multiplier=BLACKJACK_WIN_MULT, context=context,
+        )
     else:
         credit_wallet(user_id, game["bet_amount"])
         result_text_plain = "Push - Tie"

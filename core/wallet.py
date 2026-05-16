@@ -346,10 +346,22 @@ async def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False,
     if len(stats['bets']['history']) > 500:
         stats['bets']['history'] = stats['bets']['history'][-500:]
 
-    # Rakeback (pure dict ops, fast)
+    # Rakeback (pure dict ops, fast).
+    #
+    # Phase 1c (audit M14): the jackpot pool is fed
+    # ``JACKPOT_DEFAULT_ACCUM_RATE`` of every bet (default 0.2%) via
+    # ``_jackpot_credit`` above. That portion of the declared house
+    # edge is paid back to players via jackpot draws -- if we *also*
+    # rebate it via rakeback we'd be rebating the same skim twice.
+    # ``effective_rakeback_edge`` returns ``declared_edge -
+    # jackpot_rate`` (floored at zero), so rakeback rebates only the
+    # part the house actually keeps.
+    from core.game_math import effective_rakeback_edge as _effective_rakeback_edge
     edge_category = GAME_TYPE_TO_EDGE_CATEGORY.get(game_type, "originals")
     house_edge_rate = HOUSE_EDGES.get(edge_category, HOUSE_EDGES["originals"])
-    edge_amount = amount * house_edge_rate
+    jackpot_rate = float(JACKPOT_DEFAULT_ACCUM_RATE or 0.0)
+    rakeback_edge_rate = _effective_rakeback_edge(house_edge_rate, jackpot_rate)
+    edge_amount = amount * rakeback_edge_rate
     level_data = get_user_level(user_id)
     vip_rakeback_pct = level_data["rakeback_percentage"] / 100.0
     stats.setdefault("rakeback_balance", 0.0)
@@ -357,7 +369,9 @@ async def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False,
 
     # Weekly / monthly stats (fast). ``net_loss_this_bet`` comes from
     # the same outcome resolution above so push / win / loss accounting
-    # stays consistent (audit S6 / M5).
+    # stays consistent (audit S6 / M5). ``weighted_wager`` keeps the
+    # *declared* edge so leaderboard/VIP progression weighs games by
+    # their nominal house edge (slots > originals > pvp) -- unchanged.
     weighted_wager = amount * house_edge_rate
     net_loss_this_bet = outcome.net_loss_this_bet
     stats.setdefault("weekly_stats", {"weighted_wager": 0.0, "net_loss": 0.0, "last_claim": None})
