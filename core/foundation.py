@@ -1276,6 +1276,132 @@ def credit_wallet_safe(user_id: int, usd_amount: float, coin: str = None,
     wallet[coin] = wallet.get(coin, 0.0) + crypto_amount
     return crypto_amount, coin
 
+
+# ---------------------------------------------------------------------
+# Phase 1e (audit S5): centralised house_balance mutations.
+# ---------------------------------------------------------------------
+#
+# Every read-modify-write on ``bot_settings['house_balance']`` MUST go
+# through one of these helpers so the operations serialise through
+# ``_house_balance_lock``.
+#
+# Public surface:
+#
+#     get_house_balance() -> float
+#     apply_house_balance_delta(delta, reason="...") -> float
+#     set_house_balance(amount, reason="...") -> float
+#
+# Why each helper takes a ``reason`` string: every call gets logged at
+# INFO level so post-mortems of unexplained house_balance moves are
+# possible without grepping by call-site. The ``apply_*`` variant also
+# guards against accidental ``+= NaN`` / ``+= inf`` from a buggy
+# multiplier upstream -- those used to be capable of permanently
+# corrupting the global state.
+
+
+def get_house_balance() -> float:
+    """Return the current house balance.
+
+    Reads are not locked -- a single Python attribute read is atomic
+    under the GIL. If you need a *consistent snapshot for compare-and-
+    swap* semantics, do the read inside ``apply_house_balance_delta``.
+    """
+    try:
+        return float(bot_settings.get("house_balance", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        # Corrupt persisted value -- log and treat as zero so
+        # downstream divisions don't explode.
+        logging.error(
+            "house_balance is not a number: %r -- treating as 0.0",
+            bot_settings.get("house_balance"),
+        )
+        return 0.0
+
+
+async def apply_house_balance_delta(delta: float, *, reason: str = "unspecified") -> float:
+    """Atomically add ``delta`` to ``bot_settings['house_balance']``.
+
+    Returns the new balance. Rejects NaN / inf deltas (which used to
+    permanently corrupt the global state) and logs every change.
+
+    Use a positive ``delta`` for events that move money into the house
+    (a player loss, a raffle prize forfeited), a negative ``delta`` for
+    events that move money out of the house (a player win, a cashout).
+    """
+    import math as _math_hb
+    if delta is None or _math_hb.isnan(delta) or _math_hb.isinf(delta):
+        logging.error(
+            "apply_house_balance_delta: rejected invalid delta %r (reason=%s)",
+            delta, reason,
+        )
+        return get_house_balance()
+    async with _house_balance_lock:
+        try:
+            current = float(bot_settings.get("house_balance", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            current = 0.0
+        new_balance = current + float(delta)
+        bot_settings["house_balance"] = new_balance
+        logging.info(
+            "house_balance %+.4f -> %.4f (reason=%s)",
+            float(delta), new_balance, reason,
+        )
+        return new_balance
+
+
+def apply_house_balance_delta_sync(delta: float, *, reason: str = "unspecified") -> float:
+    """Synchronous counterpart for code paths that aren't async.
+
+    NOTE: this does *not* take the asyncio lock -- it relies on
+    CPython's per-bytecode atomicity for the single ``+=``. Prefer
+    ``apply_house_balance_delta`` from async code.
+    """
+    import math as _math_hbs
+    if delta is None or _math_hbs.isnan(delta) or _math_hbs.isinf(delta):
+        logging.error(
+            "apply_house_balance_delta_sync: rejected invalid delta %r (reason=%s)",
+            delta, reason,
+        )
+        return get_house_balance()
+    try:
+        current = float(bot_settings.get("house_balance", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        current = 0.0
+    new_balance = current + float(delta)
+    bot_settings["house_balance"] = new_balance
+    logging.info(
+        "house_balance %+.4f -> %.4f (reason=%s, sync)",
+        float(delta), new_balance, reason,
+    )
+    return new_balance
+
+
+async def set_house_balance(amount: float, *, reason: str = "admin-set") -> float:
+    """Atomically set the house balance to an exact value.
+
+    Used by the admin /sethouse path. Refuses NaN / inf / negative
+    values (use ``apply_house_balance_delta`` if you genuinely need a
+    negative balance for some reason).
+    """
+    import math as _math_shb
+    if amount is None or _math_shb.isnan(amount) or _math_shb.isinf(amount) or amount < 0:
+        logging.error(
+            "set_house_balance: rejected invalid amount %r (reason=%s)",
+            amount, reason,
+        )
+        return get_house_balance()
+    async with _house_balance_lock:
+        try:
+            old_balance = float(bot_settings.get("house_balance", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            old_balance = 0.0
+        bot_settings["house_balance"] = float(amount)
+        logging.warning(
+            "house_balance HARD SET %.4f -> %.4f (reason=%s)",
+            old_balance, float(amount), reason,
+        )
+        return float(amount)
+
 leaderboard_data = {
     "all_time": [],  # Top 10 wagered users all-time: [(user_id, username, total_wagered)]
     "weekly": [],    # Top 10 wagered users this week
@@ -1321,6 +1447,16 @@ _USER_ACTION_COOLDOWN_GAME = 0.5   # seconds between same game action from same 
 _USER_ACTION_COOLDOWN_MENU = 0.3   # seconds between menu navigation from same user
 
 _wallet_locks: dict = {}
+
+# Phase 1e (audit S5): centralised lock for every house_balance
+# read-modify-write. Today the field is mutated from 4 places --
+# bet settlement, raffle-cancel admin action, emoji-game cashout, and
+# admin /sethouse -- with no lock. CPython's GIL makes a bare ``+=``
+# *technically* atomic on a single line, but anything that does
+# ``read -> compute -> write`` (cashout, admin set) can race with a
+# concurrent bet settle and silently lose the update. This lock makes
+# every house_balance touch a single critical section.
+_house_balance_lock: asyncio.Lock = asyncio.Lock()
 
 _game_locks: dict = {}
 

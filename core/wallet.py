@@ -333,7 +333,15 @@ async def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False,
     # the push / win / loss accounting lives in one tested place.
     from core.game_math import resolve_bet_outcome as _resolve_bet_outcome
     outcome = _resolve_bet_outcome(amount, win, multiplier=multiplier, push=push)
-    bot_settings["house_balance"] += outcome.house_balance_delta
+    # Phase 1e (audit S5): every house_balance mutation routes through
+    # apply_house_balance_delta so the operation serialises and we get
+    # an audit-log entry for post-mortems of unexplained drift. Pushes
+    # have a zero delta which short-circuits in the helper.
+    if outcome.house_balance_delta != 0.0:
+        await apply_house_balance_delta(
+            outcome.house_balance_delta,
+            reason=f"bet:{game_type}:{game_id}",
+        )
     win_amount = outcome.win_amount
     if outcome.counter == "wins":
         if outcome.net_loss_this_bet < 0:
