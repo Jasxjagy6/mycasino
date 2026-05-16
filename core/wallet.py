@@ -118,6 +118,115 @@ def check_withdrawal_limit(user_id: int, amount_usd: float) -> tuple:
                 return False, f"You must wager your deposit {wagering_mult}x before withdrawal."
     return True, None
 
+# ---------------------------------------------------------------------
+# Phase 1f (audit M3): refund the EXACT crypto bet, not USD at current
+# price.
+# ---------------------------------------------------------------------
+#
+# Before this fix, admin ``/cancel <game_id>`` did
+# ``credit_wallet(player_id, bet_amount_usd)`` which converts using the
+# *current* ``LIVE_PRICES`` value. A user could bet at BTC=$60k, watch
+# the price drop to $50k, ask the admin to cancel, and end up with
+# 20%% more BTC than they started with -- free arbitrage on the
+# admin's response time.
+#
+# ``refund_bet`` refunds the exact crypto amount that was originally
+# deducted. It tries (in order):
+#
+#   1. ``game_data["crypto_bet_amount"]`` + ``game_data["active_currency"]``
+#        -- stored at bet time by almost all single-player games
+#   2. ``game_data["deducted"][player_id]`` (Phase 1f addition for PvP)
+#        -- structured per-player record stored when the bet was taken
+#   3. ``game_data["locked_price"]`` (Phase 1d-style price lock)
+#        -- ``bet_amount / locked_price`` reconstructs the crypto
+#   4. Final fallback: ``credit_wallet(user_id, bet_amount)`` with a
+#      WARNING log noting that the refund used the *current* price
+#      because no locked info was available.
+#
+# Return value: ``(credited_crypto_amount: float, coin: str)`` so
+# callers can show the user "You were refunded 0.000833 BTC".
+
+
+def refund_bet(player_id: int, game_data: dict, *, reason: str = "cancel"):
+    """Refund the exact crypto bet for a single player in ``game_data``.
+
+    ``game_data`` is the dict stored in ``game_sessions[game_id]`` (or
+    a similar match dict). For PvP games, the caller passes the
+    *match* dict for ``game_data`` and the relevant ``player_id``;
+    the helper picks the per-player deducted info out of
+    ``game_data["deducted"]`` if present.
+
+    Returns ``(credited_crypto_amount, coin)``.
+    """
+    import math as _math_rb
+
+    def _credit_crypto_direct(coin: str, crypto_amount: float):
+        """Bypass ``credit_wallet``'s USD-to-crypto conversion and add
+        the crypto amount directly to the player's wallet."""
+        if (
+            _math_rb.isnan(crypto_amount) or _math_rb.isinf(crypto_amount)
+            or crypto_amount <= 0
+        ):
+            logging.warning(
+                "refund_bet: rejected invalid crypto amount %r for user %s "
+                "(reason=%s)",
+                crypto_amount, player_id, reason,
+            )
+            return 0.0, coin
+        wallet = ensure_wallet_dict(player_id)
+        wallet[coin] = wallet.get(coin, 0.0) + float(crypto_amount)
+        logging.info(
+            "refund_bet user=%s coin=%s amount=%.10f (reason=%s, source=%s)",
+            player_id, coin, float(crypto_amount), reason,
+            "direct-crypto",
+        )
+        return float(crypto_amount), coin
+
+    # 1. Per-player record stored at deduct time (PvP).
+    deducted = game_data.get("deducted") if isinstance(game_data, dict) else None
+    if isinstance(deducted, dict):
+        record = deducted.get(player_id) or deducted.get(str(player_id))
+        if isinstance(record, dict):
+            crypto_amount = record.get("crypto_amount")
+            coin = record.get("coin")
+            if coin and crypto_amount is not None:
+                return _credit_crypto_direct(str(coin), float(crypto_amount))
+
+    # 2. Single-player game with crypto_bet_amount + active_currency.
+    crypto_bet = game_data.get("crypto_bet_amount")
+    active_currency = game_data.get("active_currency") or game_data.get("coin")
+    if crypto_bet is not None and active_currency:
+        return _credit_crypto_direct(str(active_currency), float(crypto_bet))
+
+    # 3. Locked-price-style: USD bet + locked_price quote.
+    bet_amount_usd = game_data.get("bet_amount") or game_data.get("bet_amount_usd")
+    locked_price = game_data.get("locked_price")
+    locked_coin = game_data.get("locked_coin") or game_data.get("active_currency")
+    if (
+        bet_amount_usd is not None and locked_price
+        and locked_coin and float(locked_price) > 0
+    ):
+        crypto_amount = float(bet_amount_usd) / float(locked_price)
+        return _credit_crypto_direct(str(locked_coin), crypto_amount)
+
+    # 4. Last resort -- old behaviour. Log loudly so operators know
+    # they refunded at the current price (potential arbitrage).
+    if bet_amount_usd is None:
+        logging.error(
+            "refund_bet: no usable bet amount in game_data for user %s "
+            "(reason=%s, keys=%s)",
+            player_id, reason, list(game_data.keys()) if isinstance(game_data, dict) else None,
+        )
+        return 0.0, get_active_currency(player_id)
+    logging.warning(
+        "refund_bet user=%s reason=%s -- FALLBACK to USD@LIVE_PRICES "
+        "(no crypto info in game_data; possible arbitrage on price drift)",
+        player_id, reason,
+    )
+    credited, coin = credit_wallet_safe(player_id, float(bet_amount_usd))
+    return credited, coin
+
+
 def get_locked_balance_in_games(user_id: int) -> dict:
     """
     Calculate total locked balance in active games and provide breakdown by game type.
