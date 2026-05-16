@@ -145,12 +145,13 @@ async def slots_rebet_double_callback(update: Update, context: ContextTypes.DEFA
         await query.answer(f"Maximum bet is {dformat(max_bet)}", show_alert=True)
         return
 
-    # Check balance
-    if get_active_balance_usd(user.id) < bet_amount:
+    # Deduct bet atomically (per-user lock prevents double-spend across
+    # concurrent rebet/double clicks and across queue workers).
+    try:
+        await deduct_wallet_safe(user.id, bet_amount)
+    except ValueError:
         await query.answer("Insufficient balance!", show_alert=True)
         return
-
-    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
 
     # Generate provably fair seeds for slots

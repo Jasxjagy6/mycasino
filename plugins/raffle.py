@@ -60,16 +60,18 @@ async def raffle_prize_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"{pe('cross')} Prize must be positive. Try again:")
             return RAFFLE_PRIZE_AMOUNT
 
-        balance = get_active_balance_usd(user.id)
-        if prize_usd > balance:
+        # Deduct prize from balance atomically — the balance check is
+        # rolled into deduct_wallet_safe so we cannot race a concurrent
+        # bet on the same wallet (single-process or multi-worker).
+        try:
+            await deduct_wallet_safe(user.id, prize_usd)
+        except ValueError:
+            balance = get_active_balance_usd(user.id)
             await update.message.reply_text(
                 f"{pe('cross')} Insufficient balance. You have ${balance:.2f}. Try again:",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="raffle_cancel")]])
             )
             return RAFFLE_PRIZE_AMOUNT
-
-        # Deduct prize from balance immediately
-        deduct_wallet(user.id, prize_usd)
         save_user_data(user.id)
 
         context.user_data['raffle_prize_usd'] = prize_usd
