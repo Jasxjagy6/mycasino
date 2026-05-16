@@ -271,8 +271,30 @@ def calculate_required_wager(user_id):
     return total_needed, breakdown
 
 async def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False,
-                               multiplier=0, context=None, game_type=None):
-    """OPTIMIZED ASYNC version. Fast in-memory mutations only. Defers all heavy work."""
+                               multiplier=0, context=None, game_type=None,
+                               push=False):
+    """OPTIMIZED ASYNC version. Fast in-memory mutations only.
+
+    Phase 1b fix (audit S6 / M5): added ``push`` parameter so blackjack
+    pushes (and any future tie outcomes) are recorded correctly. Before
+    this fix a push was passed as ``win=False, multiplier=0``, which the
+    function treated as a full LOSS and added the bet amount to
+    ``bot_settings['house_balance']`` even though the stake had been
+    returned to the player via ``credit_wallet``. That silently inflated
+    the house balance on every tie and pulled the dynamic max-bet
+    ceiling above real reserves.
+
+    On push:
+      * ``bot_settings['house_balance']`` is NOT touched (the bet was
+        returned to the player).
+      * ``stats['bets']['pushes']`` is incremented; wins/losses counts
+        are unchanged.
+      * Wagered amount, rakeback, raffle tickets and weekly/monthly
+        ``weighted_wager`` still accrue (push counts as wagering).
+      * Weekly/monthly ``net_loss`` accrues 0 for this bet.
+
+    Defers all heavy work.
+    """
     stats = user_stats[user_id]
     stats["bets"]["count"] += 1
     stats["bets"]["amount"] += amount
@@ -289,18 +311,22 @@ async def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False,
     if game_type is None:
         game_type = game_sessions.get(game_id, {}).get('game_type', 'unknown')
 
-    if win:
-        winnings = amount * multiplier
-        net_win = winnings - amount
-        bot_settings["house_balance"] -= net_win
-        win_amount = winnings
-        if net_win > 0:
-            stats["last_win"] = net_win
+    # Phase 1b: resolve outcome via the pure helper in core.game_math so
+    # the push / win / loss accounting lives in one tested place.
+    from core.game_math import resolve_bet_outcome as _resolve_bet_outcome
+    outcome = _resolve_bet_outcome(amount, win, multiplier=multiplier, push=push)
+    bot_settings["house_balance"] += outcome.house_balance_delta
+    win_amount = outcome.win_amount
+    if outcome.counter == "wins":
+        if outcome.net_loss_this_bet < 0:
+            stats["last_win"] = -outcome.net_loss_this_bet
         stats["bets"]["wins"] += 1
         if pvp_win:
             stats["bets"]["pvp_wins"] = stats["bets"].get("pvp_wins", 0) + 1
+    elif outcome.counter == "pushes":
+        stats["bets"].setdefault("pushes", 0)
+        stats["bets"]["pushes"] += 1
     else:
-        bot_settings["house_balance"] += amount
         stats["bets"]["losses"] += 1
 
     # Game session history — cap at 100
@@ -329,9 +355,11 @@ async def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False,
     stats.setdefault("rakeback_balance", 0.0)
     stats["rakeback_balance"] += edge_amount * vip_rakeback_pct
 
-    # Weekly / monthly stats (fast)
+    # Weekly / monthly stats (fast). ``net_loss_this_bet`` comes from
+    # the same outcome resolution above so push / win / loss accounting
+    # stays consistent (audit S6 / M5).
     weighted_wager = amount * house_edge_rate
-    net_loss_this_bet = (amount - (amount * multiplier)) if win else amount
+    net_loss_this_bet = outcome.net_loss_this_bet
     stats.setdefault("weekly_stats", {"weighted_wager": 0.0, "net_loss": 0.0, "last_claim": None})
     stats["weekly_stats"]["weighted_wager"] += weighted_wager
     stats["weekly_stats"]["net_loss"] += net_loss_this_bet
