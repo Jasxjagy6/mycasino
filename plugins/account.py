@@ -143,16 +143,25 @@ def hash_pin(pin: str) -> str:
     return hashlib.sha256(pin.encode()).hexdigest()
 
 def is_valid_bep20_address(address: str) -> bool:
-    """Validate if address is a valid BEP20 (Ethereum-format) address"""
-    if not address or not address.startswith("0x"):
-        return False
-    if len(address) != 42:  # 0x + 40 hex chars
-        return False
-    try:
-        int(address[2:], 16)  # Check if it's valid hex
-        return True
-    except ValueError:
-        return False
+    """Validate if address is a valid BEP20 / EVM (0x...) address.
+
+    Backwards-compatible with the legacy format-only check, but
+    additionally accepts EIP-55 checksum addresses (mixed case).
+    """
+    from core.address_validation import is_valid_eth_address
+    return is_valid_eth_address(address)
+
+
+def is_valid_chain_address(coin: str, address: str) -> bool:
+    """Per-chain withdrawal address validator (Phase 3).
+
+    Falls back to the legacy BEP20-only check when the coin is empty.
+    Use this for new withdrawal flows that know the destination chain.
+    """
+    if not coin:
+        return is_valid_bep20_address(address)
+    from core.address_validation import validate
+    return bool(validate(coin, address))
 
 async def change_withdrawal_address_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Same logic as set_withdrawal_address_step
