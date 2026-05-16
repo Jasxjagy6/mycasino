@@ -2,6 +2,23 @@
 from __future__ import annotations
 from core.foundation import *  # noqa: F401, F403
 
+# --- Phase 1a: house-edge-aligned multipliers ------------------------
+# Single source of truth: ``HOUSE_EDGES['originals']`` (declared in
+# ``core/foundation.py``). Every dice / coin-flip multiplier below is
+# computed from that constant, so changing the declared edge in one
+# place re-tunes every payout in this module.
+#
+# Before this fix the live values were:
+#   * coin-flip parlay per-round: 1.94  (≈3% edge, declared 1%)
+#   * dice 50/50 (even/odd/high/low): 1.96  (≈2% edge, declared 1%)
+#   * dice exact-number: 5.30           (≈11.67% edge, declared 1%)
+# That mismatch broke rakeback accounting (audit S7, S8, M2, M3).
+_ORIGINALS_EDGE = HOUSE_EDGES.get("originals", 0.01)
+# Fair odds on a 50/50 = 2.00; on a 1/6 exact-number = 6.00.
+COIN_FLIP_PER_ROUND_MULT = round(2.0 * (1.0 - _ORIGINALS_EDGE), 4)  # 1.98
+DICE_5050_MULT = round(2.0 * (1.0 - _ORIGINALS_EDGE), 4)            # 1.98
+DICE_EXACT_MULT = round(6.0 * (1.0 - _ORIGINALS_EDGE), 4)           # 5.94
+
 def _dr_get_font(size=14):
     """Get font for Dice Rush image."""
     try:
@@ -81,7 +98,7 @@ async def coin_flip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text(
         f"{pe('coin')} <b>Coin Flip Started!</b> (ID: <code>{game_id}</code>)\n\n💰 Bet: {dformat(bet)}\nChoose Heads or Tails!\n\n"
-        f"{pe('target')} Current Multiplier: 1.94x",
+        f"{pe('target')} Current Multiplier: {COIN_FLIP_PER_ROUND_MULT:.2f}x",
         parse_mode=ParseMode.HTML,
         reply_markup=create_styled_keyboard(keyboard)
     )
@@ -119,11 +136,13 @@ async def coin_flip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if pick == bot_choice:
             game["streak"] += 1
-            # Changed multiplier progression to maintain house edge
-            # 1.94x on first win, 3.88x on second, 7.76x on third, etc.
-            multiplier = 1.94 * (2 ** (game["streak"] - 1))
+            # Phase 1a: base multiplier per round derived from
+            # HOUSE_EDGES["originals"] (1% by default) so the parlay
+            # actually delivers the declared edge instead of ~3% per
+            # round. Sequence: 1.98, 3.96, 7.92, 15.84, 31.68, ...
+            multiplier = COIN_FLIP_PER_ROUND_MULT * (2 ** (game["streak"] - 1))
             win_amount = game["bet_amount"] * multiplier
-            next_multiplier = 1.94 * (2 ** game["streak"])
+            next_multiplier = COIN_FLIP_PER_ROUND_MULT * (2 ** game["streak"])
             keyboard = [
                 [apply_button_style(InlineKeyboardButton("Heads", callback_data=f"flip_pick_{game_id}_Heads"), 'primary'),
                  apply_button_style(InlineKeyboardButton("Tails", callback_data=f"flip_pick_{game_id}_Tails"), 'primary')],
@@ -166,9 +185,9 @@ async def coin_flip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             # del game_sessions[game_id] # FIX: Don't delete history
 
     elif action == "cashout":
-        # Changed multiplier progression to maintain house edge
-        # 1.94x on first win, 3.88x on second, 7.76x on third, etc.
-        multiplier = 1.94 * (2 ** (game["streak"] - 1))
+        # Phase 1a: derived from HOUSE_EDGES["originals"] — see
+        # COIN_FLIP_PER_ROUND_MULT at the top of this module.
+        multiplier = COIN_FLIP_PER_ROUND_MULT * (2 ** (game["streak"] - 1))
         win_amount = game["bet_amount"] * multiplier
         credit_wallet(user.id, win_amount)
         game["status"] = 'completed'
@@ -263,16 +282,19 @@ async def dice_roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     win = False
     multiplier = 0 # NEW
+    # Phase 1a: multipliers derived from HOUSE_EDGES["originals"]. See
+    # DICE_EXACT_MULT and DICE_5050_MULT at the top of this module —
+    # changing the declared edge in core/foundation.py retunes both.
     if choice in valid_numbers:
-        if int(choice) == dice_result: win, multiplier = True, 5.30
+        if int(choice) == dice_result: win, multiplier = True, DICE_EXACT_MULT
     elif choice == "even":
-        if dice_result in [2, 4, 6]: win, multiplier = True, 1.96
+        if dice_result in [2, 4, 6]: win, multiplier = True, DICE_5050_MULT
     elif choice == "odd":
-        if dice_result in [1, 3, 5]: win, multiplier = True, 1.96
+        if dice_result in [1, 3, 5]: win, multiplier = True, DICE_5050_MULT
     elif choice == "high":
-        if dice_result in [4, 5, 6]: win, multiplier = True, 1.96
+        if dice_result in [4, 5, 6]: win, multiplier = True, DICE_5050_MULT
     elif choice == "low":
-        if dice_result in [1, 2, 3]: win, multiplier = True, 1.96
+        if dice_result in [1, 2, 3]: win, multiplier = True, DICE_5050_MULT
 
     if win:
         winnings = bet_amount * multiplier
