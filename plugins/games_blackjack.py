@@ -221,8 +221,13 @@ async def blackjack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if dealer_value == 21:
             credit_wallet(user.id, bet_amount_usd)
-            # Push still counts towards leaderboard wagering
-            await update_stats_on_bet(user.id, game_id, bet_amount_usd, False, multiplier=0, context=context)
+            # Push still counts towards leaderboard wagering. Phase 1b
+            # fix: use ``push=True`` so the house_balance is NOT inflated
+            # by the returned bet (audit S6 / M5).
+            await update_stats_on_bet(
+                user.id, game_id, bet_amount_usd, False,
+                multiplier=0, context=context, push=True,
+            )
             save_user_data(user.id)
             bj_image = await async_generate_bj_image(
                 player_hand=player_hand,
@@ -928,7 +933,21 @@ async def _play_next_split_hand(query, context, game_id, next_hand_index, bot_un
     )
 
 async def _resolve_split_game(query, context, game_id, bot_uname):
-    """Resolve all split hands against dealer."""
+    """Resolve all split hands against dealer.
+
+    Phase 1b fix (audit S6 / M5): every hand now records its own stats
+    update via :func:`update_stats_on_bet` with the correct outcome
+    (win / loss / push / bust). Previously the function summarised the
+    whole split as one ``avg_bet`` call with ``has_win = any(...)``,
+    which:
+      * recorded mixed split outcomes as a single Win or single Loss,
+        breaking win/loss counters and rakeback accounting;
+      * silently treated split pushes as a LOSS (inflating
+        ``bot_settings['house_balance']``);
+      * skipped early-bust hands from stats entirely (no rakeback / no
+        weighted wager / no raffle ticket credit, because the loop
+        ``continue``-d before any stats accrual).
+    """
     game = game_sessions[game_id]
     user_id = game["user_id"]
 
@@ -940,6 +959,11 @@ async def _resolve_split_game(query, context, game_id, bot_uname):
     total_wagered = 0
     total_winnings = 0
     results = []
+    # Track per-hand outcome so each hand records its own stats below.
+    # Each entry is a tuple of (bet_amount, kind, multiplier_if_win).
+    # kind \u2208 {"win", "loss", "push"}; multiplier is the realised payout
+    # multiplier (1.94 for a regular win, 0 otherwise).
+    per_hand_outcomes: list[tuple[float, str, float]] = []
 
     for i, (hand, bet) in enumerate(zip(game["split_hands"], game["split_bets"])):
         player_value = calculate_hand_value(hand)
@@ -954,6 +978,7 @@ async def _resolve_split_game(query, context, game_id, bot_uname):
 
         if existing_result and existing_result["status"] == "bust":
             results.append(f"Hand {i+1}: Bust (-{dformat(bet)})")
+            per_hand_outcomes.append((bet, "loss", 0.0))
             continue
 
         if dealer_value > 21:
@@ -963,16 +988,19 @@ async def _resolve_split_game(query, context, game_id, bot_uname):
             credit_wallet(user_id, winnings)
             results.append(f"Hand {i+1}: Win +{dformat(winnings)}")
             game['win'] = True
+            per_hand_outcomes.append((bet, "win", 1.94))
         elif player_value > dealer_value:
             winnings = bet * 1.94
             total_winnings += winnings
             credit_wallet(user_id, winnings)
             results.append(f"Hand {i+1}: Win +{dformat(winnings)}")
             game['win'] = True
+            per_hand_outcomes.append((bet, "win", 1.94))
         elif player_value < dealer_value:
             results.append(f"Hand {i+1}: Loss (-{dformat(bet)})")
             if not game.get('win'):
                 game['win'] = False
+            per_hand_outcomes.append((bet, "loss", 0.0))
         else:
             # Push
             credit_wallet(user_id, bet)
@@ -980,13 +1008,29 @@ async def _resolve_split_game(query, context, game_id, bot_uname):
             results.append(f"Hand {i+1}: Push")
             if game.get('win') is None:
                 game['win'] = None
+            per_hand_outcomes.append((bet, "push", 0.0))
 
     update_pnl(user_id)
 
-    # Update stats for original bet (average across split hands)
-    avg_bet = total_wagered / len(game["split_hands"])
-    has_win = any("Win" in r for r in results)
-    await update_stats_on_bet(user_id, game_id, avg_bet, has_win, multiplier=1.94 if has_win else 0, context=context)
+    # Record stats for each hand individually. Push hands flow through
+    # the dedicated push=True path so ``bot_settings['house_balance']``
+    # isn't inflated by the returned bet.
+    for hand_bet, kind, mult in per_hand_outcomes:
+        if kind == "win":
+            await update_stats_on_bet(
+                user_id, game_id, hand_bet, True,
+                multiplier=mult, context=context,
+            )
+        elif kind == "push":
+            await update_stats_on_bet(
+                user_id, game_id, hand_bet, False,
+                multiplier=0, context=context, push=True,
+            )
+        else:
+            await update_stats_on_bet(
+                user_id, game_id, hand_bet, False,
+                multiplier=0, context=context,
+            )
 
     save_user_data(user_id)
     game["status"] = 'completed'
@@ -1087,8 +1131,13 @@ async def handle_dealer_turn(query, context, game_id, bot_uname: str = "Casino")
         result_pe_text = f"{pe('push')} Push! Bet returned."
         result_color_tuple = BJ_PUSH_COLOR
         game['win'] = None # No win or loss
-        # Push still counts towards leaderboard wagering
-        await update_stats_on_bet(user_id, game_id, original_bet, False, multiplier=0, context=context)
+        # Push still counts towards leaderboard wagering. Phase 1b fix:
+        # use ``push=True`` so the house_balance is NOT inflated by the
+        # returned bet (audit S6 / M5).
+        await update_stats_on_bet(
+            user_id, game_id, original_bet, False,
+            multiplier=0, context=context, push=True,
+        )
 
     # Finalise the game state FIRST so a follow-up exception (telegram
     # timeout, image render failure, etc.) cannot leave the session
