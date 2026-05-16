@@ -1692,10 +1692,21 @@ async def rpvp_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             opp_deducted, opp_coin = await deduct_wallet_safe(opponent_id, match["bet_amount_usd"])
         except ValueError:
-            credit_wallet_safe(host_id, match["bet_amount_usd"])
+            # Phase 1f (audit M3): refund the host the EXACT crypto we
+            # just took, not USD-at-current-price.
+            wallet = ensure_wallet_dict(host_id)
+            wallet[host_coin] = wallet.get(host_coin, 0.0) + float(host_deducted)
             await query.edit_message_text(f"{pe('cross')} Opponent has insufficient balance. Challenge cancelled.")
             match["status"] = "cancelled"
             return
+
+        # Phase 1f: record per-player crypto deductions so admin
+        # /cancel can refund the EXACT same crypto amount via
+        # refund_bet().
+        match["deducted"] = {
+            host_id: {"crypto_amount": float(host_deducted), "coin": host_coin},
+            opponent_id: {"crypto_amount": float(opp_deducted), "coin": opp_coin},
+        }
 
         save_user_data(host_id)
         save_user_data(opponent_id)
@@ -1824,10 +1835,21 @@ async def rpvp_target_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         opp_deducted, opp_coin = await deduct_wallet_safe(opponent_id, match["bet_amount_usd"])
     except ValueError:
-        credit_wallet_safe(host_id, match["bet_amount_usd"])
+        # Phase 1f (audit M3): refund the host the EXACT crypto we
+        # just took, not USD-at-current-price.
+        wallet = ensure_wallet_dict(host_id)
+        wallet[host_coin] = wallet.get(host_coin, 0.0) + float(host_deducted)
         await query.edit_message_text(f"{pe('cross')} Opponent has insufficient balance. Challenge cancelled.")
         match["status"] = "cancelled"
         return
+
+    # Phase 1f: record per-player crypto deductions so admin
+    # /cancel can refund the EXACT same crypto amount via
+    # refund_bet().
+    match["deducted"] = {
+        host_id: {"crypto_amount": float(host_deducted), "coin": host_coin},
+        opponent_id: {"crypto_amount": float(opp_deducted), "coin": opp_coin},
+    }
 
     save_user_data(host_id)
     save_user_data(opponent_id)
