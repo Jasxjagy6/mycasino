@@ -17,9 +17,26 @@ def generate_mine_positions(server_seed, client_seed, nonce, num_mines):
     return sorted(positions)
 
 def get_mines_multiplier(num_mines, safe_picks):
-    if safe_picks == 0: return 1.0
-    try: return MINES_MULT_TABLE[num_mines][safe_picks]
-    except KeyError: return 1.0
+    """Return the Mines payout multiplier for ``safe_picks`` safe tiles
+    on a 25-cell board with ``num_mines`` mines.
+
+    Phase 1a fix: this looks up ``MINES_MULT_TABLE`` (now computed from
+    the fair formula with the declared ``HOUSE_EDGES['originals']``
+    house edge) and falls back to ``_compute_mines_multiplier`` for any
+    out-of-range coordinate so we never silently return ``1.0`` for a
+    valid (mines, picks) pair.
+    """
+    if safe_picks == 0:
+        return 1.0
+    try:
+        return MINES_MULT_TABLE[num_mines][safe_picks]
+    except KeyError:
+        try:
+            return _compute_mines_multiplier(
+                num_mines, safe_picks, HOUSE_EDGES["originals"]
+            )
+        except Exception:
+            return 1.0
 
 def mines_keyboard(game_id, reveal=False):
     game = game_sessions.get(game_id)

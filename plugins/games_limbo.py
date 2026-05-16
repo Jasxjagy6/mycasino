@@ -2,20 +2,31 @@
 from __future__ import annotations
 from core.foundation import *  # noqa: F401, F403
 
+# --- Phase 1a: house-edge-aligned limbo factor -----------------------
+# Single source of truth: ``HOUSE_EDGES['originals']`` (declared in
+# ``core/foundation.py``). The previous hard-coded ``92`` produced an
+# actual ~7.07% edge while the declared edge was 1% (audit S10 / E9).
+# Now derived from the declared constant so the math always matches.
+_LIMBO_EDGE = HOUSE_EDGES.get("originals", 0.01)
+LIMBO_FACTOR = round(100.0 * (1.0 - _LIMBO_EDGE), 4)  # 99.0 at 1% edge
+
 def get_limbo_multiplier(server_seed, client_seed, nonce):
-    """
-    Generate a provably fair Limbo multiplier using Stake.com's algorithm.
-    Returns a multiplier between 1.00 and 1000.00.
+    """Generate a provably-fair Limbo multiplier (Stake-style algorithm).
 
     Algorithm:
-    - Uses first 52 bits of SHA256 hash as random seed
-    - Converts to range [1, 100] for percentage (uniform distribution)
-    - Applies formula: house_edge_multiplier / random_percentage
-    - With house_edge_multiplier=92:
-      * P(X >= 2) = P(92/random_percentage >= 2) = P(random_percentage <= 46)
-      * Since random_percentage is uniformly distributed in [1, 100]:
-      * P(random_percentage <= 46) = 46/100 = 46%
-    - Higher multipliers have exponentially lower chances (e.g., P(X >= 10) ≈ 9.2%)
+      * Uses the first 52 bits of ``SHA256(server_seed:client_seed:nonce)``
+        as the entropy source.
+      * Maps it to a uniform random percentage in ``[1, 100]``.
+      * Applies ``result = LIMBO_FACTOR / random_percentage`` where
+        ``LIMBO_FACTOR = 100 * (1 - HOUSE_EDGES['originals'])`` is the
+        single knob controlling the house edge.
+      * Result is clamped to ``[1.00, 1000.00]``.
+
+    With the default 1% edge (LIMBO_FACTOR = 99):
+      * P(X >= 2)  ≈ 49.5%
+      * P(X >= 4)  ≈ 24.75%
+      * P(X >= 10) ≈ 9.9%
+      * Long-run RTP ≈ 99% (1% edge), matching the declared value.
     """
     hash_result = create_hash(server_seed, client_seed, nonce)
 
@@ -23,21 +34,15 @@ def get_limbo_multiplier(server_seed, client_seed, nonce):
     hex_value = int(hash_result[:13], 16)
     max_val = 16 ** 13
 
-    # Convert to [1, 100] range to avoid division by zero and ensure proper distribution
-    # This gives uniform distribution across 1-100 (inclusive)
+    # Map to [1, 100] uniform. Inclusive endpoints, continuous treatment.
     random_percentage = ((hex_value / max_val) * 99) + 1
 
-    # Apply house edge to achieve 46% chance at 2x
-    # With house_edge_multiplier=92 and uniform random_percentage in [1, 100]:
-    # P(X >= 2) = P(random_percentage <= 46) = 46 out of 100 values = 46%
-    house_edge_multiplier = 92
-
     try:
-        result = house_edge_multiplier / random_percentage
+        result = LIMBO_FACTOR / random_percentage
         # Clamp between 1.00 and 1000.00
         result = max(1.00, min(1000.00, result))
         return round(result, 2)
-    except:
+    except Exception:
         # Should never happen with random_percentage in [1, 100], but safety fallback
         return 1.00
 
@@ -99,8 +104,9 @@ async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• If outcome ≥ your target: You win (bet × target)\n"
             "• If outcome < your target: You lose\n\n"
             "<b>Probability:</b>\n"
-            "• 2x = ~46% chance\n"
-            "• 4x = ~23% chance\n"
+            "• 2x  ≈ 49.5% chance\n"
+            "• 4x  ≈ 24.7% chance\n"
+            "• 10x ≈ 9.9%  chance\n"
             "• Higher multipliers = lower chance\n\n"
             "<b>Usage:</b> <code>/lb amount multiplier</code>\n\n"
             "<b>Examples:</b>\n"
