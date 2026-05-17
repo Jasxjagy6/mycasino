@@ -270,10 +270,19 @@ async def process_withdrawal_amount(update: Update, context: ContextTypes.DEFAUL
         "txid": None
     }
 
-    # Deduct from user's specific coin wallet (ATOMIC - prevents double-spend race)
+    # Deduct from user's specific coin wallet (ATOMIC - prevents double-spend race).
+    # Phase 2: ``intent_id`` is keyed on the withdrawal_id so a crash
+    # retry never double-debits.  The mirror lands in the PG ledger
+    # via ``deduct_wallet_safe`` -> ``ledger_writer.enqueue_mutation``.
     async with _get_withdrawal_lock(user.id):
         try:
-            deducted_amount, deducted_coin = await deduct_wallet_safe(user.id, amount_usd, coin)
+            deducted_amount, deducted_coin = await deduct_wallet_safe(
+                user.id,
+                amount_usd,
+                coin,
+                intent_id=f"withdrawal:reserve:{withdrawal_id}",
+                ref=withdrawal_id,
+            )
         except ValueError as e:
             if "INSUFFICIENT_FUNDS" in str(e):
                 await update.message.reply_text(

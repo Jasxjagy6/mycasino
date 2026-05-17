@@ -716,6 +716,27 @@ async def withdrawal_approve_callback(update: Update, context: ContextTypes.DEFA
         await query.answer(f"This withdrawal has already been {withdrawal['status']}.", show_alert=True)
         return
 
+    # Phase 2 dedup: prevent two admin clicks (mobile fat-finger, or
+    # two admins clicking simultaneously) from both opening the TXID
+    # prompt for the same withdrawal.  Falls open when Redis is
+    # disabled — the legacy ``status != pending`` check above + the
+    # withdrawal_txid_step also recheck before mutating state.
+    try:
+        from core import redis_backend as _rb
+        if _rb.redis_enabled():
+            claimed = await _rb.claim_once(
+                f"withdrawal:approve:open:{withdrawal_id}",
+                ttl_seconds=600,
+            )
+            if not claimed:
+                await query.answer(
+                    "Another admin is already handling this withdrawal.",
+                    show_alert=True,
+                )
+                return
+    except Exception:  # noqa: BLE001
+        logging.exception("Redis dedup failed for withdrawal_approve %s", withdrawal_id)
+
     # Ask for TXID
     await query.edit_message_text(
         f"{pe('withdraw')} <b>Approve Withdrawal</b>\n\n"
@@ -793,6 +814,28 @@ async def withdrawal_cancel_callback(update: Update, context: ContextTypes.DEFAU
         await query.answer(f"This withdrawal has already been {withdrawal['status']}.", show_alert=True)
         return
 
+    # Phase 2 dedup: prevent two simultaneous admin clicks from both
+    # making it past the fast-path check.  ``claim_once`` is keyed on
+    # the withdrawal_id so a single click wins; the loser gets a
+    # friendly toast.  Falls open when Redis is disabled — the
+    # per-user lock + status re-check below remain the authoritative
+    # double-credit guard.
+    try:
+        from core import redis_backend as _rb
+        if _rb.redis_enabled():
+            claimed = await _rb.claim_once(
+                f"withdrawal:cancel:{withdrawal_id}",
+                ttl_seconds=600,
+            )
+            if not claimed:
+                await query.answer(
+                    "Another admin is already cancelling this withdrawal.",
+                    show_alert=True,
+                )
+                return
+    except Exception:  # noqa: BLE001
+        logging.exception("Redis dedup failed for withdrawal_cancel %s", withdrawal_id)
+
     # Return funds to user (ATOMIC - prevents race conditions).
     # SECURITY: status re-check, credit, and status mutation MUST all happen
     # inside the same _get_withdrawal_lock so two concurrent admin clicks
@@ -813,7 +856,17 @@ async def withdrawal_cancel_callback(update: Update, context: ContextTypes.DEFAU
                 show_alert=True,
             )
             return
-        credit_wallet_safe(user_id, amount_usd)
+        # Refund the legacy in-memory wallet (UI source-of-truth) and
+        # mirror the credit to the PG ledger via credit_wallet_safe's
+        # ledger_writer hook.  ``intent_id`` = the withdrawal_id, so
+        # crash-retry never double-refunds.
+        credit_wallet_safe(
+            user_id,
+            amount_usd,
+            intent_id=f"withdrawal:refund:{withdrawal_id}",
+            ref=withdrawal_id,
+            kind="withdraw_refund",
+        )
         current["status"] = "cancelled"
         current["cancelled_at"] = str(datetime.now(timezone.utc))
         # Refresh the outer reference so the post-lock notification code
