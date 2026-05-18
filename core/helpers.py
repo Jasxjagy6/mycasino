@@ -641,6 +641,21 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"{pe('cross')} Invalid amount. Enter a positive number.", parse_mode=ParseMode.HTML)
             return
 
+    # PERFORMANCE: this handler is registered on
+    # `filters.Dice.ALL | (filters.TEXT & ~filters.COMMAND)`, so in a
+    # group with thousands of chatters every casual text message used
+    # to run `ensure_user_in_wallets` + a `user_stats[user.id]
+    # ['last_update']` write — pure overhead that dominates the event
+    # loop at scale. The text-only branches in this handler are
+    # `eg_awaiting_custom_bet_*` (handled above) and `escrow_step`
+    # (handled below); plain text otherwise has nothing to do here.
+    # Bail out before the expensive bookkeeping for those messages.
+    if (update.message.text
+            and not update.message.dice
+            and not update.message.new_chat_members
+            and 'escrow_step' not in context.user_data):
+        return
+
     await ensure_user_in_wallets(user.id, user.username, context=context)
     user_stats[user.id]['last_update'] = str(datetime.now(timezone.utc))
 
@@ -692,408 +707,421 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.info(f"DICE: user={user.id}, emoji={update.message.dice.emoji}, value={update.message.dice.value}, active_game={active_pvb_game_id}, exists={active_pvb_game_id in game_sessions if active_pvb_game_id else False}")
 
     if chat_matched_pvb and active_pvb_game_id and active_pvb_game_id in game_sessions:
-        game = game_sessions[active_pvb_game_id]
-
-        game_type = (game['game_type']
-                     .replace("pvb_", "")
-                     .replace("xdxw_", "")
-                     .replace("group_challenge_", ""))
-        # Handle different game_type naming variations
-        emoji_map = {
-            "dice": "🎲", "dice_bot": "🎲",
-            "darts": "🎯",
-            "goal": "⚽", "football": "⚽",
-            "bowl": "🎳", "bowling": "🎳"
-        }
-        expected_emoji = emoji_map.get(game_type, "🎲")  # Default to dice if not found
-        game_rolls = game.get('game_rolls', 1)
-        game_mode = game.get('game_mode', 'normal')
-        bot_rolls_first = game.get('bot_rolls_first', False)
-
-        # CRITICAL FIX (race-condition #1): drop dice that arrive while the
-        # bot is still rolling or while we're mid-way through resolving the
-        # previous round.
-        #
-        # `waiting_for == "bot"` and `bot_is_rolling` cover the bot's
-        # animation window. But there is a *second* race window between
-        # the moment we clear those flags after multi_roll_parallel
-        # returns and the moment we reset `game['user_rolls']` to [] at
-        # the end of round resolution (which only happens after several
-        # `await reply_text` calls). A dice the user spams in that window
-        # used to be appended onto the still-full `user_rolls` list, sail
-        # past the `len < game_rolls` gate, and trigger a *second* bot
-        # roll for the same round — that is the source of the duplicate
-        # bot rolls + score corruption + "behaves unusual" reports for
-        # /dice <amount> PvB matches.
-        #
-        # Closing the race: also bail when `user_rolls` is already at
-        # full capacity for this round, regardless of the boolean flags.
-        if (game.get("waiting_for") == "bot"
-                or game.get("bot_is_rolling")
-                or len(game.get('user_rolls', []) or []) >= game_rolls):
-            if DEBUG_EMOJI_GAMES:
-                logging.info(f"PVB IGNORED: user={user.id} tried to roll during bot's turn / round resolution (game={active_pvb_game_id})")
-            return
-
-        if update.message.dice and update.message.dice.emoji == expected_emoji and update.message.forward_origin is None:
-            # Cancel PvB timeout since user is rolling
-            _cancel_pvb_timeout_jobs(context, user.id, active_pvb_game_id)
-
-            user_roll = update.message.dice.value
-
-            # Add to user_rolls list
-            if 'user_rolls' not in game:
-                game['user_rolls'] = []
-            game['user_rolls'].append(user_roll)
-
-            # Check if user has completed all rolls
-            if len(game['user_rolls']) < game_rolls:
-                # Mid-round partial roll: schedule a throttled, fire-and-forget
-                # refresh of the existing cashout button so the label catches
-                # up with the new state without awaiting a Telegram round trip
-                # inside the dice handler. Awaiting an edit_message_reply_markup
-                # here used to serialise concurrent PvB matches behind the per-
-                # chat rate limiter.
-                _schedule_pvb_cashout_refresh(context, active_pvb_game_id, game, user.id)
+        # CONCURRENCY FIX: per-game asyncio.Lock — close the race
+        # where two near-simultaneous user dice both pass the
+        # `len(user_rolls) < game_rolls` gate before either appends.
+        # The lock infrastructure was already declared at line 124
+        # but was never actually wrapped around the dice handler's
+        # read-modify-write path, which is the source of dropped /
+        # duplicated user rolls and double bot rolls.
+        async with _get_game_lock(active_pvb_game_id):
+            # Re-read game inside the lock — a prior handler may
+            # have completed the round / changed the status while
+            # we were waiting to acquire the lock.
+            game = game_sessions.get(active_pvb_game_id)
+            if not game or game.get('status') != 'active':
                 return
 
-            # Round will now resolve — invalidate the cashout button so the
-            # player can't cash out after already locking in all their rolls.
-            _active_cashout_buttons.pop(active_pvb_game_id, None)
-            _cashout_refresh_last.pop(active_pvb_game_id, None)
+            game_type = (game['game_type']
+                         .replace("pvb_", "")
+                         .replace("xdxw_", "")
+                         .replace("group_challenge_", ""))
+            # Handle different game_type naming variations
+            emoji_map = {
+                "dice": "🎲", "dice_bot": "🎲",
+                "darts": "🎯",
+                "goal": "⚽", "football": "⚽",
+                "bowl": "🎳", "bowling": "🎳"
+            }
+            expected_emoji = emoji_map.get(game_type, "🎲")  # Default to dice if not found
+            game_rolls = game.get('game_rolls', 1)
+            game_mode = game.get('game_mode', 'normal')
+            bot_rolls_first = game.get('bot_rolls_first', False)
 
-            # User finished rolling
-            user_rolls = game['user_rolls']
-            user_total = sum(user_rolls)
-            user_rolls_text = ROLL_SEPARATOR.join(str(r) for r in user_rolls)
+            # CRITICAL FIX (race-condition #1): drop dice that arrive while the
+            # bot is still rolling or while we're mid-way through resolving the
+            # previous round.
+            #
+            # `waiting_for == "bot"` and `bot_is_rolling` cover the bot's
+            # animation window. But there is a *second* race window between
+            # the moment we clear those flags after multi_roll_parallel
+            # returns and the moment we reset `game['user_rolls']` to [] at
+            # the end of round resolution (which only happens after several
+            # `await reply_text` calls). A dice the user spams in that window
+            # used to be appended onto the still-full `user_rolls` list, sail
+            # past the `len < game_rolls` gate, and trigger a *second* bot
+            # roll for the same round — that is the source of the duplicate
+            # bot rolls + score corruption + "behaves unusual" reports for
+            # /dice <amount> PvB matches.
+            #
+            # Closing the race: also bail when `user_rolls` is already at
+            # full capacity for this round, regardless of the boolean flags.
+            if (game.get("waiting_for") == "bot"
+                    or game.get("bot_is_rolling")
+                    or len(game.get('user_rolls', []) or []) >= game_rolls):
+                if DEBUG_EMOJI_GAMES:
+                    logging.info(f"PVB IGNORED: user={user.id} tried to roll during bot's turn / round resolution (game={active_pvb_game_id})")
+                return
 
-            if bot_rolls_first:
-                # Bot already rolled, so we have bot_rolls
-                bot_rolls = game.get('bot_rolls', [])
-                bot_total = sum(bot_rolls)
-                bot_rolls_text = ROLL_SEPARATOR.join(str(r) for r in bot_rolls)
-
-                # Determine winner based on mode
-                win = False
-                if game_mode == "normal":
-                    # Normal mode: highest total wins
-                    win = user_total > bot_total
-                    tie = user_total == bot_total
-                else:
-                    # Crazy mode: lowest total wins
-                    win = user_total < bot_total
-                    tie = user_total == bot_total
-
-                round_result = {"user_rolls": user_rolls, "bot_rolls": bot_rolls,
-                              "user_total": user_total, "bot_total": bot_total, "winner": None}
-
-                if tie:
-                    result_text = f"{pe('push')} It's a tie! No point."
-                elif win:
-                    game["user_score"] += 1
-                    round_result["winner"] = "user"
-                    result_text = f"{pe('win')} {user.first_name} wins this round!"
-                else:
-                    game["bot_score"] += 1
-                    round_result["winner"] = "bot"
-                    result_text = f"{pe('robot')} Bot wins this round!"
-
-                # Consolidated message for bot_rolls_first mode
-                username_display = user.first_name if user.first_name else "Player"
-                await update.message.reply_text(
-                    f"{pe('robot')} <b>BOT ROLLED FIRST!</b>\n\n"
-                    f"Bot rolled: [{bot_rolls_text}] = <b>{bot_total}</b>\n"
-                    f"{username_display} rolled: [{user_rolls_text}] = <b>{user_total}</b>\n\n"
-                    f"{result_text}",
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                # PERFORMANCE: We used to send a "{user} rolled X. Bot is
-                # rolling..." ack message here, *then* the bot's dice, *then*
-                # the consolidated result. With AIORateLimiter that's three
-                # messages-per-round serialised on the same chat's rate
-                # window — ~3s of waiting before the result is visible. With
-                # 2 players in the same group running PvB matches it doubles
-                # to ~6s and feels like the bot has crashed. Skip the ack:
-                # the bot's dice that's about to be sent is itself the "I'm
-                # rolling now" indicator, and the consolidated result message
-                # below repeats both the user's and bot's rolls.
-                username_display = user.first_name if user.first_name else "Player"
-
-                # Check if bot already rolled (via "Bot rolls first" button or timeout job)
-                pre_rolled_values = context.user_data.get('pre_rolled_bot_values') or game.get('pre_rolled_bot_values')
-
-                if pre_rolled_values:
-                    # Bot already rolled - use those values
-                    bot_rolls = pre_rolled_values
-                    # Clear the stored values from both places
-                    context.user_data.pop('pre_rolled_bot_values', None)
-                    game.pop('pre_rolled_bot_values', None)
-                else:
-                    # Bot hasn't rolled yet - roll now using multi_roll_parallel for lightning-fast speed
-                    # Set flags to prevent user from sending more emojis during bot's rolling.
-                    # Both `bot_is_rolling` and `waiting_for='bot'` are set so any
-                    # consumer that only knows about one flag still bails correctly.
-                    game['bot_is_rolling'] = True
-                    game['waiting_for'] = 'bot'
-                    bot_rolls = []
-                    # CRITICAL FIX: reply-tag the user's most-recent dice
-                    # message rather than the original /dice <amount>
-                    # command. Tagging the user's recent dice is the
-                    # natural "Bot is responding to your roll" UX and is
-                    # what the user expects in /dice <amount> mode (parity
-                    # with what they see in /dice <amount> XdX'w mode
-                    # where the bot's emoji clearly tags the user). Using
-                    # the original /dice command id made the bot's roll
-                    # land deep above the user's dice in the chat scroll,
-                    # which is what the user reported as "doesn't
-                    # actually tag the user message".
-                    command_msg_id = (update.message.message_id
-                                      if update.message else game.get('command_message_id'))
-                    try:
-                        rolls_data = await multi_roll_parallel(context, update.effective_chat.id, expected_emoji, game_rolls, reply_to_message_id=command_msg_id)
-                        for msg, _ in rolls_data:
-                            bot_rolls.append(msg.dice.value)
-                    except Exception as e:
-                        logging.error(f"Error sending dice in PvB game: {e}")
-                        await update.message.reply_text(f"{pe('cross')} An error occurred. Game terminated.")
-                        game['status'] = 'error'
-                        game.pop('bot_is_rolling', None)
-                        game.pop('waiting_for', None)
-                        context.chat_data.pop(f"active_pvb_game_{user.id}", None)
-                        if user.id in active_pvb_games:
-                            del active_pvb_games[user.id]
-                        _unindex_user_game(user.id, active_pvb_game_id)
-                        _active_cashout_buttons.pop(active_pvb_game_id, None)
-                        _cashout_refresh_last.pop(active_pvb_game_id, None)
-                        credit_wallet(user.id, game['bet_amount'])
-                        update_pnl(user.id)
-                        save_user_data(user.id)
-                        return
-                    # NOTE: keep `bot_is_rolling=True` and `waiting_for='bot'`
-                    # in place until *after* user_rolls/bot_rolls are reset
-                    # below. Clearing them here used to open a small race
-                    # window during the round-result `await reply_text`
-                    # where a spammed dice would be appended to the
-                    # still-full user_rolls list and trigger a duplicate
-                    # bot roll. The flags now act as a single "round in
-                    # progress" guard until the round is fully resolved.
-
-                game["bot_rolls"] = bot_rolls
-                bot_total = sum(bot_rolls)
-                bot_rolls_text = ROLL_SEPARATOR.join(str(r) for r in bot_rolls)
-
-                # Determine winner based on mode
-                win = False
-                if game_mode == "normal":
-                    # Normal mode: highest total wins
-                    win = user_total > bot_total
-                    tie = user_total == bot_total
-                else:
-                    # Crazy mode: lowest total wins
-                    win = user_total < bot_total
-                    tie = user_total == bot_total
-
-                round_result = {"user_rolls": user_rolls, "bot_rolls": bot_rolls,
-                              "user_total": user_total, "bot_total": bot_total, "winner": None}
-
-                if tie:
-                    result_text = f"{pe('push')} It's a tie! No point."
-                elif win:
-                    game["user_score"] += 1
-                    round_result["winner"] = "user"
-                    result_text = f"{pe('win')} {username_display} wins this round!"
-                else:
-                    game["bot_score"] += 1
-                    round_result["winner"] = "bot"
-                    result_text = f"{pe('robot')} Bot wins this round!"
-
-                # Consolidated message showing bot rolls and winner
-                username_display = user.first_name if user.first_name else "Player"
-                await update.message.reply_text(
-                    f"<b>{username_display.upper()} ROLLED FIRST!</b>\n\n"
-                    f"{username_display} rolled: [{user_rolls_text}] = <b>{user_total}</b>\n"
-                    f"{pe('robot')} Bot rolled: [{bot_rolls_text}] = <b>{bot_total}</b>\n\n"
-                    f"{result_text}",
-                    parse_mode=ParseMode.HTML
-                )
-
-            game["history"].append(round_result)
-            game["current_round"] += 1
-            game['user_rolls'] = []  # Reset for next round
-            game['bot_rolls'] = []  # Reset for next round
-            # Round fully resolved — *now* it's safe to clear the
-            # "round-in-progress" guards. The next-round bot-rolls-first
-            # branch below re-sets them as needed for its own bot roll.
-            game.pop('bot_is_rolling', None)
-            game['waiting_for'] = 'user'
-
-            # Check for game end
-            if game["user_score"] >= game["target_score"]:
-                # Cancel any pending timeout
+            if update.message.dice and update.message.dice.emoji == expected_emoji and update.message.forward_origin is None:
+                # Cancel PvB timeout since user is rolling
                 _cancel_pvb_timeout_jobs(context, user.id, active_pvb_game_id)
-                winnings = game["bet_amount"] * 1.96
-                credit_wallet(user.id, winnings)
-                game['status'] = 'completed'
-                game['win'] = True
-                # Resolve side bets - user (p1) wins
-                asyncio.ensure_future(resolve_sidebets_for_match(active_pvb_game_id, "p1", context))
-                await update_stats_on_bet(user.id, game['id'], game['bet_amount'], True, multiplier=1.96, context=context)
-                # No manual sleep — AIORateLimiter already paces outbound
-                # messages per chat. Sleeping here just stretched concurrent
-                # PvB matches' total wall-clock time without buying anything.
-                await update.message.reply_text(f"{pe('trophy')} {user.mention_html()}, Congratulations! You beat the bot ({game['user_score']}-{game['bot_score']}) and win ${winnings:.2f}!", parse_mode=ParseMode.HTML)
-                context.chat_data.pop(f"active_pvb_game_{user.id}", None)
-                if user.id in active_pvb_games:
-                    del active_pvb_games[user.id]
-                _unindex_user_game(user.id, active_pvb_game_id)
-                # Lifecycle cleanup: cashout button state is per-game.
+
+                user_roll = update.message.dice.value
+
+                # Add to user_rolls list
+                if 'user_rolls' not in game:
+                    game['user_rolls'] = []
+                game['user_rolls'].append(user_roll)
+
+                # Check if user has completed all rolls
+                if len(game['user_rolls']) < game_rolls:
+                    # Mid-round partial roll: schedule a throttled, fire-and-forget
+                    # refresh of the existing cashout button so the label catches
+                    # up with the new state without awaiting a Telegram round trip
+                    # inside the dice handler. Awaiting an edit_message_reply_markup
+                    # here used to serialise concurrent PvB matches behind the per-
+                    # chat rate limiter.
+                    _schedule_pvb_cashout_refresh(context, active_pvb_game_id, game, user.id)
+                    return
+
+                # Round will now resolve — invalidate the cashout button so the
+                # player can't cash out after already locking in all their rolls.
                 _active_cashout_buttons.pop(active_pvb_game_id, None)
                 _cashout_refresh_last.pop(active_pvb_game_id, None)
-                _game_locks.pop(active_pvb_game_id, None)
-            elif game["bot_score"] >= game["target_score"]:
-                # Cancel any pending timeout
-                _cancel_pvb_timeout_jobs(context, user.id, active_pvb_game_id)
-                game['status'] = 'completed'
-                game['win'] = False
-                # Resolve side bets - bot (p2) wins
-                asyncio.ensure_future(resolve_sidebets_for_match(active_pvb_game_id, "p2", context))
-                await update_stats_on_bet(user.id, game['id'], game['bet_amount'], False, context=context)
-                # AIORateLimiter handles per-chat pacing; manual sleep removed.
-                await update.message.reply_text(f"{pe('lose')} {user.mention_html()}, Bot wins the match ({game['bot_score']}-{game['user_score']}). You lost {format_for_user(user.id, game['bet_amount'])}.", parse_mode=ParseMode.HTML)
-                context.chat_data.pop(f"active_pvb_game_{user.id}", None)
-                if user.id in active_pvb_games:
-                    del active_pvb_games[user.id]
-                _unindex_user_game(user.id, active_pvb_game_id)
-                # Lifecycle cleanup: cashout button state is per-game.
-                _active_cashout_buttons.pop(active_pvb_game_id, None)
-                _cashout_refresh_last.pop(active_pvb_game_id, None)
-                _game_locks.pop(active_pvb_game_id, None)
-            else: # Continue game - next round
-                # AIORateLimiter handles per-chat pacing; manual sleep removed.
+
+                # User finished rolling
+                user_rolls = game['user_rolls']
+                user_total = sum(user_rolls)
+                user_rolls_text = ROLL_SEPARATOR.join(str(r) for r in user_rolls)
 
                 if bot_rolls_first:
-                    # Bot rolls first for next round
-                    # Set flag to prevent user from rolling during bot's turn
-                    game['waiting_for'] = 'bot'
-                    game['bot_is_rolling'] = True
+                    # Bot already rolled, so we have bot_rolls
+                    bot_rolls = game.get('bot_rolls', [])
+                    bot_total = sum(bot_rolls)
+                    bot_rolls_text = ROLL_SEPARATOR.join(str(r) for r in bot_rolls)
 
+                    # Determine winner based on mode
+                    win = False
+                    if game_mode == "normal":
+                        # Normal mode: highest total wins
+                        win = user_total > bot_total
+                        tie = user_total == bot_total
+                    else:
+                        # Crazy mode: lowest total wins
+                        win = user_total < bot_total
+                        tie = user_total == bot_total
+
+                    round_result = {"user_rolls": user_rolls, "bot_rolls": bot_rolls,
+                                  "user_total": user_total, "bot_total": bot_total, "winner": None}
+
+                    if tie:
+                        result_text = f"{pe('push')} It's a tie! No point."
+                    elif win:
+                        game["user_score"] += 1
+                        round_result["winner"] = "user"
+                        result_text = f"{pe('win')} {user.first_name} wins this round!"
+                    else:
+                        game["bot_score"] += 1
+                        round_result["winner"] = "bot"
+                        result_text = f"{pe('robot')} Bot wins this round!"
+
+                    # Consolidated message for bot_rolls_first mode
+                    username_display = user.first_name if user.first_name else "Player"
                     await update.message.reply_text(
-                        f"Score: You {game['user_score']} - {game['bot_score']} Bot. (First to {game['target_score']})\n\n"
-                        f"<b>Bot is rolling for Round {game['current_round']}...</b>",
+                        f"{pe('robot')} <b>BOT ROLLED FIRST!</b>\n\n"
+                        f"Bot rolled: [{bot_rolls_text}] = <b>{bot_total}</b>\n"
+                        f"{username_display} rolled: [{user_rolls_text}] = <b>{user_total}</b>\n\n"
+                        f"{result_text}",
                         parse_mode=ParseMode.HTML
                     )
+                else:
+                    # PERFORMANCE: We used to send a "{user} rolled X. Bot is
+                    # rolling..." ack message here, *then* the bot's dice, *then*
+                    # the consolidated result. With AIORateLimiter that's three
+                    # messages-per-round serialised on the same chat's rate
+                    # window — ~3s of waiting before the result is visible. With
+                    # 2 players in the same group running PvB matches it doubles
+                    # to ~6s and feels like the bot has crashed. Skip the ack:
+                    # the bot's dice that's about to be sent is itself the "I'm
+                    # rolling now" indicator, and the consolidated result message
+                    # below repeats both the user's and bot's rolls.
+                    username_display = user.first_name if user.first_name else "Player"
 
-                    # Bot rolls - use multi_roll_parallel for lightning-fast speed
-                    bot_rolls = []
-                    # Reply-tag the user's most-recent dice (parity with
-                    # the user-rolls-first branch above).
-                    command_msg_id = (update.message.message_id
-                                      if update.message else game.get('command_message_id'))
-                    try:
-                        rolls_data = await multi_roll_parallel(context, update.effective_chat.id, expected_emoji, game_rolls, reply_to_message_id=command_msg_id)
-                        for msg, _ in rolls_data:
-                            bot_rolls.append(msg.dice.value)
-                    except Exception as e:
-                        logging.error(f"Error sending dice in PvB game: {e}")
-                        await update.message.reply_text(f"{pe('cross')} An error occurred. Game terminated.")
-                        game['status'] = 'error'
-                        game.pop('bot_is_rolling', None)
-                        game.pop('waiting_for', None)
-                        context.chat_data.pop(f"active_pvb_game_{user.id}", None)
-                        if user.id in active_pvb_games:
-                            del active_pvb_games[user.id]
-                        _unindex_user_game(user.id, active_pvb_game_id)
-                        _active_cashout_buttons.pop(active_pvb_game_id, None)
-                        _cashout_refresh_last.pop(active_pvb_game_id, None)
-                        credit_wallet(user.id, game['bet_amount'])
-                        update_pnl(user.id)
-                        save_user_data(user.id)
-                        return
+                    # Check if bot already rolled (via "Bot rolls first" button or timeout job)
+                    pre_rolled_values = context.user_data.get('pre_rolled_bot_values') or game.get('pre_rolled_bot_values')
 
-                    game.pop('bot_is_rolling', None)
+                    if pre_rolled_values:
+                        # Bot already rolled - use those values
+                        bot_rolls = pre_rolled_values
+                        # Clear the stored values from both places
+                        context.user_data.pop('pre_rolled_bot_values', None)
+                        game.pop('pre_rolled_bot_values', None)
+                    else:
+                        # Bot hasn't rolled yet - roll now using multi_roll_parallel for lightning-fast speed
+                        # Set flags to prevent user from sending more emojis during bot's rolling.
+                        # Both `bot_is_rolling` and `waiting_for='bot'` are set so any
+                        # consumer that only knows about one flag still bails correctly.
+                        game['bot_is_rolling'] = True
+                        game['waiting_for'] = 'bot'
+                        bot_rolls = []
+                        # CRITICAL FIX: reply-tag the user's most-recent dice
+                        # message rather than the original /dice <amount>
+                        # command. Tagging the user's recent dice is the
+                        # natural "Bot is responding to your roll" UX and is
+                        # what the user expects in /dice <amount> mode (parity
+                        # with what they see in /dice <amount> XdX'w mode
+                        # where the bot's emoji clearly tags the user). Using
+                        # the original /dice command id made the bot's roll
+                        # land deep above the user's dice in the chat scroll,
+                        # which is what the user reported as "doesn't
+                        # actually tag the user message".
+                        command_msg_id = (update.message.message_id
+                                          if update.message else game.get('command_message_id'))
+                        try:
+                            rolls_data = await multi_roll_parallel(context, update.effective_chat.id, expected_emoji, game_rolls, reply_to_message_id=command_msg_id)
+                            for msg, _ in rolls_data:
+                                bot_rolls.append(msg.dice.value)
+                        except Exception as e:
+                            logging.error(f"Error sending dice in PvB game: {e}")
+                            await update.message.reply_text(f"{pe('cross')} An error occurred. Game terminated.")
+                            game['status'] = 'error'
+                            game.pop('bot_is_rolling', None)
+                            game.pop('waiting_for', None)
+                            context.chat_data.pop(f"active_pvb_game_{user.id}", None)
+                            if user.id in active_pvb_games:
+                                del active_pvb_games[user.id]
+                            _unindex_user_game(user.id, active_pvb_game_id)
+                            _active_cashout_buttons.pop(active_pvb_game_id, None)
+                            _cashout_refresh_last.pop(active_pvb_game_id, None)
+                            credit_wallet(user.id, game['bet_amount'])
+                            update_pnl(user.id)
+                            save_user_data(user.id)
+                            return
+                        # NOTE: keep `bot_is_rolling=True` and `waiting_for='bot'`
+                        # in place until *after* user_rolls/bot_rolls are reset
+                        # below. Clearing them here used to open a small race
+                        # window during the round-result `await reply_text`
+                        # where a spammed dice would be appended to the
+                        # still-full user_rolls list and trigger a duplicate
+                        # bot roll. The flags now act as a single "round in
+                        # progress" guard until the round is fully resolved.
+
                     game["bot_rolls"] = bot_rolls
                     bot_total = sum(bot_rolls)
                     bot_rolls_text = ROLL_SEPARATOR.join(str(r) for r in bot_rolls)
 
-                    # Store bot roll values in context for next user response
-                    context.user_data['pre_rolled_bot_values'] = bot_rolls
-                    # Now it's user's turn
-                    game['waiting_for'] = 'user'
+                    # Determine winner based on mode
+                    win = False
+                    if game_mode == "normal":
+                        # Normal mode: highest total wins
+                        win = user_total > bot_total
+                        tie = user_total == bot_total
+                    else:
+                        # Crazy mode: lowest total wins
+                        win = user_total < bot_total
+                        tie = user_total == bot_total
 
+                    round_result = {"user_rolls": user_rolls, "bot_rolls": bot_rolls,
+                                  "user_total": user_total, "bot_total": bot_total, "winner": None}
+
+                    if tie:
+                        result_text = f"{pe('push')} It's a tie! No point."
+                    elif win:
+                        game["user_score"] += 1
+                        round_result["winner"] = "user"
+                        result_text = f"{pe('win')} {username_display} wins this round!"
+                    else:
+                        game["bot_score"] += 1
+                        round_result["winner"] = "bot"
+                        result_text = f"{pe('robot')} Bot wins this round!"
+
+                    # Consolidated message showing bot rolls and winner
                     username_display = user.first_name if user.first_name else "Player"
-
-                    # GREEN cashout button based on live match-win probability
-                    _co_match_id = active_pvb_game_id
-                    _co_round = game.get('current_round', 1)
-                    _co_mult = calculate_cashout_multiplier(game, user_id=user.id)
-                    _co_keyboard = _build_pvb_cashout_keyboard(_co_match_id, _co_round, _co_mult)
-
-                    _co_sent = await update.message.reply_text(
-                        f"{pe('robot')} <b>BOT ROLLED FIRST!</b>\n\n"
-                        f"Bot rolled: [{bot_rolls_text}] = {bot_total}\n\n"
-                        f"{username_display}, Your turn! Send {game_rolls} {expected_emoji} to respond.\n"
-                        f"Or tap Cashout to collect <b>${round(game['bet_amount'] * _co_mult, 2):.2f}</b>:",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=_co_keyboard
+                    await update.message.reply_text(
+                        f"<b>{username_display.upper()} ROLLED FIRST!</b>\n\n"
+                        f"{username_display} rolled: [{user_rolls_text}] = <b>{user_total}</b>\n"
+                        f"{pe('robot')} Bot rolled: [{bot_rolls_text}] = <b>{bot_total}</b>\n\n"
+                        f"{result_text}",
+                        parse_mode=ParseMode.HTML
                     )
-                    _register_cashout_button(_co_match_id, user.id, update.effective_chat.id, _co_round,
-                                             message_id=getattr(_co_sent, 'message_id', None))
 
-                    # Schedule PvB timeout for next round
-                    if context.job_queue:
-                        _cancel_pvb_timeout_jobs(context, user.id, active_pvb_game_id)
-                        round_timeout = game.get('round_timeout', default_round_timeout)
-                        warn_time = round_timeout - 60 if round_timeout > 60 else max(5, int(round_timeout * 0.75))
-                        context.job_queue.run_once(
-                            pvb_timeout_warn_job,
-                            when=warn_time,
-                            data={'user_id': user.id, 'game_id': active_pvb_game_id, 'chat_id': update.effective_chat.id},
-                            name=f"pvb_warn_{active_pvb_game_id}"
-                        )
-                        context.job_queue.run_once(
-                            pvb_timeout_finish_job,
-                            when=round_timeout,
-                            data={'user_id': user.id, 'game_id': active_pvb_game_id, 'chat_id': update.effective_chat.id},
-                            name=f"pvb_finish_{active_pvb_game_id}"
-                        )
-                else:
-                    # User rolls first for next round - GREEN cashout available now
-                    _co_match_id = active_pvb_game_id
-                    _co_round = game.get('current_round', 1)
-                    _co_mult = calculate_cashout_multiplier(game, user_id=user.id)
-                    _co_keyboard = _build_pvb_cashout_keyboard(_co_match_id, _co_round, _co_mult)
+                game["history"].append(round_result)
+                game["current_round"] += 1
+                game['user_rolls'] = []  # Reset for next round
+                game['bot_rolls'] = []  # Reset for next round
+                # Round fully resolved — *now* it's safe to clear the
+                # "round-in-progress" guards. The next-round bot-rolls-first
+                # branch below re-sets them as needed for its own bot roll.
+                game.pop('bot_is_rolling', None)
+                game['waiting_for'] = 'user'
 
-                    _co_sent = await update.message.reply_text(
-                        f"Score: You {game['user_score']} - {game['bot_score']} Bot. (First to {game['target_score']})\n\n"
-                        f"{user.mention_html()}, <b>Your turn! Send {game_rolls} {expected_emoji}!</b>\n"
-                        f"Or tap Cashout to collect <b>${round(game['bet_amount'] * _co_mult, 2):.2f}</b>:",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=_co_keyboard
-                    )
-                    _register_cashout_button(_co_match_id, user.id, update.effective_chat.id, _co_round,
-                                             message_id=getattr(_co_sent, 'message_id', None))
+                # Check for game end
+                if game["user_score"] >= game["target_score"]:
+                    # Cancel any pending timeout
+                    _cancel_pvb_timeout_jobs(context, user.id, active_pvb_game_id)
+                    winnings = game["bet_amount"] * 1.96
+                    credit_wallet(user.id, winnings)
+                    game['status'] = 'completed'
+                    game['win'] = True
+                    # Resolve side bets - user (p1) wins
+                    asyncio.ensure_future(resolve_sidebets_for_match(active_pvb_game_id, "p1", context))
+                    await update_stats_on_bet(user.id, game['id'], game['bet_amount'], True, multiplier=1.96, context=context)
+                    # No manual sleep — AIORateLimiter already paces outbound
+                    # messages per chat. Sleeping here just stretched concurrent
+                    # PvB matches' total wall-clock time without buying anything.
+                    await update.message.reply_text(f"{pe('trophy')} {user.mention_html()}, Congratulations! You beat the bot ({game['user_score']}-{game['bot_score']}) and win ${winnings:.2f}!", parse_mode=ParseMode.HTML)
+                    context.chat_data.pop(f"active_pvb_game_{user.id}", None)
+                    if user.id in active_pvb_games:
+                        del active_pvb_games[user.id]
+                    _unindex_user_game(user.id, active_pvb_game_id)
+                    # Lifecycle cleanup: cashout button state is per-game.
+                    _active_cashout_buttons.pop(active_pvb_game_id, None)
+                    _cashout_refresh_last.pop(active_pvb_game_id, None)
+                    _game_locks.pop(active_pvb_game_id, None)
+                elif game["bot_score"] >= game["target_score"]:
+                    # Cancel any pending timeout
+                    _cancel_pvb_timeout_jobs(context, user.id, active_pvb_game_id)
+                    game['status'] = 'completed'
+                    game['win'] = False
+                    # Resolve side bets - bot (p2) wins
+                    asyncio.ensure_future(resolve_sidebets_for_match(active_pvb_game_id, "p2", context))
+                    await update_stats_on_bet(user.id, game['id'], game['bet_amount'], False, context=context)
+                    # AIORateLimiter handles per-chat pacing; manual sleep removed.
+                    await update.message.reply_text(f"{pe('lose')} {user.mention_html()}, Bot wins the match ({game['bot_score']}-{game['user_score']}). You lost {format_for_user(user.id, game['bet_amount'])}.", parse_mode=ParseMode.HTML)
+                    context.chat_data.pop(f"active_pvb_game_{user.id}", None)
+                    if user.id in active_pvb_games:
+                        del active_pvb_games[user.id]
+                    _unindex_user_game(user.id, active_pvb_game_id)
+                    # Lifecycle cleanup: cashout button state is per-game.
+                    _active_cashout_buttons.pop(active_pvb_game_id, None)
+                    _cashout_refresh_last.pop(active_pvb_game_id, None)
+                    _game_locks.pop(active_pvb_game_id, None)
+                else: # Continue game - next round
+                    # AIORateLimiter handles per-chat pacing; manual sleep removed.
 
-                    # Schedule PvB timeout for next round
-                    if context.job_queue:
-                        _cancel_pvb_timeout_jobs(context, user.id, active_pvb_game_id)
-                        round_timeout = game.get('round_timeout', default_round_timeout)
-                        warn_time = round_timeout - 60 if round_timeout > 60 else max(5, int(round_timeout * 0.75))
-                        context.job_queue.run_once(
-                            pvb_timeout_warn_job,
-                            when=warn_time,
-                            data={'user_id': user.id, 'game_id': active_pvb_game_id, 'chat_id': update.effective_chat.id},
-                            name=f"pvb_warn_{active_pvb_game_id}"
+                    if bot_rolls_first:
+                        # Bot rolls first for next round
+                        # Set flag to prevent user from rolling during bot's turn
+                        game['waiting_for'] = 'bot'
+                        game['bot_is_rolling'] = True
+
+                        await update.message.reply_text(
+                            f"Score: You {game['user_score']} - {game['bot_score']} Bot. (First to {game['target_score']})\n\n"
+                            f"<b>Bot is rolling for Round {game['current_round']}...</b>",
+                            parse_mode=ParseMode.HTML
                         )
-                        context.job_queue.run_once(
-                            pvb_timeout_finish_job,
-                            when=round_timeout,
-                            data={'user_id': user.id, 'game_id': active_pvb_game_id, 'chat_id': update.effective_chat.id},
-                            name=f"pvb_finish_{active_pvb_game_id}"
+
+                        # Bot rolls - use multi_roll_parallel for lightning-fast speed
+                        bot_rolls = []
+                        # Reply-tag the user's most-recent dice (parity with
+                        # the user-rolls-first branch above).
+                        command_msg_id = (update.message.message_id
+                                          if update.message else game.get('command_message_id'))
+                        try:
+                            rolls_data = await multi_roll_parallel(context, update.effective_chat.id, expected_emoji, game_rolls, reply_to_message_id=command_msg_id)
+                            for msg, _ in rolls_data:
+                                bot_rolls.append(msg.dice.value)
+                        except Exception as e:
+                            logging.error(f"Error sending dice in PvB game: {e}")
+                            await update.message.reply_text(f"{pe('cross')} An error occurred. Game terminated.")
+                            game['status'] = 'error'
+                            game.pop('bot_is_rolling', None)
+                            game.pop('waiting_for', None)
+                            context.chat_data.pop(f"active_pvb_game_{user.id}", None)
+                            if user.id in active_pvb_games:
+                                del active_pvb_games[user.id]
+                            _unindex_user_game(user.id, active_pvb_game_id)
+                            _active_cashout_buttons.pop(active_pvb_game_id, None)
+                            _cashout_refresh_last.pop(active_pvb_game_id, None)
+                            credit_wallet(user.id, game['bet_amount'])
+                            update_pnl(user.id)
+                            save_user_data(user.id)
+                            return
+
+                        game.pop('bot_is_rolling', None)
+                        game["bot_rolls"] = bot_rolls
+                        bot_total = sum(bot_rolls)
+                        bot_rolls_text = ROLL_SEPARATOR.join(str(r) for r in bot_rolls)
+
+                        # Store bot roll values in context for next user response
+                        context.user_data['pre_rolled_bot_values'] = bot_rolls
+                        # Now it's user's turn
+                        game['waiting_for'] = 'user'
+
+                        username_display = user.first_name if user.first_name else "Player"
+
+                        # GREEN cashout button based on live match-win probability
+                        _co_match_id = active_pvb_game_id
+                        _co_round = game.get('current_round', 1)
+                        _co_mult = calculate_cashout_multiplier(game, user_id=user.id)
+                        _co_keyboard = _build_pvb_cashout_keyboard(_co_match_id, _co_round, _co_mult)
+
+                        _co_sent = await update.message.reply_text(
+                            f"{pe('robot')} <b>BOT ROLLED FIRST!</b>\n\n"
+                            f"Bot rolled: [{bot_rolls_text}] = {bot_total}\n\n"
+                            f"{username_display}, Your turn! Send {game_rolls} {expected_emoji} to respond.\n"
+                            f"Or tap Cashout to collect <b>${round(game['bet_amount'] * _co_mult, 2):.2f}</b>:",
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=_co_keyboard
                         )
-            update_pnl(user.id)
-            save_user_data(user.id)
-            return  # Return only after processing PvB game emoji
+                        _register_cashout_button(_co_match_id, user.id, update.effective_chat.id, _co_round,
+                                                 message_id=getattr(_co_sent, 'message_id', None))
+
+                        # Schedule PvB timeout for next round
+                        if context.job_queue:
+                            _cancel_pvb_timeout_jobs(context, user.id, active_pvb_game_id)
+                            round_timeout = game.get('round_timeout', default_round_timeout)
+                            warn_time = round_timeout - 60 if round_timeout > 60 else max(5, int(round_timeout * 0.75))
+                            context.job_queue.run_once(
+                                pvb_timeout_warn_job,
+                                when=warn_time,
+                                data={'user_id': user.id, 'game_id': active_pvb_game_id, 'chat_id': update.effective_chat.id},
+                                name=f"pvb_warn_{active_pvb_game_id}"
+                            )
+                            context.job_queue.run_once(
+                                pvb_timeout_finish_job,
+                                when=round_timeout,
+                                data={'user_id': user.id, 'game_id': active_pvb_game_id, 'chat_id': update.effective_chat.id},
+                                name=f"pvb_finish_{active_pvb_game_id}"
+                            )
+                    else:
+                        # User rolls first for next round - GREEN cashout available now
+                        _co_match_id = active_pvb_game_id
+                        _co_round = game.get('current_round', 1)
+                        _co_mult = calculate_cashout_multiplier(game, user_id=user.id)
+                        _co_keyboard = _build_pvb_cashout_keyboard(_co_match_id, _co_round, _co_mult)
+
+                        _co_sent = await update.message.reply_text(
+                            f"Score: You {game['user_score']} - {game['bot_score']} Bot. (First to {game['target_score']})\n\n"
+                            f"{user.mention_html()}, <b>Your turn! Send {game_rolls} {expected_emoji}!</b>\n"
+                            f"Or tap Cashout to collect <b>${round(game['bet_amount'] * _co_mult, 2):.2f}</b>:",
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=_co_keyboard
+                        )
+                        _register_cashout_button(_co_match_id, user.id, update.effective_chat.id, _co_round,
+                                                 message_id=getattr(_co_sent, 'message_id', None))
+
+                        # Schedule PvB timeout for next round
+                        if context.job_queue:
+                            _cancel_pvb_timeout_jobs(context, user.id, active_pvb_game_id)
+                            round_timeout = game.get('round_timeout', default_round_timeout)
+                            warn_time = round_timeout - 60 if round_timeout > 60 else max(5, int(round_timeout * 0.75))
+                            context.job_queue.run_once(
+                                pvb_timeout_warn_job,
+                                when=warn_time,
+                                data={'user_id': user.id, 'game_id': active_pvb_game_id, 'chat_id': update.effective_chat.id},
+                                name=f"pvb_warn_{active_pvb_game_id}"
+                            )
+                            context.job_queue.run_once(
+                                pvb_timeout_finish_job,
+                                when=round_timeout,
+                                data={'user_id': user.id, 'game_id': active_pvb_game_id, 'chat_id': update.effective_chat.id},
+                                name=f"pvb_finish_{active_pvb_game_id}"
+                            )
+                update_pnl(user.id)
+                save_user_data(user.id)
+                return  # Return only after processing PvB game emoji
 
     # Check and prompt helper bots in groups (when emoji game is detected)
     if update.message.dice and update.effective_chat and update.effective_chat.type in ["group", "supergroup"]:
@@ -1132,290 +1160,305 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not match_data:
                     continue
                 if (match_data.get("chat_id") == chat_id and match_data.get("status") == 'active' and user.id in match_data.get("players", [])):
-                    # Silently swallow user dice that arrive while the bot is
-                    # rolling — same rationale as the PvB block above. Without
-                    # this, spamming dice during multi_roll_parallel triggers
-                    # overlapping round resolutions.
-                    if match_data.get("bot_is_rolling"):
-                        return
-                    # Auto-index for subsequent rolls on the fast path.
-                    if not _indexed_ids:
-                        _index_user_game(user.id, match_id)
-                    if DEBUG_EMOJI_GAMES:
-                        logging.info(f"PVP MATCH FOUND: match_id={match_id}, type={match_data.get('game_type')}, players={match_data.get('players')}, points={match_data.get('points')}")
-
-                    # Extract game type properly - handle pvp_, group_challenge_, xdxw_ prefixes
-                    raw_game_type = match_data.get("game_type", "pvp_dice")
-                    gtype = raw_game_type.replace("pvp_", "").replace("group_challenge_", "").replace("xdxw_", "")
-                    players = match_data["players"]
-                    game_rolls = match_data.get("game_rolls", 1)
-                    game_mode = match_data.get("game_mode", "normal")
-
-                    # Initialize player_rolls if not exists
-                    if "player_rolls" not in match_data:
-                        match_data["player_rolls"] = {players[0]: [], players[1]: []}
-
-                    last_roller = match_data.get("last_roller")
-
-                    # Check turn order
-                    if last_roller is None:
-                        if user.id != players[0]:
-                            await update.message.reply_text("It's not your turn yet! Host should roll first.")
+                    # CONCURRENCY FIX: per-game asyncio.Lock — same
+                    # race as the PvB block above.  Two near-simultaneous
+                    # dice messages for the same match both pass the
+                    # turn-order / `bot_is_rolling` gate before either
+                    # appends to `match_data['player_rolls']`, producing
+                    # duplicated user rolls and double bot rolls.
+                    async with _get_game_lock(match_id):
+                        # Re-read match state inside the lock — a prior
+                        # handler may have completed the round / cleared
+                        # the match while we were waiting to acquire.
+                        match_data = game_sessions.get(match_id)
+                        if (not match_data
+                                or match_data.get('status') != 'active'
+                                or user.id not in match_data.get('players', [])):
                             return
-                    elif user.id == last_roller:
-                        # Check if current player has completed all rolls
-                        if len(match_data["player_rolls"][user.id]) < game_rolls:
-                            # Allow more rolls
-                            pass
-                        else:
-                            await update.message.reply_text("Wait for your opponent to roll next.")
+                        # Silently swallow user dice that arrive while the bot is
+                        # rolling — same rationale as the PvB block above. Without
+                        # this, spamming dice during multi_roll_parallel triggers
+                        # overlapping round resolutions.
+                        if match_data.get("bot_is_rolling"):
                             return
-                    else:
-                        # Other player's turn, check if they've started rolling
-                        if len(match_data["player_rolls"][user.id]) > 0 and len(match_data["player_rolls"][user.id]) < game_rolls:
-                            # Allow continuing rolls
-                            pass
-                        else:
-                            # Not this player's turn
-                            other_id = [pid for pid in players if pid != user.id][0]
-                            if len(match_data["player_rolls"][other_id]) < game_rolls:
-                                await update.message.reply_text("Wait for your opponent to complete their rolls.")
+                        # Auto-index for subsequent rolls on the fast path.
+                        if not _indexed_ids:
+                            _index_user_game(user.id, match_id)
+                        if DEBUG_EMOJI_GAMES:
+                            logging.info(f"PVP MATCH FOUND: match_id={match_id}, type={match_data.get('game_type')}, players={match_data.get('players')}, points={match_data.get('points')}")
+
+                        # Extract game type properly - handle pvp_, group_challenge_, xdxw_ prefixes
+                        raw_game_type = match_data.get("game_type", "pvp_dice")
+                        gtype = raw_game_type.replace("pvp_", "").replace("group_challenge_", "").replace("xdxw_", "")
+                        players = match_data["players"]
+                        game_rolls = match_data.get("game_rolls", 1)
+                        game_mode = match_data.get("game_mode", "normal")
+
+                        # Initialize player_rolls if not exists
+                        if "player_rolls" not in match_data:
+                            match_data["player_rolls"] = {players[0]: [], players[1]: []}
+
+                        last_roller = match_data.get("last_roller")
+
+                        # Check turn order
+                        if last_roller is None:
+                            if user.id != players[0]:
+                                await update.message.reply_text("It's not your turn yet! Host should roll first.")
                                 return
-
-                    allowed_emojis = {"dice": "🎲", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
-                    if emoji != allowed_emojis.get(gtype, "🎲"):
-                        await update.message.reply_text(f"Only {allowed_emojis.get(gtype)} emoji allowed for this match!")
-                        return
-
-                    # Add roll to player's rolls
-                    match_data["player_rolls"][user.id].append(dice_obj.value)
-                    match_data["last_roller"] = user.id
-
-                    # Check if player has completed their rolls
-                    current_player_rolls = len(match_data["player_rolls"][user.id])
-                    if current_player_rolls < game_rolls:
-                        # Don't send spam messages - user knows to send more rolls
-                        return
-
-                    # Check if both players have completed their rolls
-                    p1, p2 = players
-                    p1_rolls = match_data["player_rolls"].get(p1, [])
-                    p2_rolls = match_data["player_rolls"].get(p2, [])
-
-                    # Check if playing against bot (opponent_id == 0)
-                    is_bot_game = match_data.get("opponent_id") == 0
-
-                    if is_bot_game and user.id == p1 and len(p1_rolls) == game_rolls and len(p2_rolls) < game_rolls:
-                        # User (host) completed rolls, now bot should roll using multi_roll_parallel.
-                        # Set both bot_is_rolling and waiting_for so any other handler
-                        # that re-enters during the await silently skips additional dice.
-                        match_data['bot_is_rolling'] = True
-                        match_data['waiting_for'] = 'bot'
-                        # PERFORMANCE: dropped the asyncio.sleep(1) +
-                        # "Bot is rolling..." ack reply. With
-                        # AIORateLimiter that ack is a third
-                        # message-per-round serialised on the chat's
-                        # rate window before the bot's actual dice can
-                        # land — and the bot's dice that immediately
-                        # follows is itself a clear "bot is rolling"
-                        # indicator. Same change has already been made
-                        # in the PvB block; this brings the PvP-vs-bot
-                        # path to parity.
-
-                        bot_rolls = []
-                        # Reply-tag the user's most-recent dice rather
-                        # than the original /dice <amount> command
-                        # (parity with PvB block above and natural UX).
-                        command_msg_id = (update.message.message_id
-                                          if update.message else match_data.get('command_message_id'))
-                        try:
-                            rolls_data = await multi_roll_parallel(context, chat_id, dice_obj.emoji, game_rolls, reply_to_message_id=command_msg_id)
-                            for msg, _ in rolls_data:
-                                bot_rolls.append(msg.dice.value)
-                        except Exception as e:
-                            logging.error(f"Error sending bot dice in PvP game: {e}")
-                            bot_rolls = [0] * game_rolls  # Fallback
-
-                        match_data["player_rolls"][p2] = bot_rolls
-                        p2_rolls = bot_rolls
-                        # NOTE: defer clearing bot_is_rolling /
-                        # waiting_for until after match_data["player_rolls"]
-                        # is reset below — same race-window fix as the
-                        # PvB block. Otherwise a dice the user spams
-                        # during the round-result `await reply_text`
-                        # could append onto the still-full p1_rolls list
-                        # and trigger a duplicate bot roll.
-
-                    if len(p1_rolls) == game_rolls and len(p2_rolls) == game_rolls:
-                        # Both players completed, calculate results
-                        p1_total = sum(p1_rolls)
-                        p2_total = sum(p2_rolls)
-
-                        p1_rolls_text = " + ".join(str(r) for r in p1_rolls)
-                        p2_rolls_text = " + ".join(str(r) for r in p2_rolls)
-
-                        # Safely get usernames with fallbacks
-                        p1_username = match_data.get('usernames', {}).get(p1, f"Player {p1}")
-                        p2_username = match_data.get('usernames', {}).get(p2, f"Player {p2}")
-                        # Don't show @ for Bot
-                        p1_display = p1_username if p1 == 0 else display_at(p1_username)
-                        p2_display = p2_username if p2 == 0 else display_at(p2_username)
-                        p1_mention = f'<a href="tg://user?id={p1}">{p1_display}</a>'
-                        p2_mention = f'<a href="tg://user?id={p2}">{p2_display}</a>'
-
-                        text = f"<b>{p1_username.upper()} ROLLED FIRST!</b>\n"
-                        text += f"{p1_mention} rolled: [{p1_rolls_text}] = <b>{p1_total}</b>\n"
-                        text += f"{p2_mention} rolled: [{p2_rolls_text}] = <b>{p2_total}</b>\n\n"
-
-                        winner_id, extra_info = None, ""
-
-                        # DEBUG: Log scoring details
-                        if DEBUG_EMOJI_GAMES:
-                            logging.info(f"SCORING: match_id={match_id}, mode={game_mode}, p1={p1}, p2={p2}, p1_total={p1_total}, p2_total={p2_total}, points_before={match_data.get('points')}")
-
-                        # Determine winner based on mode
-                        if game_mode == "normal":
-                            # Normal mode: highest total wins
-                            if p1_total > p2_total:
-                                winner_id = p1
-                            elif p2_total > p1_total:
-                                winner_id = p2
+                        elif user.id == last_roller:
+                            # Check if current player has completed all rolls
+                            if len(match_data["player_rolls"][user.id]) < game_rolls:
+                                # Allow more rolls
+                                pass
                             else:
-                                extra_info = "🤝 It's a tie! No points this round."
+                                await update.message.reply_text("Wait for your opponent to roll next.")
+                                return
                         else:
-                            # Crazy mode: lowest total wins
-                            if p1_total < p2_total:
-                                winner_id = p1
-                            elif p2_total < p1_total:
-                                winner_id = p2
+                            # Other player's turn, check if they've started rolling
+                            if len(match_data["player_rolls"][user.id]) > 0 and len(match_data["player_rolls"][user.id]) < game_rolls:
+                                # Allow continuing rolls
+                                pass
                             else:
-                                extra_info = "🤝 It's a tie! No points this round."
+                                # Not this player's turn
+                                other_id = [pid for pid in players if pid != user.id][0]
+                                if len(match_data["player_rolls"][other_id]) < game_rolls:
+                                    await update.message.reply_text("Wait for your opponent to complete their rolls.")
+                                    return
 
-                        if DEBUG_EMOJI_GAMES:
-                            logging.info(f"WINNER: winner_id={winner_id}, extra_info={extra_info}")
+                        allowed_emojis = {"dice": "🎲", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
+                        if emoji != allowed_emojis.get(gtype, "🎲"):
+                            await update.message.reply_text(f"Only {allowed_emojis.get(gtype)} emoji allowed for this match!")
+                            return
 
-                        if winner_id is not None:
+                        # Add roll to player's rolls
+                        match_data["player_rolls"][user.id].append(dice_obj.value)
+                        match_data["last_roller"] = user.id
+
+                        # Check if player has completed their rolls
+                        current_player_rolls = len(match_data["player_rolls"][user.id])
+                        if current_player_rolls < game_rolls:
+                            # Don't send spam messages - user knows to send more rolls
+                            return
+
+                        # Check if both players have completed their rolls
+                        p1, p2 = players
+                        p1_rolls = match_data["player_rolls"].get(p1, [])
+                        p2_rolls = match_data["player_rolls"].get(p2, [])
+
+                        # Check if playing against bot (opponent_id == 0)
+                        is_bot_game = match_data.get("opponent_id") == 0
+
+                        if is_bot_game and user.id == p1 and len(p1_rolls) == game_rolls and len(p2_rolls) < game_rolls:
+                            # User (host) completed rolls, now bot should roll using multi_roll_parallel.
+                            # Set both bot_is_rolling and waiting_for so any other handler
+                            # that re-enters during the await silently skips additional dice.
+                            match_data['bot_is_rolling'] = True
+                            match_data['waiting_for'] = 'bot'
+                            # PERFORMANCE: dropped the asyncio.sleep(1) +
+                            # "Bot is rolling..." ack reply. With
+                            # AIORateLimiter that ack is a third
+                            # message-per-round serialised on the chat's
+                            # rate window before the bot's actual dice can
+                            # land — and the bot's dice that immediately
+                            # follows is itself a clear "bot is rolling"
+                            # indicator. Same change has already been made
+                            # in the PvB block; this brings the PvP-vs-bot
+                            # path to parity.
+
+                            bot_rolls = []
+                            # Reply-tag the user's most-recent dice rather
+                            # than the original /dice <amount> command
+                            # (parity with PvB block above and natural UX).
+                            command_msg_id = (update.message.message_id
+                                              if update.message else match_data.get('command_message_id'))
                             try:
-                                # Ensure points dict has both players
+                                rolls_data = await multi_roll_parallel(context, chat_id, dice_obj.emoji, game_rolls, reply_to_message_id=command_msg_id)
+                                for msg, _ in rolls_data:
+                                    bot_rolls.append(msg.dice.value)
+                            except Exception as e:
+                                logging.error(f"Error sending bot dice in PvP game: {e}")
+                                bot_rolls = [0] * game_rolls  # Fallback
+
+                            match_data["player_rolls"][p2] = bot_rolls
+                            p2_rolls = bot_rolls
+                            # NOTE: defer clearing bot_is_rolling /
+                            # waiting_for until after match_data["player_rolls"]
+                            # is reset below — same race-window fix as the
+                            # PvB block. Otherwise a dice the user spams
+                            # during the round-result `await reply_text`
+                            # could append onto the still-full p1_rolls list
+                            # and trigger a duplicate bot roll.
+
+                        if len(p1_rolls) == game_rolls and len(p2_rolls) == game_rolls:
+                            # Both players completed, calculate results
+                            p1_total = sum(p1_rolls)
+                            p2_total = sum(p2_rolls)
+
+                            p1_rolls_text = " + ".join(str(r) for r in p1_rolls)
+                            p2_rolls_text = " + ".join(str(r) for r in p2_rolls)
+
+                            # Safely get usernames with fallbacks
+                            p1_username = match_data.get('usernames', {}).get(p1, f"Player {p1}")
+                            p2_username = match_data.get('usernames', {}).get(p2, f"Player {p2}")
+                            # Don't show @ for Bot
+                            p1_display = p1_username if p1 == 0 else display_at(p1_username)
+                            p2_display = p2_username if p2 == 0 else display_at(p2_username)
+                            p1_mention = f'<a href="tg://user?id={p1}">{p1_display}</a>'
+                            p2_mention = f'<a href="tg://user?id={p2}">{p2_display}</a>'
+
+                            text = f"<b>{p1_username.upper()} ROLLED FIRST!</b>\n"
+                            text += f"{p1_mention} rolled: [{p1_rolls_text}] = <b>{p1_total}</b>\n"
+                            text += f"{p2_mention} rolled: [{p2_rolls_text}] = <b>{p2_total}</b>\n\n"
+
+                            winner_id, extra_info = None, ""
+
+                            # DEBUG: Log scoring details
+                            if DEBUG_EMOJI_GAMES:
+                                logging.info(f"SCORING: match_id={match_id}, mode={game_mode}, p1={p1}, p2={p2}, p1_total={p1_total}, p2_total={p2_total}, points_before={match_data.get('points')}")
+
+                            # Determine winner based on mode
+                            if game_mode == "normal":
+                                # Normal mode: highest total wins
+                                if p1_total > p2_total:
+                                    winner_id = p1
+                                elif p2_total > p1_total:
+                                    winner_id = p2
+                                else:
+                                    extra_info = "🤝 It's a tie! No points this round."
+                            else:
+                                # Crazy mode: lowest total wins
+                                if p1_total < p2_total:
+                                    winner_id = p1
+                                elif p2_total < p1_total:
+                                    winner_id = p2
+                                else:
+                                    extra_info = "🤝 It's a tie! No points this round."
+
+                            if DEBUG_EMOJI_GAMES:
+                                logging.info(f"WINNER: winner_id={winner_id}, extra_info={extra_info}")
+
+                            if winner_id is not None:
+                                try:
+                                    # Ensure points dict has both players
+                                    if p1 not in match_data.get("points", {}):
+                                        match_data.setdefault("points", {})[p1] = 0
+                                    if p2 not in match_data.get("points", {}):
+                                        match_data.setdefault("points", {})[p2] = 0
+                                    match_data["points"][winner_id] += 1
+                                    winner_username = match_data.get('usernames', {}).get(winner_id, f'Player {winner_id}')
+                                    winner_mention = f'<a href="tg://user?id={winner_id}">{display_at(winner_username)}</a>'
+                                    text += f"{pe('win')} {winner_mention} wins this round!"
+                                    if DEBUG_EMOJI_GAMES:
+                                        logging.info(f"POINTS_UPDATED: {match_data['points']}")
+                                except Exception as e:
+                                    logging.error(f"Error updating points: winner_id={winner_id}, error={e}")
+                                    text += f"{pe('warning')} Error updating score"
+                            else:
+                                text += extra_info
+
+                            try:
+                                # Ensure points dict has both players for display
                                 if p1 not in match_data.get("points", {}):
                                     match_data.setdefault("points", {})[p1] = 0
                                 if p2 not in match_data.get("points", {}):
                                     match_data.setdefault("points", {})[p2] = 0
-                                match_data["points"][winner_id] += 1
-                                winner_username = match_data.get('usernames', {}).get(winner_id, f'Player {winner_id}')
-                                winner_mention = f'<a href="tg://user?id={winner_id}">{display_at(winner_username)}</a>'
-                                text += f"{pe('win')} {winner_mention} wins this round!"
-                                if DEBUG_EMOJI_GAMES:
-                                    logging.info(f"POINTS_UPDATED: {match_data['points']}")
+                                text += f"\n\n<b>Score:</b> {p1_mention} {match_data['points'][p1]} - {match_data['points'][p2]} {p2_mention}"
                             except Exception as e:
-                                logging.error(f"Error updating points: winner_id={winner_id}, error={e}")
-                                text += f"{pe('warning')} Error updating score"
+                                logging.error(f"Error displaying score: p1={p1}, p2={p2}, error={e}")
+                                text += f"\n\n<b>Score:</b> Error displaying score"
+
+                            target = match_data.get("target_points", match_data.get("target_score", 1))
+                            final_winner = None
+                            # Ensure points dict exists before checking
+                            if match_data.get("points"):
+                                if match_data["points"].get(p1, 0) >= target: final_winner = p1
+                                elif match_data["points"].get(p2, 0) >= target: final_winner = p2
+
+                            # Round fully resolved — clear the bot-rolling guards
+                            # before anything that awaits, so legitimate next-round
+                            # dice are accepted but late-arriving spam from the
+                            # current round (already rejected by the new
+                            # `len(player_rolls) >= game_rolls` check above)
+                            # cannot trigger a duplicate bot roll. Same
+                            # race-window fix as the PvB block.
+                            match_data.pop('bot_is_rolling', None)
+                            match_data['waiting_for'] = 'user'
+
+                            if final_winner is not None:
+                                loser_id = p2 if final_winner == p1 else p1
+                                match_data.update({"status": "completed", "winner_id": final_winner})
+
+                                # Resolve side bets for this match
+                                winner_index = "p1" if final_winner == p1 else "p2"
+                                asyncio.ensure_future(resolve_sidebets_for_match(match_id, winner_index, context))
+
+                                # Use bet_amount_usd if available, otherwise bet_amount
+                                bet_amount = match_data.get("bet_amount_usd", match_data.get("bet_amount", 0))
+                                winnings = bet_amount * 1.94  # 1.94x multiplier
+
+                                # Credit winner (only if not bot)
+                                if final_winner != 0:  # 0 = Bot
+                                    credit_wallet(final_winner, winnings)
+                                    await update_stats_on_bet(final_winner, match_id, bet_amount, True, pvp_win=True, multiplier=1.94, context=context)
+                                    update_pnl(final_winner)
+                                    save_user_data(final_winner)
+                                    # Add to player history
+                                    if 'game_sessions' not in user_stats[final_winner]:
+                                        user_stats[final_winner]['game_sessions'] = []
+                                    user_stats[final_winner]['game_sessions'].append(match_id)
+
+                                # Update loser stats (only if not bot)
+                                if loser_id != 0:  # 0 = Bot
+                                    await update_stats_on_bet(loser_id, match_id, bet_amount, False, context=context)
+                                    update_pnl(loser_id)
+                                    save_user_data(loser_id)
+                                    # Add to player history
+                                    if 'game_sessions' not in user_stats[loser_id]:
+                                        user_stats[loser_id]['game_sessions'] = []
+                                    user_stats[loser_id]['game_sessions'].append(match_id)
+
+                                final_winner_username = match_data.get('usernames', {}).get(final_winner, f"Player {final_winner}")
+                                final_winner_mention = f'<a href="tg://user?id={final_winner}">{display_at(final_winner_username)}</a>'
+                                text += f"\n\n{pe('trophy')} <b>{final_winner_mention} wins the match and earns ${winnings:.2f}!</b>"
+                                # Emoji-game match messages are no longer pinned.
+                            else:
+                                match_data["last_roller"] = None
+                                match_data["player_rolls"] = {p1: [], p2: []}  # Reset rolls for next round
+                                text += f"\n\n<b>Next round:</b> {p1_mention} rolls first! ({allowed_emojis[gtype]} emoji)"
+
+                            await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
+                            # Cancel any pending PvP timeout jobs since round was resolved
+                            _cancel_pvp_timeout_jobs(context, match_id)
+                            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
                         else:
-                            text += extra_info
-
-                        try:
-                            # Ensure points dict has both players for display
-                            if p1 not in match_data.get("points", {}):
-                                match_data.setdefault("points", {})[p1] = 0
-                            if p2 not in match_data.get("points", {}):
-                                match_data.setdefault("points", {})[p2] = 0
-                            text += f"\n\n<b>Score:</b> {p1_mention} {match_data['points'][p1]} - {match_data['points'][p2]} {p2_mention}"
-                        except Exception as e:
-                            logging.error(f"Error displaying score: p1={p1}, p2={p2}, error={e}")
-                            text += f"\n\n<b>Score:</b> Error displaying score"
-
-                        target = match_data.get("target_points", match_data.get("target_score", 1))
-                        final_winner = None
-                        # Ensure points dict exists before checking
-                        if match_data.get("points"):
-                            if match_data["points"].get(p1, 0) >= target: final_winner = p1
-                            elif match_data["points"].get(p2, 0) >= target: final_winner = p2
-
-                        # Round fully resolved — clear the bot-rolling guards
-                        # before anything that awaits, so legitimate next-round
-                        # dice are accepted but late-arriving spam from the
-                        # current round (already rejected by the new
-                        # `len(player_rolls) >= game_rolls` check above)
-                        # cannot trigger a duplicate bot roll. Same
-                        # race-window fix as the PvB block.
-                        match_data.pop('bot_is_rolling', None)
-                        match_data['waiting_for'] = 'user'
-
-                        if final_winner is not None:
-                            loser_id = p2 if final_winner == p1 else p1
-                            match_data.update({"status": "completed", "winner_id": final_winner})
-
-                            # Resolve side bets for this match
-                            winner_index = "p1" if final_winner == p1 else "p2"
-                            asyncio.ensure_future(resolve_sidebets_for_match(match_id, winner_index, context))
-
-                            # Use bet_amount_usd if available, otherwise bet_amount
-                            bet_amount = match_data.get("bet_amount_usd", match_data.get("bet_amount", 0))
-                            winnings = bet_amount * 1.94  # 1.94x multiplier
-
-                            # Credit winner (only if not bot)
-                            if final_winner != 0:  # 0 = Bot
-                                credit_wallet(final_winner, winnings)
-                                await update_stats_on_bet(final_winner, match_id, bet_amount, True, pvp_win=True, multiplier=1.94, context=context)
-                                update_pnl(final_winner)
-                                save_user_data(final_winner)
-                                # Add to player history
-                                if 'game_sessions' not in user_stats[final_winner]:
-                                    user_stats[final_winner]['game_sessions'] = []
-                                user_stats[final_winner]['game_sessions'].append(match_id)
-
-                            # Update loser stats (only if not bot)
-                            if loser_id != 0:  # 0 = Bot
-                                await update_stats_on_bet(loser_id, match_id, bet_amount, False, context=context)
-                                update_pnl(loser_id)
-                                save_user_data(loser_id)
-                                # Add to player history
-                                if 'game_sessions' not in user_stats[loser_id]:
-                                    user_stats[loser_id]['game_sessions'] = []
-                                user_stats[loser_id]['game_sessions'].append(match_id)
-
-                            final_winner_username = match_data.get('usernames', {}).get(final_winner, f"Player {final_winner}")
-                            final_winner_mention = f'<a href="tg://user?id={final_winner}">{display_at(final_winner_username)}</a>'
-                            text += f"\n\n{pe('trophy')} <b>{final_winner_mention} wins the match and earns ${winnings:.2f}!</b>"
-                            # Emoji-game match messages are no longer pinned.
-                        else:
-                            match_data["last_roller"] = None
-                            match_data["player_rolls"] = {p1: [], p2: []}  # Reset rolls for next round
-                            text += f"\n\n<b>Next round:</b> {p1_mention} rolls first! ({allowed_emojis[gtype]} emoji)"
-
-                        await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
-                        # Cancel any pending PvP timeout jobs since round was resolved
-                        _cancel_pvp_timeout_jobs(context, match_id)
-                        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
-                    else:
-                        other_id = [pid for pid in players if pid != user.id][0]
-                        other_rolls = len(match_data["player_rolls"].get(other_id, []))
-                        # Safely get username with fallback
-                        other_username = match_data.get('usernames', {}).get(other_id, f"Player {other_id}")
-                        if other_rolls == 0:
-                            await asyncio.sleep(1)
-                            await update.message.reply_text(f"Your rolls complete! Waiting for {other_username} to start rolling.")
-                            # Schedule PvP timeout (only for real PvP, not PvB with bot)
-                            if not is_bot_game and context.job_queue:
-                                _cancel_pvp_timeout_jobs(context, match_id)
-                                round_timeout = match_data.get('round_timeout', default_round_timeout)
-                                warn_time = round_timeout - 60 if round_timeout > 60 else max(5, int(round_timeout * 0.75))
-                                context.job_queue.run_once(
-                                    pvp_timeout_warn_job,
-                                    when=warn_time,
-                                    data={'match_id': match_id, 'chat_id': chat_id, 'waiting_user_id': other_id, 'rolling_user_id': user.id},
-                                    name=f"pvp_warn_{match_id}"
-                                )
-                                context.job_queue.run_once(
-                                    pvp_timeout_finish_job,
-                                    when=round_timeout,
-                                    data={'match_id': match_id, 'chat_id': chat_id, 'rolling_user_id': user.id},
-                                    name=f"pvp_finish_{match_id}"
-                                )
-                        elif other_rolls < game_rolls:
-                            await asyncio.sleep(1)
-                            await update.message.reply_text(f"Your rolls complete! Waiting for {other_username} to finish ({other_rolls}/{game_rolls} done).")
-                    return
+                            other_id = [pid for pid in players if pid != user.id][0]
+                            other_rolls = len(match_data["player_rolls"].get(other_id, []))
+                            # Safely get username with fallback
+                            other_username = match_data.get('usernames', {}).get(other_id, f"Player {other_id}")
+                            if other_rolls == 0:
+                                await asyncio.sleep(1)
+                                await update.message.reply_text(f"Your rolls complete! Waiting for {other_username} to start rolling.")
+                                # Schedule PvP timeout (only for real PvP, not PvB with bot)
+                                if not is_bot_game and context.job_queue:
+                                    _cancel_pvp_timeout_jobs(context, match_id)
+                                    round_timeout = match_data.get('round_timeout', default_round_timeout)
+                                    warn_time = round_timeout - 60 if round_timeout > 60 else max(5, int(round_timeout * 0.75))
+                                    context.job_queue.run_once(
+                                        pvp_timeout_warn_job,
+                                        when=warn_time,
+                                        data={'match_id': match_id, 'chat_id': chat_id, 'waiting_user_id': other_id, 'rolling_user_id': user.id},
+                                        name=f"pvp_warn_{match_id}"
+                                    )
+                                    context.job_queue.run_once(
+                                        pvp_timeout_finish_job,
+                                        when=round_timeout,
+                                        data={'match_id': match_id, 'chat_id': chat_id, 'rolling_user_id': user.id},
+                                        name=f"pvp_finish_{match_id}"
+                                    )
+                            elif other_rolls < game_rolls:
+                                await asyncio.sleep(1)
+                                await update.message.reply_text(f"Your rolls complete! Waiting for {other_username} to finish ({other_rolls}/{game_rolls} done).")
+                        return
         except Exception as e:
             logging.error(f"Error in PvP game handling: {e}", exc_info=True)
             await update.message.reply_text(f"{pe('cross')} An error occurred processing your roll. Please contact support.")
