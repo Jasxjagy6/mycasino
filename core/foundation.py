@@ -30,7 +30,24 @@ import os
 
 from dotenv import load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+# Load .env from the repository root (the directory that contains bot.py and
+# core/).  The monolith historically resolved this from its own __file__,
+# which sat at the repo root — after the bot was split into core/foundation.py
+# the same expression started resolving to <repo>/core/.env, which silently
+# left BOT_TOKEN and every other secret unset on production boxes that follow
+# the documented `cp .env.example .env` placement.  Resolve to the parent
+# directory so the documented placement actually works, and fall back to the
+# old core/.env path for anyone who already worked around the bug.
+_DOTENV_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env'
+)
+_DOTENV_LEGACY = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+# Allow operators to point at an explicit file (e.g. /etc/mycasino/bot.env).
+_DOTENV_OVERRIDE = os.environ.get('MYCASINO_DOTENV')
+if _DOTENV_OVERRIDE:
+    load_dotenv(_DOTENV_OVERRIDE)
+load_dotenv(_DOTENV_ROOT)
+load_dotenv(_DOTENV_LEGACY)
 
 # Repo root: the directory containing bot.py / core/.  This used to be
 # hard-coded to '/root/7' which broke any deployment that wasn't sitting
