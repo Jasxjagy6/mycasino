@@ -227,10 +227,17 @@ def create_hash(server_seed, client_seed, nonce):
     return hashlib.sha256(combined.encode()).hexdigest()
 
 def get_provably_fair_result(server_seed, client_seed, nonce, max_value):
-    hash_result = create_hash(server_seed, client_seed, nonce)
-    # Convert first 8 characters of hash to integer
-    hex_value = int(hash_result[:8], 16)
-    return (hex_value % max_value)
+    """Unbiased integer draw in ``[0, max_value)``.
+
+    Phase 3 — routes to :func:`core.fair_rng.draw_uniform_int` which
+    uses rejection sampling, so outcomes are uniform even when
+    ``max_value`` does not divide 2**32 (the legacy modulo path was
+    biased by ~1.5% on the mines tile range ``n=25``).  The function
+    signature is unchanged, so every existing game call site picks up
+    the fix without further edits.
+    """
+    from core.fair_rng import draw_uniform_int
+    return draw_uniform_int(server_seed, client_seed, nonce, max_value)
 
 def get_user_seeds(user_id):
     """Get user's current seeds and nonce - ensures seeds are initialized and saved"""
