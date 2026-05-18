@@ -160,221 +160,222 @@ async def keno_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = parts[1]
         game_id = parts[2]
 
-        game = game_sessions.get(game_id)
-        if not game or game["user_id"] != query.from_user.id:
-            await query.answer("This is not your game!", show_alert=True)
-            return
-
-        if action == "pick":
-            if game["status"] != "selecting":
-                await query.answer("Game already completed!", show_alert=True)
+        async with _get_game_lock(game_id):
+            game = game_sessions.get(game_id)
+            if not game or game["user_id"] != query.from_user.id:
+                await query.answer("This is not your game!", show_alert=True)
                 return
 
-            number = int(parts[3])
-            selected = game["selected_numbers"]
-
-            if number in selected:
-                selected.remove(number)
-            else:
-                if len(selected) >= 10:
-                    await query.answer("Maximum 10 numbers allowed!", show_alert=True)
+            if action == "pick":
+                if game["status"] != "selecting":
+                    await query.answer("Game already completed!", show_alert=True)
                     return
-                selected.append(number)
 
-            text = (
-                f"{pe('target')} <b>KENO GAME</b>\n"
-                f"────────\n\n"
-                f"{pe('chart')} <b>Game Status:</b>\n"
-                f"• Numbers Selected: {len(selected)}/10\n"
-                f"• Bet Amount: ${game['bet_amount']:.2f}\n\n"
-                f"📝 <b>Instructions:</b>\n"
-                f"Pick 1 to 10 numbers from the grid below."
-            )
+                number = int(parts[3])
+                selected = game["selected_numbers"]
 
-            keyboard = create_keno_keyboard(game_id, selected)
-            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                if number in selected:
+                    selected.remove(number)
+                else:
+                    if len(selected) >= 10:
+                        await query.answer("Maximum 10 numbers allowed!", show_alert=True)
+                        return
+                    selected.append(number)
 
-        elif action == "clear":
-            game["selected_numbers"] = []
-            text = (
-                f"{pe('target')} <b>KENO GAME</b>\n"
-                f"────────\n\n"
-                f"{pe('chart')} <b>Game Status:</b>\n"
-                f"• Numbers Selected: 0/10\n"
-                f"• Bet Amount: ${game['bet_amount']:.2f}\n\n"
-                f"📝 <b>Instructions:</b>\n"
-                f"Pick 1 to 10 numbers from the grid below."
-            )
-            keyboard = create_keno_keyboard(game_id, [])
-            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
-        elif action == "info":
-            info_text = (
-                "ℹ️ <b>HOW TO PLAY KENO</b>\n\n"
-                "1️⃣ Select 1-10 numbers from 1-40\n"
-                "2️⃣ Click 'Place Bet' when ready\n"
-                "3️⃣ 10 random numbers will be drawn\n"
-                "4️⃣ Win based on matches!\n\n"
-                "<b>Tips:</b>\n"
-                "• More picks = higher potential payout\n"
-                "• But also need more matches to win\n"
-                "• Check payout table for details"
-            )
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"keno_back_{game_id}")]])
-            await query.edit_message_text(info_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
-        elif action == "payout":
-            payout_text = get_keno_payout_text()
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"keno_back_{game_id}")]])
-            await query.edit_message_text(payout_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
-        elif action == "back":
-            selected = game["selected_numbers"]
-            text = (
-                f"{pe('target')} <b>KENO GAME</b>\n"
-                f"────────\n\n"
-                f"{pe('chart')} <b>Game Status:</b>\n"
-                f"• Numbers Selected: {len(selected)}/10\n"
-                f"• Bet Amount: ${game['bet_amount']:.2f}\n\n"
-                f"📝 <b>Instructions:</b>\n"
-                f"Pick 1 to 10 numbers from the grid below."
-            )
-            keyboard = create_keno_keyboard(game_id, selected)
-            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
-        elif action == "place":
-            selected = game["selected_numbers"]
-            if not selected:
-                await query.answer("Please select at least 1 number!", show_alert=True)
-                return
-
-            # ATOMIC balance check + deduct to prevent race conditions
-            try:
-                crypto_deducted, coin = await deduct_wallet_safe(game["user_id"], game["bet_amount"])
-            except ValueError:
-                await query.answer("Insufficient balance.", show_alert=True)
-                return
-            save_user_data(game["user_id"])
-
-            # Use provably fair generation for keno with fresh game client seed (like mines)
-            seeds = get_user_seeds(game["user_id"])
-            current_nonce = seeds["nonce"]
-            increment_user_nonce(game["user_id"])
-
-            # Generate fresh client seed for this specific game
-            game_client_seed = generate_game_client_seed()
-
-            # Generate keno numbers using provably fair method
-            drawn_numbers = generate_keno_numbers(seeds["server_seed"], game_client_seed, current_nonce, 10)
-
-            # Calculate matches
-            matches = len(set(selected) & set(drawn_numbers))
-            num_picks = len(selected)
-
-            # Get multiplier
-            multiplier = KENO_PAYOUTS.get(num_picks, {}).get(matches, 0.0)
-
-            if multiplier > 0:
-                winnings = game["bet_amount"] * multiplier
-                credit_wallet(game["user_id"], winnings)
-                profit = winnings - game["bet_amount"]
-                win = True
-            else:
-                winnings = 0
-                profit = -game["bet_amount"]
-                win = False
-
-            # Update game - store the game-specific client seed for provably fair verification
-            game["status"] = "completed"
-            game["drawn_numbers"] = drawn_numbers
-            game["matches"] = matches
-            game["multiplier"] = multiplier
-            game["server_seed"] = seeds["server_seed"]
-            game["client_seed"] = game_client_seed  # Store fresh game client seed
-            game["nonce"] = current_nonce
-            game["win"] = win
-
-            # Update stats
-            await update_stats_on_bet(game["user_id"], game_id, game["bet_amount"], win, multiplier=multiplier, context=context)
-            update_pnl(game["user_id"])
-            save_user_data(game["user_id"])
-
-            # Format result
-            selected_str = ", ".join(str(n) for n in sorted(selected))
-            drawn_str = ", ".join(str(n) for n in sorted(drawn_numbers))
-            matched_str = ", ".join(str(n) for n in sorted(set(selected) & set(drawn_numbers)))
-
-            result_text = (
-                f"{pe('target')} <b>KENO RESULT</b>\n"
-                f"────────────────\n\n"
-                f"{pe('pin')} <b>Your Numbers:</b> {selected_str}\n"
-                f"{pe('dice')} <b>Drawn Numbers:</b> {drawn_str}\n"
-                f"{pe('check')} <b>Matches:</b> {matches}/{num_picks}\n"
-            )
-
-            if matched_str:
-                result_text += f"{pe('win')} <b>Matched:</b> {matched_str}\n"
-
-            result_text += "\n"
-
-            if win:
-                result_text += (
-                    f"{pe('win')} <b>YOU WIN!</b>\n"
-                    f"{pe('money')} Multiplier: {multiplier}x\n"
-                    f"{pe('balance')} Profit: {dformat(profit)}\n"
-                    f"{pe('withdraw')} Total Payout: {dformat(winnings)}\n"
-                )
-            else:
-                result_text += (
-                    f"{pe('cross')} <b>NO WIN</b>\n"
-                    f"{pe('withdraw')} Lost: ${game['bet_amount']:.2f}\n"
-                    f"Better luck next time!"
+                text = (
+                    f"{pe('target')} <b>KENO GAME</b>\n"
+                    f"────────\n\n"
+                    f"{pe('chart')} <b>Game Status:</b>\n"
+                    f"• Numbers Selected: {len(selected)}/10\n"
+                    f"• Bet Amount: ${game['bet_amount']:.2f}\n\n"
+                    f"📝 <b>Instructions:</b>\n"
+                    f"Pick 1 to 10 numbers from the grid below."
                 )
 
-            result_text += f"\n<b>Game ID:</b> <code>{game_id}</code>"
+                keyboard = create_keno_keyboard(game_id, selected)
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-            # Store provably fair record
-            store_provably_fair_record(game_id, "keno", game["server_seed"], game["client_seed"], game["nonce"],
-                                       result_data=f"Matches: {matches}/{num_picks}, Drawn: {drawn_numbers}")
-
-            # Send template
-            keno_user = game["user_id"]
-            keno_user_obj = await context.bot.get_chat(keno_user)
-            username = f"@{keno_user_obj.username}" if keno_user_obj.username else f"User{keno_user}"
-            template = _render_keno_sync(
-                username=username,
-                bet_amount=game["bet_amount"],
-                selected_numbers=list(selected),
-                drawn_numbers=list(drawn_numbers),
-                matches=matches,
-                num_picks=num_picks,
-                won=win,
-                multiplier=multiplier,
-                winnings=winnings,
-                game_id=game_id,
-            )
-            selected_str_callback = ",".join(str(n) for n in sorted(selected))
-            pf_button = await create_provably_fair_button(game_id, context)
-            rebet_btn = apply_button_style(InlineKeyboardButton("Rebet", callback_data=f"keno_rebet_{game['bet_amount']}_{selected_str_callback}_{game['user_id']}"), 'primary')
-            double_btn = apply_button_style(InlineKeyboardButton("Double", callback_data=f"keno_double_{game['bet_amount']}_{selected_str_callback}_{game['user_id']}"), 'success')
-            kb = InlineKeyboardMarkup([[rebet_btn, double_btn], [pf_button]])
-
-            if win:
-                caption = f"{pe('win')} <b>YOU WIN!</b>\n{pe('money')} Multiplier: {multiplier}x\n{pe('balance')} Profit: {dformat(profit)}\n{pe('withdraw')} Total Payout: {dformat(winnings)}\n<b>Game ID:</b> <code>{game_id}</code>"
-            else:
-                caption = f"{pe('cross')} <b>NO WIN</b>\n{pe('withdraw')} Lost: ${game['bet_amount']:.2f}\nBetter luck next time!\n<b>Game ID:</b> <code>{game_id}</code>"
-
-            if template:
-                await query.edit_message_media(
-                    InputMediaPhoto(template, caption=caption, parse_mode=ParseMode.HTML),
-                    reply_markup=kb
+            elif action == "clear":
+                game["selected_numbers"] = []
+                text = (
+                    f"{pe('target')} <b>KENO GAME</b>\n"
+                    f"────────\n\n"
+                    f"{pe('chart')} <b>Game Status:</b>\n"
+                    f"• Numbers Selected: 0/10\n"
+                    f"• Bet Amount: ${game['bet_amount']:.2f}\n\n"
+                    f"📝 <b>Instructions:</b>\n"
+                    f"Pick 1 to 10 numbers from the grid below."
                 )
-            else:
-                await query.edit_message_text(caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+                keyboard = create_keno_keyboard(game_id, [])
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-        elif action == "cancel":
-            game["status"] = "cancelled"
-            await query.edit_message_text(f"{pe('cross')} Keno game cancelled.", parse_mode=ParseMode.HTML)
+            elif action == "info":
+                info_text = (
+                    "ℹ️ <b>HOW TO PLAY KENO</b>\n\n"
+                    "1️⃣ Select 1-10 numbers from 1-40\n"
+                    "2️⃣ Click 'Place Bet' when ready\n"
+                    "3️⃣ 10 random numbers will be drawn\n"
+                    "4️⃣ Win based on matches!\n\n"
+                    "<b>Tips:</b>\n"
+                    "• More picks = higher potential payout\n"
+                    "• But also need more matches to win\n"
+                    "• Check payout table for details"
+                )
+                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"keno_back_{game_id}")]])
+                await query.edit_message_text(info_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+            elif action == "payout":
+                payout_text = get_keno_payout_text()
+                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"keno_back_{game_id}")]])
+                await query.edit_message_text(payout_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+            elif action == "back":
+                selected = game["selected_numbers"]
+                text = (
+                    f"{pe('target')} <b>KENO GAME</b>\n"
+                    f"────────\n\n"
+                    f"{pe('chart')} <b>Game Status:</b>\n"
+                    f"• Numbers Selected: {len(selected)}/10\n"
+                    f"• Bet Amount: ${game['bet_amount']:.2f}\n\n"
+                    f"📝 <b>Instructions:</b>\n"
+                    f"Pick 1 to 10 numbers from the grid below."
+                )
+                keyboard = create_keno_keyboard(game_id, selected)
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+            elif action == "place":
+                selected = game["selected_numbers"]
+                if not selected:
+                    await query.answer("Please select at least 1 number!", show_alert=True)
+                    return
+
+                # ATOMIC balance check + deduct to prevent race conditions
+                try:
+                    crypto_deducted, coin = await deduct_wallet_safe(game["user_id"], game["bet_amount"])
+                except ValueError:
+                    await query.answer("Insufficient balance.", show_alert=True)
+                    return
+                save_user_data(game["user_id"])
+
+                # Use provably fair generation for keno with fresh game client seed (like mines)
+                seeds = get_user_seeds(game["user_id"])
+                current_nonce = seeds["nonce"]
+                increment_user_nonce(game["user_id"])
+
+                # Generate fresh client seed for this specific game
+                game_client_seed = generate_game_client_seed()
+
+                # Generate keno numbers using provably fair method
+                drawn_numbers = generate_keno_numbers(seeds["server_seed"], game_client_seed, current_nonce, 10)
+
+                # Calculate matches
+                matches = len(set(selected) & set(drawn_numbers))
+                num_picks = len(selected)
+
+                # Get multiplier
+                multiplier = KENO_PAYOUTS.get(num_picks, {}).get(matches, 0.0)
+
+                if multiplier > 0:
+                    winnings = game["bet_amount"] * multiplier
+                    credit_wallet(game["user_id"], winnings)
+                    profit = winnings - game["bet_amount"]
+                    win = True
+                else:
+                    winnings = 0
+                    profit = -game["bet_amount"]
+                    win = False
+
+                # Update game - store the game-specific client seed for provably fair verification
+                game["status"] = "completed"
+                game["drawn_numbers"] = drawn_numbers
+                game["matches"] = matches
+                game["multiplier"] = multiplier
+                game["server_seed"] = seeds["server_seed"]
+                game["client_seed"] = game_client_seed  # Store fresh game client seed
+                game["nonce"] = current_nonce
+                game["win"] = win
+
+                # Update stats
+                await update_stats_on_bet(game["user_id"], game_id, game["bet_amount"], win, multiplier=multiplier, context=context)
+                update_pnl(game["user_id"])
+                save_user_data(game["user_id"])
+
+                # Format result
+                selected_str = ", ".join(str(n) for n in sorted(selected))
+                drawn_str = ", ".join(str(n) for n in sorted(drawn_numbers))
+                matched_str = ", ".join(str(n) for n in sorted(set(selected) & set(drawn_numbers)))
+
+                result_text = (
+                    f"{pe('target')} <b>KENO RESULT</b>\n"
+                    f"────────────────\n\n"
+                    f"{pe('pin')} <b>Your Numbers:</b> {selected_str}\n"
+                    f"{pe('dice')} <b>Drawn Numbers:</b> {drawn_str}\n"
+                    f"{pe('check')} <b>Matches:</b> {matches}/{num_picks}\n"
+                )
+
+                if matched_str:
+                    result_text += f"{pe('win')} <b>Matched:</b> {matched_str}\n"
+
+                result_text += "\n"
+
+                if win:
+                    result_text += (
+                        f"{pe('win')} <b>YOU WIN!</b>\n"
+                        f"{pe('money')} Multiplier: {multiplier}x\n"
+                        f"{pe('balance')} Profit: {dformat(profit)}\n"
+                        f"{pe('withdraw')} Total Payout: {dformat(winnings)}\n"
+                    )
+                else:
+                    result_text += (
+                        f"{pe('cross')} <b>NO WIN</b>\n"
+                        f"{pe('withdraw')} Lost: ${game['bet_amount']:.2f}\n"
+                        f"Better luck next time!"
+                    )
+
+                result_text += f"\n<b>Game ID:</b> <code>{game_id}</code>"
+
+                # Store provably fair record
+                store_provably_fair_record(game_id, "keno", game["server_seed"], game["client_seed"], game["nonce"],
+                                           result_data=f"Matches: {matches}/{num_picks}, Drawn: {drawn_numbers}")
+
+                # Send template
+                keno_user = game["user_id"]
+                keno_user_obj = await context.bot.get_chat(keno_user)
+                username = f"@{keno_user_obj.username}" if keno_user_obj.username else f"User{keno_user}"
+                template = _render_keno_sync(
+                    username=username,
+                    bet_amount=game["bet_amount"],
+                    selected_numbers=list(selected),
+                    drawn_numbers=list(drawn_numbers),
+                    matches=matches,
+                    num_picks=num_picks,
+                    won=win,
+                    multiplier=multiplier,
+                    winnings=winnings,
+                    game_id=game_id,
+                )
+                selected_str_callback = ",".join(str(n) for n in sorted(selected))
+                pf_button = await create_provably_fair_button(game_id, context)
+                rebet_btn = apply_button_style(InlineKeyboardButton("Rebet", callback_data=f"keno_rebet_{game['bet_amount']}_{selected_str_callback}_{game['user_id']}"), 'primary')
+                double_btn = apply_button_style(InlineKeyboardButton("Double", callback_data=f"keno_double_{game['bet_amount']}_{selected_str_callback}_{game['user_id']}"), 'success')
+                kb = InlineKeyboardMarkup([[rebet_btn, double_btn], [pf_button]])
+
+                if win:
+                    caption = f"{pe('win')} <b>YOU WIN!</b>\n{pe('money')} Multiplier: {multiplier}x\n{pe('balance')} Profit: {dformat(profit)}\n{pe('withdraw')} Total Payout: {dformat(winnings)}\n<b>Game ID:</b> <code>{game_id}</code>"
+                else:
+                    caption = f"{pe('cross')} <b>NO WIN</b>\n{pe('withdraw')} Lost: ${game['bet_amount']:.2f}\nBetter luck next time!\n<b>Game ID:</b> <code>{game_id}</code>"
+
+                if template:
+                    await query.edit_message_media(
+                        InputMediaPhoto(template, caption=caption, parse_mode=ParseMode.HTML),
+                        reply_markup=kb
+                    )
+                else:
+                    await query.edit_message_text(caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+            elif action == "cancel":
+                game["status"] = "cancelled"
+                await query.edit_message_text(f"{pe('cross')} Keno game cancelled.", parse_mode=ParseMode.HTML)
     finally:
         _release_callback(query.id)
 

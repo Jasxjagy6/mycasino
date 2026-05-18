@@ -493,390 +493,391 @@ async def blackjack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         game_id = parts[2]
         hand_index_for_callback = None
 
-    game = game_sessions.get(game_id)
+    async with _get_game_lock(game_id):
+        game = game_sessions.get(game_id)
 
-    if not game:
-        await query.edit_message_text("Game not found or already finished.")
-        return
-
-    # Game interaction security - only the game owner can interact
-    if user.id != game.get('user_id'):
-        await query.answer("This is not your game!", show_alert=True)
-        return
-
-    if game.get('status') != 'active':
-        await query.edit_message_text("This game is already finished.")
-        return
-
-    bot_uname = context.bot.username or "Casino"
-
-    if action == "hit":
-        card = game["deck"].pop()
-        game["player_hand"].append(card)
-        player_value = calculate_hand_value(game["player_hand"])
-
-        if player_value > 21:
-            game["status"] = 'completed'
-            game["win"] = False
-            increment_user_nonce(user.id)
-            await update_stats_on_bet(user.id, game_id, game["bet_amount"], False, context=context)
-            update_pnl(user.id)
-            save_user_data(user.id)
-
-            # Store provably fair record
-            store_provably_fair_record(game_id, "blackjack", game["server_seed"], game["client_seed"], game["nonce"],
-                                       result_data=f"Player busted: {player_value}")
-
-            # Add provably fair button
-            keyboard = [[await create_provably_fair_button(game_id, context)]]
-
-            bj_image = await async_generate_bj_image(
-                player_hand=game["player_hand"],
-                dealer_hand=game["dealer_hand"],
-                show_dealer_hole=False,
-                player_value=player_value,
-                player_username=user.username,
-                bet_amount=game["bet_amount"],
-                bot_username=bot_uname,
-                player_profile_pic=await _get_cached_profile_picture(context, user.id),
-                result_text="Bust!",
-                result_color=BJ_LOSE_COLOR,
-            )
-            caption = (
-                f"{pe('bust')} <b>Bust!</b> — ID: <code>{game_id}</code>\n"
-                f"You lose {pe('cross')} ${game['bet_amount']:.2f}"
-            )
-            await query.edit_message_media(
-                media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        elif player_value == 21:
-            await handle_dealer_turn(query, context, game_id, bot_uname)
-        else:
-            # Continue game
-            bj_image = await async_generate_bj_image(
-                player_hand=game["player_hand"],
-                dealer_hand=game["dealer_hand"],
-                show_dealer_hole=False,
-                player_value=player_value,
-                player_username=user.username,
-                bet_amount=game["bet_amount"],
-                bot_username=bot_uname,
-                player_profile_pic=await _get_cached_profile_picture(context, user.id),
-            )
-            keyboard_buttons = [
-                [apply_button_style(InlineKeyboardButton("Hit", callback_data=f"bj_hit_{game_id}"), 'success', peb('hit')),
-                 apply_button_style(InlineKeyboardButton("Stand", callback_data=f"bj_stand_{game_id}"), 'danger', peb('stand'))]
-            ]
-            caption = (
-                f"{pe('cards')} <b>Blackjack</b> — ID: <code>{game_id}</code>\n"
-                f"{pe('money')} Bet: ${game['bet_amount']:.2f}"
-            )
-            await query.edit_message_media(
-                media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
-                reply_markup=InlineKeyboardMarkup(keyboard_buttons)
-            )
-
-    elif action == "stand":
-        await handle_dealer_turn(query, context, game_id, bot_uname)
-
-    elif action == "double":
-        if get_active_balance_usd(user.id) < game["bet_amount"]:
-            # Show alert with deposit option
-            await query.answer(f"{pe('cross')} Not enough balance to double down!", show_alert=True)
-            # Edit message to show back button
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Back to Game", callback_data=f"bj_continue_{game_id}")]
-            ])
-            await query.edit_message_text(
-                f"{pe('cross')} You don't have enough balance to double down.\n\n"
-                f"Required: ${game['bet_amount']:.2f}\n"
-                f"Your balance: ${get_active_balance_usd(user.id):.2f}\n\n"
-                f"Please deposit to continue.",
-                reply_markup=keyboard,
-                parse_mode=ParseMode.HTML
-            )
+        if not game:
+            await query.edit_message_text("Game not found or already finished.")
             return
 
-        try:
-            await deduct_wallet_safe(user.id, game["bet_amount"])
-        except ValueError:
-            await query.answer("Insufficient balance for double down!", show_alert=True)
+        # Game interaction security - only the game owner can interact
+        if user.id != game.get('user_id'):
+            await query.answer("This is not your game!", show_alert=True)
             return
-        game["bet_amount"] *= 2
-        game["doubled"] = True
-        save_user_data(user.id)
 
-        card = game["deck"].pop()
-        game["player_hand"].append(card)
-        player_value = calculate_hand_value(game["player_hand"])
+        if game.get('status') != 'active':
+            await query.edit_message_text("This game is already finished.")
+            return
 
-        if player_value > 21:
-            game["status"] = 'completed'
-            game["win"] = False
-            increment_user_nonce(user.id)
-            # On double down loss, the original bet amount is what's recorded for stats
-            await update_stats_on_bet(user.id, game_id, game["bet_amount"]/2, False, context=context)
-            update_pnl(user.id)
-            save_user_data(user.id)
+        bot_uname = context.bot.username or "Casino"
 
-            # Store provably fair record
-            store_provably_fair_record(game_id, "blackjack", game["server_seed"], game["client_seed"], game["nonce"],
-                                       result_data=f"Double down - Player busted: {player_value}")
+        if action == "hit":
+            card = game["deck"].pop()
+            game["player_hand"].append(card)
+            player_value = calculate_hand_value(game["player_hand"])
 
-            # Add provably fair button
-            keyboard = [[await create_provably_fair_button(game_id, context)]]
+            if player_value > 21:
+                game["status"] = 'completed'
+                game["win"] = False
+                increment_user_nonce(user.id)
+                await update_stats_on_bet(user.id, game_id, game["bet_amount"], False, context=context)
+                update_pnl(user.id)
+                save_user_data(user.id)
 
-            bj_image = await async_generate_bj_image(
-                player_hand=game["player_hand"],
-                dealer_hand=game["dealer_hand"],
-                show_dealer_hole=False,
-                player_value=player_value,
-                player_username=user.username,
-                bet_amount=game["bet_amount"],
-                bot_username=bot_uname,
-                player_profile_pic=await _get_cached_profile_picture(context, user.id),
-                result_text="Bust!",
-                result_color=BJ_LOSE_COLOR,
-            )
-            caption = (
-                f"{pe('bust')} <b>Bust! (Doubled Down)</b> — ID: <code>{game_id}</code>\n"
-                f"You lose {pe('cross')} ${game['bet_amount']:.2f}"
-            )
-            await query.edit_message_media(
-                media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        else:
+                # Store provably fair record
+                store_provably_fair_record(game_id, "blackjack", game["server_seed"], game["client_seed"], game["nonce"],
+                                           result_data=f"Player busted: {player_value}")
+
+                # Add provably fair button
+                keyboard = [[await create_provably_fair_button(game_id, context)]]
+
+                bj_image = await async_generate_bj_image(
+                    player_hand=game["player_hand"],
+                    dealer_hand=game["dealer_hand"],
+                    show_dealer_hole=False,
+                    player_value=player_value,
+                    player_username=user.username,
+                    bet_amount=game["bet_amount"],
+                    bot_username=bot_uname,
+                    player_profile_pic=await _get_cached_profile_picture(context, user.id),
+                    result_text="Bust!",
+                    result_color=BJ_LOSE_COLOR,
+                )
+                caption = (
+                    f"{pe('bust')} <b>Bust!</b> — ID: <code>{game_id}</code>\n"
+                    f"You lose {pe('cross')} ${game['bet_amount']:.2f}"
+                )
+                await query.edit_message_media(
+                    media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            elif player_value == 21:
+                await handle_dealer_turn(query, context, game_id, bot_uname)
+            else:
+                # Continue game
+                bj_image = await async_generate_bj_image(
+                    player_hand=game["player_hand"],
+                    dealer_hand=game["dealer_hand"],
+                    show_dealer_hole=False,
+                    player_value=player_value,
+                    player_username=user.username,
+                    bet_amount=game["bet_amount"],
+                    bot_username=bot_uname,
+                    player_profile_pic=await _get_cached_profile_picture(context, user.id),
+                )
+                keyboard_buttons = [
+                    [apply_button_style(InlineKeyboardButton("Hit", callback_data=f"bj_hit_{game_id}"), 'success', peb('hit')),
+                     apply_button_style(InlineKeyboardButton("Stand", callback_data=f"bj_stand_{game_id}"), 'danger', peb('stand'))]
+                ]
+                caption = (
+                    f"{pe('cards')} <b>Blackjack</b> — ID: <code>{game_id}</code>\n"
+                    f"{pe('money')} Bet: ${game['bet_amount']:.2f}"
+                )
+                await query.edit_message_media(
+                    media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
+                    reply_markup=InlineKeyboardMarkup(keyboard_buttons)
+                )
+
+        elif action == "stand":
             await handle_dealer_turn(query, context, game_id, bot_uname)
 
-    elif action == "continue":
-        # Continue/back button - show current game state
-        if game.get('split'):
-            # Split game - show current active hand
-            split_hands = game['split_hands']
-            split_bets = game['split_bets']
-            current_hand_index = game.get('current_hand_index', 0)
-            current_hand = split_hands[current_hand_index]
-            current_bet = split_bets[current_hand_index]
-            hand_value = calculate_hand_value(current_hand)
+        elif action == "double":
+            if get_active_balance_usd(user.id) < game["bet_amount"]:
+                # Show alert with deposit option
+                await query.answer(f"{pe('cross')} Not enough balance to double down!", show_alert=True)
+                # Edit message to show back button
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Back to Game", callback_data=f"bj_continue_{game_id}")]
+                ])
+                await query.edit_message_text(
+                    f"{pe('cross')} You don't have enough balance to double down.\n\n"
+                    f"Required: ${game['bet_amount']:.2f}\n"
+                    f"Your balance: ${get_active_balance_usd(user.id):.2f}\n\n"
+                    f"Please deposit to continue.",
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML
+                )
+                return
 
+            try:
+                await deduct_wallet_safe(user.id, game["bet_amount"])
+            except ValueError:
+                await query.answer("Insufficient balance for double down!", show_alert=True)
+                return
+            game["bet_amount"] *= 2
+            game["doubled"] = True
+            save_user_data(user.id)
+
+            card = game["deck"].pop()
+            game["player_hand"].append(card)
+            player_value = calculate_hand_value(game["player_hand"])
+
+            if player_value > 21:
+                game["status"] = 'completed'
+                game["win"] = False
+                increment_user_nonce(user.id)
+                # On double down loss, the original bet amount is what's recorded for stats
+                await update_stats_on_bet(user.id, game_id, game["bet_amount"]/2, False, context=context)
+                update_pnl(user.id)
+                save_user_data(user.id)
+
+                # Store provably fair record
+                store_provably_fair_record(game_id, "blackjack", game["server_seed"], game["client_seed"], game["nonce"],
+                                           result_data=f"Double down - Player busted: {player_value}")
+
+                # Add provably fair button
+                keyboard = [[await create_provably_fair_button(game_id, context)]]
+
+                bj_image = await async_generate_bj_image(
+                    player_hand=game["player_hand"],
+                    dealer_hand=game["dealer_hand"],
+                    show_dealer_hole=False,
+                    player_value=player_value,
+                    player_username=user.username,
+                    bet_amount=game["bet_amount"],
+                    bot_username=bot_uname,
+                    player_profile_pic=await _get_cached_profile_picture(context, user.id),
+                    result_text="Bust!",
+                    result_color=BJ_LOSE_COLOR,
+                )
+                caption = (
+                    f"{pe('bust')} <b>Bust! (Doubled Down)</b> — ID: <code>{game_id}</code>\n"
+                    f"You lose {pe('cross')} ${game['bet_amount']:.2f}"
+                )
+                await query.edit_message_media(
+                    media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            else:
+                await handle_dealer_turn(query, context, game_id, bot_uname)
+
+        elif action == "continue":
+            # Continue/back button - show current game state
+            if game.get('split'):
+                # Split game - show current active hand
+                split_hands = game['split_hands']
+                split_bets = game['split_bets']
+                current_hand_index = game.get('current_hand_index', 0)
+                current_hand = split_hands[current_hand_index]
+                current_bet = split_bets[current_hand_index]
+                hand_value = calculate_hand_value(current_hand)
+
+                bj_image = await async_generate_bj_image(
+                    player_hand=current_hand,
+                    dealer_hand=game['dealer_hand'],
+                    show_dealer_hole=False,
+                    player_value=hand_value,
+                    player_username=user.username,
+                    bet_amount=sum(split_bets),
+                    bot_username=bot_uname,
+                    player_profile_pic=await _get_cached_profile_picture(context, user.id),
+                    split_hands=split_hands,
+                    split_active_hand=current_hand_index,
+                    split_bets=split_bets,
+                    split_results=game.get('split_results', []),
+                )
+
+                keyboard_buttons = [
+                    [apply_button_style(InlineKeyboardButton("Hit", callback_data=f"bj_split_hit_{game_id}_{current_hand_index}"), 'success', peb('hit')),
+                     apply_button_style(InlineKeyboardButton("Stand", callback_data=f"bj_split_stand_{game_id}_{current_hand_index}"), 'danger', peb('stand'))]
+                ]
+                if len(current_hand) == 2 and get_active_balance_usd(user.id) >= current_bet:
+                    keyboard_buttons.append([apply_button_style(InlineKeyboardButton("Double", callback_data=f"bj_split_double_{game_id}_{current_hand_index}"), 'primary', peb('double'))])
+
+                caption = (
+                    f"{pe('cards')} <b>Blackjack - Split</b> — ID: <code>{game_id}</code>\n"
+                    f"{pe('money')} Bet per hand: ${current_bet:.2f}\n"
+                    f"Playing Hand {current_hand_index + 1} of {len(split_hands)}"
+                )
+                await query.edit_message_media(
+                    media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
+                    reply_markup=InlineKeyboardMarkup(keyboard_buttons)
+                )
+            else:
+                # Regular game
+                player_value = calculate_hand_value(game['player_hand'])
+                bj_image = await async_generate_bj_image(
+                    player_hand=game['player_hand'],
+                    dealer_hand=game['dealer_hand'],
+                    show_dealer_hole=False,
+                    player_value=player_value,
+                    player_username=user.username,
+                    bet_amount=game['bet_amount'],
+                    bot_username=bot_uname,
+                    player_profile_pic=await _get_cached_profile_picture(context, user.id),
+                )
+                keyboard_buttons = [
+                    [apply_button_style(InlineKeyboardButton("Hit", callback_data=f"bj_hit_{game_id}"), 'success', peb('hit')),
+                     apply_button_style(InlineKeyboardButton("Stand", callback_data=f"bj_stand_{game_id}"), 'danger', peb('stand'))]
+                ]
+                if len(game['player_hand']) == 2 and get_active_balance_usd(user.id) >= game['bet_amount']:
+                    keyboard_buttons.append([apply_button_style(InlineKeyboardButton("Double Down", callback_data=f"bj_double_{game_id}"), 'primary', peb('double'))])
+                if can_split_hand(game['player_hand']) and get_active_balance_usd(user.id) >= game['bet_amount']:
+                    keyboard_buttons.append([apply_button_style(InlineKeyboardButton("Split", callback_data=f"bj_split_{game_id}"), 'primary', peb('deal'))])
+
+                caption = (
+                    f"{pe('cards')} <b>Blackjack</b> — ID: <code>{game_id}</code>\n"
+                    f"{pe('money')} Bet: ${game['bet_amount']:.2f}"
+                )
+                await query.edit_message_media(
+                    media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
+                    reply_markup=InlineKeyboardMarkup(keyboard_buttons)
+                )
+
+        elif action == "split":
+            # Split feature - only allowed on initial 2-card hand with matching rank values
+            if not can_split_hand(game["player_hand"]):
+                await query.answer("Cannot split this hand!", show_alert=True)
+                return
+
+            # Check balance for split (need to match original bet)
+            original_bet = game["bet_amount"]
+            if get_active_balance_usd(user.id) < original_bet:
+                await query.answer(f"{pe('cross')} Not enough balance to split!", show_alert=True)
+                return
+
+            # Deduct the split bet atomically
+            try:
+                await deduct_wallet_safe(user.id, original_bet)
+            except ValueError:
+                await query.answer("Insufficient balance for split!", show_alert=True)
+                return
+            save_user_data(user.id)
+
+            # Create two separate hands from the split
+            first_card = game["player_hand"][0]
+            second_card = game["player_hand"][1]
+
+            # Deal one card to each hand
+            third_card = game["deck"].pop()
+            fourth_card = game["deck"].pop()
+
+            hand1 = [first_card, third_card]
+            hand2 = [second_card, fourth_card]
+
+            # Store split hands in game state
+            game["split"] = True
+            game["split_hands"] = [hand1, hand2]
+            game["split_bets"] = [original_bet, original_bet]  # Each hand has the original bet
+            game["current_hand_index"] = 0  # Start with first hand
+            game["split_results"] = []  # Will store results for each hand
+
+            # Show split image with both hands, highlighting active hand (hand 1)
             bj_image = await async_generate_bj_image(
-                player_hand=current_hand,
-                dealer_hand=game['dealer_hand'],
+                player_hand=hand1,
+                dealer_hand=game["dealer_hand"],
                 show_dealer_hole=False,
-                player_value=hand_value,
+                player_value=calculate_hand_value(hand1),
                 player_username=user.username,
-                bet_amount=sum(split_bets),
+                bet_amount=original_bet * 2,
                 bot_username=bot_uname,
                 player_profile_pic=await _get_cached_profile_picture(context, user.id),
-                split_hands=split_hands,
-                split_active_hand=current_hand_index,
-                split_bets=split_bets,
-                split_results=game.get('split_results', []),
+                split_hands=[hand1, hand2],
+                split_active_hand=0,
+                split_bets=[original_bet, original_bet],
+                split_results=[],
             )
 
             keyboard_buttons = [
-                [apply_button_style(InlineKeyboardButton("Hit", callback_data=f"bj_split_hit_{game_id}_{current_hand_index}"), 'success', peb('hit')),
-                 apply_button_style(InlineKeyboardButton("Stand", callback_data=f"bj_split_stand_{game_id}_{current_hand_index}"), 'danger', peb('stand'))]
+                [apply_button_style(InlineKeyboardButton("Hit", callback_data=f"bj_split_hit_{game_id}_0"), 'success', peb('hit')),
+                 apply_button_style(InlineKeyboardButton("Stand", callback_data=f"bj_split_stand_{game_id}_0"), 'danger', peb('stand'))]
             ]
-            if len(current_hand) == 2 and get_active_balance_usd(user.id) >= current_bet:
-                keyboard_buttons.append([apply_button_style(InlineKeyboardButton("Double", callback_data=f"bj_split_double_{game_id}_{current_hand_index}"), 'primary', peb('double'))])
+            # Can double on split hand if only 2 cards and has balance
+            if len(hand1) == 2 and get_active_balance_usd(user.id) >= original_bet:
+                keyboard_buttons.append([apply_button_style(InlineKeyboardButton("Double", callback_data=f"bj_split_double_{game_id}_0"), 'primary', peb('double'))])
 
             caption = (
                 f"{pe('cards')} <b>Blackjack - Split</b> — ID: <code>{game_id}</code>\n"
-                f"{pe('money')} Bet per hand: ${current_bet:.2f}\n"
-                f"Playing Hand {current_hand_index + 1} of {len(split_hands)}"
-            )
-            await query.edit_message_media(
-                media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
-                reply_markup=InlineKeyboardMarkup(keyboard_buttons)
-            )
-        else:
-            # Regular game
-            player_value = calculate_hand_value(game['player_hand'])
-            bj_image = await async_generate_bj_image(
-                player_hand=game['player_hand'],
-                dealer_hand=game['dealer_hand'],
-                show_dealer_hole=False,
-                player_value=player_value,
-                player_username=user.username,
-                bet_amount=game['bet_amount'],
-                bot_username=bot_uname,
-                player_profile_pic=await _get_cached_profile_picture(context, user.id),
-            )
-            keyboard_buttons = [
-                [apply_button_style(InlineKeyboardButton("Hit", callback_data=f"bj_hit_{game_id}"), 'success', peb('hit')),
-                 apply_button_style(InlineKeyboardButton("Stand", callback_data=f"bj_stand_{game_id}"), 'danger', peb('stand'))]
-            ]
-            if len(game['player_hand']) == 2 and get_active_balance_usd(user.id) >= game['bet_amount']:
-                keyboard_buttons.append([apply_button_style(InlineKeyboardButton("Double Down", callback_data=f"bj_double_{game_id}"), 'primary', peb('double'))])
-            if can_split_hand(game['player_hand']) and get_active_balance_usd(user.id) >= game['bet_amount']:
-                keyboard_buttons.append([apply_button_style(InlineKeyboardButton("Split", callback_data=f"bj_split_{game_id}"), 'primary', peb('deal'))])
-
-            caption = (
-                f"{pe('cards')} <b>Blackjack</b> — ID: <code>{game_id}</code>\n"
-                f"{pe('money')} Bet: ${game['bet_amount']:.2f}"
+                f"{pe('money')} Bet per hand: ${original_bet:.2f}\n"
+                f"Playing Hand 1 of 2"
             )
             await query.edit_message_media(
                 media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
                 reply_markup=InlineKeyboardMarkup(keyboard_buttons)
             )
 
-    elif action == "split":
-        # Split feature - only allowed on initial 2-card hand with matching rank values
-        if not can_split_hand(game["player_hand"]):
-            await query.answer("Cannot split this hand!", show_alert=True)
-            return
+        elif action == "split_hit":
+            # Handle hit on split hand: bj_split_hit_{game_id}_{hand_index}
+            hand_index = hand_index_for_callback
 
-        # Check balance for split (need to match original bet)
-        original_bet = game["bet_amount"]
-        if get_active_balance_usd(user.id) < original_bet:
-            await query.answer(f"{pe('cross')} Not enough balance to split!", show_alert=True)
-            return
+            # Draw card to current split hand
+            card = game["deck"].pop()
+            game["split_hands"][hand_index].append(card)
+            hand_value = calculate_hand_value(game["split_hands"][hand_index])
 
-        # Deduct the split bet atomically
-        try:
-            await deduct_wallet_safe(user.id, original_bet)
-        except ValueError:
-            await query.answer("Insufficient balance for split!", show_alert=True)
-            return
-        save_user_data(user.id)
+            # Check for bust
+            if hand_value > 21:
+                # This hand busted, move to next hand or finish
+                game["split_results"].append({"hand": hand_index, "value": hand_value, "status": "bust"})
+                await _play_next_split_hand(query, context, game_id, hand_index + 1, bot_uname)
+            elif hand_value == 21:
+                # Stand automatically on 21
+                game["split_results"].append({"hand": hand_index, "value": hand_value, "status": "21"})
+                await _play_next_split_hand(query, context, game_id, hand_index + 1, bot_uname)
+            else:
+                # Continue playing this hand - show both hands with active highlighted
+                bj_image = await async_generate_bj_image(
+                    player_hand=game["split_hands"][hand_index],
+                    dealer_hand=game["dealer_hand"],
+                    show_dealer_hole=False,
+                    player_value=hand_value,
+                    player_username=user.username,
+                    bet_amount=sum(game["split_bets"]),
+                    bot_username=bot_uname,
+                    player_profile_pic=await _get_cached_profile_picture(context, user.id),
+                    split_hands=game["split_hands"],
+                    split_active_hand=hand_index,
+                    split_bets=game["split_bets"],
+                    split_results=game.get("split_results", []),
+                )
+                keyboard_buttons = [
+                    [apply_button_style(InlineKeyboardButton("Hit", callback_data=f"bj_split_hit_{game_id}_{hand_index}"), 'success', peb('hit')),
+                     apply_button_style(InlineKeyboardButton("Stand", callback_data=f"bj_split_stand_{game_id}_{hand_index}"), 'danger', peb('stand'))]
+                ]
+                if len(game["split_hands"][hand_index]) == 2 and get_active_balance_usd(user.id) >= game["split_bets"][hand_index]:
+                    keyboard_buttons.append([apply_button_style(InlineKeyboardButton("Double", callback_data=f"bj_split_double_{game_id}_{hand_index}"), 'primary', peb('double'))])
 
-        # Create two separate hands from the split
-        first_card = game["player_hand"][0]
-        second_card = game["player_hand"][1]
+                caption = (
+                    f"{pe('cards')} <b>Blackjack - Split</b> — ID: <code>{game_id}</code>\n"
+                    f"{pe('money')} Bet per hand: ${game['split_bets'][hand_index]:.2f}\n"
+                    f"Playing Hand {hand_index + 1} of {len(game['split_hands'])}"
+                )
+                await query.edit_message_media(
+                    media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
+                    reply_markup=InlineKeyboardMarkup(keyboard_buttons)
+                )
 
-        # Deal one card to each hand
-        third_card = game["deck"].pop()
-        fourth_card = game["deck"].pop()
+        elif action == "split_stand":
+            hand_index = hand_index_for_callback
 
-        hand1 = [first_card, third_card]
-        hand2 = [second_card, fourth_card]
-
-        # Store split hands in game state
-        game["split"] = True
-        game["split_hands"] = [hand1, hand2]
-        game["split_bets"] = [original_bet, original_bet]  # Each hand has the original bet
-        game["current_hand_index"] = 0  # Start with first hand
-        game["split_results"] = []  # Will store results for each hand
-
-        # Show split image with both hands, highlighting active hand (hand 1)
-        bj_image = await async_generate_bj_image(
-            player_hand=hand1,
-            dealer_hand=game["dealer_hand"],
-            show_dealer_hole=False,
-            player_value=calculate_hand_value(hand1),
-            player_username=user.username,
-            bet_amount=original_bet * 2,
-            bot_username=bot_uname,
-            player_profile_pic=await _get_cached_profile_picture(context, user.id),
-            split_hands=[hand1, hand2],
-            split_active_hand=0,
-            split_bets=[original_bet, original_bet],
-            split_results=[],
-        )
-
-        keyboard_buttons = [
-            [apply_button_style(InlineKeyboardButton("Hit", callback_data=f"bj_split_hit_{game_id}_0"), 'success', peb('hit')),
-             apply_button_style(InlineKeyboardButton("Stand", callback_data=f"bj_split_stand_{game_id}_0"), 'danger', peb('stand'))]
-        ]
-        # Can double on split hand if only 2 cards and has balance
-        if len(hand1) == 2 and get_active_balance_usd(user.id) >= original_bet:
-            keyboard_buttons.append([apply_button_style(InlineKeyboardButton("Double", callback_data=f"bj_split_double_{game_id}_0"), 'primary', peb('double'))])
-
-        caption = (
-            f"{pe('cards')} <b>Blackjack - Split</b> — ID: <code>{game_id}</code>\n"
-            f"{pe('money')} Bet per hand: ${original_bet:.2f}\n"
-            f"Playing Hand 1 of 2"
-        )
-        await query.edit_message_media(
-            media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
-            reply_markup=InlineKeyboardMarkup(keyboard_buttons)
-        )
-
-    elif action == "split_hit":
-        # Handle hit on split hand: bj_split_hit_{game_id}_{hand_index}
-        hand_index = hand_index_for_callback
-
-        # Draw card to current split hand
-        card = game["deck"].pop()
-        game["split_hands"][hand_index].append(card)
-        hand_value = calculate_hand_value(game["split_hands"][hand_index])
-
-        # Check for bust
-        if hand_value > 21:
-            # This hand busted, move to next hand or finish
-            game["split_results"].append({"hand": hand_index, "value": hand_value, "status": "bust"})
+            hand_value = calculate_hand_value(game["split_hands"][hand_index])
+            game["split_results"].append({"hand": hand_index, "value": hand_value, "status": "stand"})
             await _play_next_split_hand(query, context, game_id, hand_index + 1, bot_uname)
-        elif hand_value == 21:
-            # Stand automatically on 21
-            game["split_results"].append({"hand": hand_index, "value": hand_value, "status": "21"})
+
+        elif action == "split_double":
+            hand_index = hand_index_for_callback
+            current_bet = game["split_bets"][hand_index]
+
+            # Deduct double-down stake atomically (per-user lock).
+            try:
+                await deduct_wallet_safe(user.id, current_bet)
+            except ValueError:
+                await query.answer(f"{pe('cross')} Not enough balance to double!", show_alert=True)
+                return
+            game["split_bets"][hand_index] *= 2
+            save_user_data(user.id)
+
+            # Deal one card and stand
+            card = game["deck"].pop()
+            game["split_hands"][hand_index].append(card)
+            hand_value = calculate_hand_value(game["split_hands"][hand_index])
+
+            if hand_value > 21:
+                game["split_results"].append({"hand": hand_index, "value": hand_value, "status": "bust"})
+            else:
+                game["split_results"].append({"hand": hand_index, "value": hand_value, "status": "doubled"})
+
             await _play_next_split_hand(query, context, game_id, hand_index + 1, bot_uname)
-        else:
-            # Continue playing this hand - show both hands with active highlighted
-            bj_image = await async_generate_bj_image(
-                player_hand=game["split_hands"][hand_index],
-                dealer_hand=game["dealer_hand"],
-                show_dealer_hole=False,
-                player_value=hand_value,
-                player_username=user.username,
-                bet_amount=sum(game["split_bets"]),
-                bot_username=bot_uname,
-                player_profile_pic=await _get_cached_profile_picture(context, user.id),
-                split_hands=game["split_hands"],
-                split_active_hand=hand_index,
-                split_bets=game["split_bets"],
-                split_results=game.get("split_results", []),
-            )
-            keyboard_buttons = [
-                [apply_button_style(InlineKeyboardButton("Hit", callback_data=f"bj_split_hit_{game_id}_{hand_index}"), 'success', peb('hit')),
-                 apply_button_style(InlineKeyboardButton("Stand", callback_data=f"bj_split_stand_{game_id}_{hand_index}"), 'danger', peb('stand'))]
-            ]
-            if len(game["split_hands"][hand_index]) == 2 and get_active_balance_usd(user.id) >= game["split_bets"][hand_index]:
-                keyboard_buttons.append([apply_button_style(InlineKeyboardButton("Double", callback_data=f"bj_split_double_{game_id}_{hand_index}"), 'primary', peb('double'))])
-
-            caption = (
-                f"{pe('cards')} <b>Blackjack - Split</b> — ID: <code>{game_id}</code>\n"
-                f"{pe('money')} Bet per hand: ${game['split_bets'][hand_index]:.2f}\n"
-                f"Playing Hand {hand_index + 1} of {len(game['split_hands'])}"
-            )
-            await query.edit_message_media(
-                media=InputMediaPhoto(media=bj_image, caption=caption, parse_mode=ParseMode.HTML),
-                reply_markup=InlineKeyboardMarkup(keyboard_buttons)
-            )
-
-    elif action == "split_stand":
-        hand_index = hand_index_for_callback
-
-        hand_value = calculate_hand_value(game["split_hands"][hand_index])
-        game["split_results"].append({"hand": hand_index, "value": hand_value, "status": "stand"})
-        await _play_next_split_hand(query, context, game_id, hand_index + 1, bot_uname)
-
-    elif action == "split_double":
-        hand_index = hand_index_for_callback
-        current_bet = game["split_bets"][hand_index]
-
-        # Deduct double-down stake atomically (per-user lock).
-        try:
-            await deduct_wallet_safe(user.id, current_bet)
-        except ValueError:
-            await query.answer(f"{pe('cross')} Not enough balance to double!", show_alert=True)
-            return
-        game["split_bets"][hand_index] *= 2
-        save_user_data(user.id)
-
-        # Deal one card and stand
-        card = game["deck"].pop()
-        game["split_hands"][hand_index].append(card)
-        hand_value = calculate_hand_value(game["split_hands"][hand_index])
-
-        if hand_value > 21:
-            game["split_results"].append({"hand": hand_index, "value": hand_value, "status": "bust"})
-        else:
-            game["split_results"].append({"hand": hand_index, "value": hand_value, "status": "doubled"})
-
-        await _play_next_split_hand(query, context, game_id, hand_index + 1, bot_uname)
 
 async def _play_next_split_hand(query, context, game_id, next_hand_index, bot_uname):
     """Play the next split hand or resolve the game if all hands are done."""

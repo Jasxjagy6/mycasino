@@ -402,35 +402,36 @@ async def tower_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not game_id:
             return
 
-        game = game_sessions.get(game_id)
+        async with _get_game_lock(game_id):
+            game = game_sessions.get(game_id)
 
-        if not game:
-            await query.edit_message_text("Game not found or already finished.")
-            return
+            if not game:
+                await query.edit_message_text("Game not found or already finished.")
+                return
 
-        # Check game ownership
-        if user.id != game.get('user_id'):
-            await query.answer("This is not your game!", show_alert=True)
-            return
+            # Check game ownership
+            if user.id != game.get('user_id'):
+                await query.answer("This is not your game!", show_alert=True)
+                return
 
-        if game.get('status') != 'active':
-            return
+            if game.get('status') != 'active':
+                return
 
-        if action == "cashout":
-            await handle_tower_cashout(update, context, game_id, game)
-            return
+            if action == "cashout":
+                await handle_tower_cashout(update, context, game_id, game)
+                return
 
-        if action == "random":
-            # Random tile selection
-            tiles_per_floor = game.get('tiles_per_floor', 3)
-            random_position = _secure_randint(0, tiles_per_floor - 1)
-            await handle_tower_pick(update, context, game_id, game, random_position)
-            return
+            if action == "random":
+                # Random tile selection
+                tiles_per_floor = game.get('tiles_per_floor', 3)
+                random_position = _secure_randint(0, tiles_per_floor - 1)
+                await handle_tower_pick(update, context, game_id, game, random_position)
+                return
 
-        if action == "pick":
-            position = int(parts[3]) if len(parts) > 3 else 0
-            await handle_tower_pick(update, context, game_id, game, position)
-            return
+            if action == "pick":
+                position = int(parts[3]) if len(parts) > 3 else 0
+                await handle_tower_pick(update, context, game_id, game, position)
+                return
     finally:
         _release_callback(query.id)
 

@@ -169,49 +169,215 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     action = parts[1]
     game_id = parts[2]
 
-    game = game_sessions.get(game_id)
+    async with _get_game_lock(game_id):
+        game = game_sessions.get(game_id)
 
-    if not game:
-        await query.edit_message_text("No active mines game found, it has ended, or it is not your game.", reply_markup=None)
-        return
+        if not game:
+            await query.edit_message_text("No active mines game found, it has ended, or it is not your game.", reply_markup=None)
+            return
 
-    # NEW: Enhanced user-specific security check
-    # Format: mines_pick_{game_id}_{tile}_{user_id} or mines_cashout_{game_id}_{user_id} or mines_random_{game_id}_{user_id}
-    if len(parts) >= 5 and parts[4].isdigit():
-        # For pick action: parts = ['mines', 'pick', game_id, tile, user_id]
-        button_user_id = int(parts[4])
-        if user.id != button_user_id:
+        # NEW: Enhanced user-specific security check
+        # Format: mines_pick_{game_id}_{tile}_{user_id} or mines_cashout_{game_id}_{user_id} or mines_random_{game_id}_{user_id}
+        if len(parts) >= 5 and parts[4].isdigit():
+            # For pick action: parts = ['mines', 'pick', game_id, tile, user_id]
+            button_user_id = int(parts[4])
+            if user.id != button_user_id:
+                await query.answer("This is not your game!", show_alert=True)
+                return
+        elif len(parts) >= 4 and parts[3].isdigit() and action in ['cashout', 'random']:
+            # For cashout/random: parts = ['mines', 'cashout'/'random', game_id, user_id]
+            button_user_id = int(parts[3])
+            if user.id != button_user_id:
+                await query.answer("This is not your game!", show_alert=True)
+                return
+
+        # Fallback security check
+        if user.id != game.get('user_id'):
             await query.answer("This is not your game!", show_alert=True)
             return
-    elif len(parts) >= 4 and parts[3].isdigit() and action in ['cashout', 'random']:
-        # For cashout/random: parts = ['mines', 'cashout'/'random', game_id, user_id]
-        button_user_id = int(parts[3])
-        if user.id != button_user_id:
-            await query.answer("This is not your game!", show_alert=True)
+
+        if game.get("status") != 'active':
+            # Don't edit message if game is over, just inform the user who tapped
+            await query.answer("This game has already ended.", show_alert=True)
             return
 
-    # Fallback security check
-    if user.id != game.get('user_id'):
-        await query.answer("This is not your game!", show_alert=True)
-        return
+        # NEW: Handle random tile selection
+        if action == "random":
+            # Get unpicked tiles - use 0-24 to match mine positions
+            unpicked = [i for i in range(game["total_cells"]) if i not in game["picks"]]
+            if not unpicked:
+                await query.answer("No tiles left to pick!", show_alert=True)
+                return
 
-    if game.get("status") != 'active':
-        # Don't edit message if game is over, just inform the user who tapped
-        await query.answer("This game has already ended.", show_alert=True)
-        return
+            # Randomly select a tile
+            cell = _secure_choice(unpicked)
 
-    # NEW: Handle random tile selection
-    if action == "random":
-        # Get unpicked tiles - use 0-24 to match mine positions
-        unpicked = [i for i in range(game["total_cells"]) if i not in game["picks"]]
-        if not unpicked:
-            await query.answer("No tiles left to pick!", show_alert=True)
+            # Check if it's a mine
+            if cell in game["mines"]:
+                game["status"] = 'completed'
+                game["win"] = False
+                # Note: nonce was incremented at game start for provably fair
+                await update_stats_on_bet(user.id, game_id, game['bet_amount'], win=False, context=context)
+                update_pnl(user.id)
+                save_user_data(user.id)
+
+                # Store provably fair record
+                store_provably_fair_record(game_id, "mines", game["server_seed"], game["client_seed"], game["nonce"],
+                                           result_data=f"Hit mine at tile {cell} (Random), Mine positions: {game['mines']}")
+
+                # Send template instead of inline keyboard
+                username = f"@{user.username}" if user.username else f"User{user.id}"
+                winnings = 0.0
+                template = _render_mines_sync(
+                    username=username,
+                    bet_amount=game['bet_amount'],
+                    num_mines=game['num_mines'],
+                    picks=list(game['picks']),
+                    mines=list(game['mines']),
+                    won=False,
+                    multiplier=0.0,
+                    winnings=winnings,
+                    game_id=game_id,
+                    safe_count=len(game['picks']),
+                )
+                pf_button = await create_provably_fair_button(game_id, context)
+                kb = InlineKeyboardMarkup([[pf_button]])
+                if template:
+                    await query.edit_message_media(
+                        InputMediaPhoto(template, caption=f"{pe('bust')} <b>Boom!</b> Random picked tile {cell} - it was a mine! (ID: <code>{game_id}</code>)\n\nYou lost your bet of <b>${game['bet_amount']:.2f}</b>.", parse_mode=ParseMode.HTML),
+                        reply_markup=kb
+                    )
+                else:
+                    await query.edit_message_text(
+                        f"{pe('bust')} <b>Boom!</b> Random picked tile {cell} - it was a mine! (ID: <code>{game_id}</code>)\n\nYou lost your bet of <b>${game['bet_amount']:.2f}</b>.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=kb
+                    )
+                return
+
+            # Safe pick
+            game["picks"].append(cell)
+            safe_picks = len(game["picks"])
+            multiplier = get_mines_multiplier(game["num_mines"], safe_picks)
+            potential_winnings = game["bet_amount"] * multiplier
+
+            if safe_picks == (game["total_cells"] - game["num_mines"]):
+                # MAX WIN
+                game["status"] = 'completed'
+                game["win"] = True
+                game["multiplier"] = multiplier
+                credit_wallet(user.id, potential_winnings)
+                # Note: nonce was incremented at game start for provably fair
+                await update_stats_on_bet(user.id, game_id, game['bet_amount'], win=True, multiplier=multiplier, context=context)
+                update_pnl(user.id)
+                save_user_data(user.id)
+
+                # Store provably fair record
+                store_provably_fair_record(game_id, "mines", game["server_seed"], game["client_seed"], game["nonce"],
+                                           result_data=f"Max win: {safe_picks} gems (Last Random), Multiplier: {multiplier:.2f}x, Mine positions: {game['mines']}")
+
+                # Send template
+                username = f"@{user.username}" if user.username else f"User{user.id}"
+                template = _render_mines_sync(
+                    username=username,
+                    bet_amount=game['bet_amount'],
+                    num_mines=game['num_mines'],
+                    picks=list(game['picks']),
+                    mines=list(game['mines']),
+                    won=True,
+                    multiplier=multiplier,
+                    winnings=potential_winnings,
+                    game_id=game_id,
+                    safe_count=safe_picks,
+                )
+                pf_button = await create_provably_fair_button(game_id, context)
+                kb = InlineKeyboardMarkup([[pf_button]])
+                if template:
+                    await query.edit_message_media(
+                        InputMediaPhoto(template, caption=f"{pe('win')} <b>MAX WIN!</b> (ID: <code>{game_id}</code>)\n\nRandom picked tile {cell} - You found all {safe_picks} gems and won <b>${potential_winnings:.2f}</b>!\nFinal Multiplier: <b>{multiplier:.2f}x</b>", parse_mode=ParseMode.HTML),
+                        reply_markup=kb
+                    )
+                else:
+                    await query.edit_message_text(
+                        f"{pe('win')} <b>MAX WIN!</b> (ID: <code>{game_id}</code>)\n\nRandom picked tile {cell} - You found all {safe_picks} gems and won <b>${potential_winnings:.2f}</b>!\nFinal Multiplier: <b>{multiplier:.2f}x</b>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=kb
+                    )
+                return
+
+            # Continue playing
+            await query.edit_message_text(
+                f"{pe('bomb')} <b>Mines Game</b> (ID: <code>{game_id}</code>)\n\n"
+                f"{pe('check')} Safe! Random picked tile {cell} - it's a gem!\n\n"
+                f"Bet: <b>${game['bet_amount']:.2f}</b> | Mines: <b>{game['num_mines']}</b>\n"
+                f"Safe Picks: <b>{safe_picks}</b> | Multiplier: <b>{multiplier:.2f}x</b>\n"
+                f"Potential Cashout: <b>${potential_winnings:.2f}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=mines_keyboard(game_id)
+            )
             return
 
-        # Randomly select a tile
-        cell = _secure_choice(unpicked)
+        if action == "cashout":
+            safe_picks = len(game["picks"])
+            if safe_picks == 0:
+                await query.answer("You need to make at least one pick to cash out.", show_alert=True)
+                return
 
-        # Check if it's a mine
+            multiplier = get_mines_multiplier(game["num_mines"], safe_picks)
+            winnings = game["bet_amount"] * multiplier
+            credit_wallet(user.id, winnings)
+            game["status"] = 'completed'
+            game["win"] = True
+            game["multiplier"] = multiplier
+            # Note: nonce was incremented at game start for provably fair
+            await update_stats_on_bet(user.id, game_id, game['bet_amount'], win=True, multiplier=multiplier, context=context)
+            update_pnl(user.id)
+            save_user_data(user.id)
+
+            # Store provably fair record
+            store_provably_fair_record(game_id, "mines", game["server_seed"], game["client_seed"], game["nonce"],
+                                       result_data=f"Cashed out: {safe_picks} safe picks, Multiplier: {multiplier:.2f}x, Mine positions: {game['mines']}")
+
+            # Send template
+            username = f"@{user.username}" if user.username else f"User{user.id}"
+            template = _render_mines_sync(
+                username=username,
+                bet_amount=game['bet_amount'],
+                num_mines=game['num_mines'],
+                picks=list(game['picks']),
+                mines=list(game['mines']),
+                won=True,
+                multiplier=multiplier,
+                winnings=winnings,
+                game_id=game_id,
+                safe_count=safe_picks,
+            )
+            pf_button = await create_provably_fair_button(game_id, context)
+            rebet_btn = apply_button_style(InlineKeyboardButton("Rebet", callback_data=f"mines_rebet_{game['bet_amount']}_{game['num_mines']}_{user.id}"), 'primary')
+            double_btn = apply_button_style(InlineKeyboardButton("Double", callback_data=f"mines_double_{game['bet_amount']}_{game['num_mines']}_{user.id}"), 'success')
+            kb = InlineKeyboardMarkup([[rebet_btn, double_btn], [pf_button]])
+            if template:
+                await query.edit_message_media(
+                    InputMediaPhoto(template, caption=f"{pe('withdraw')} <b>Cashed Out!</b> (ID: <code>{game_id}</code>)\n\nYou won <b>{dformat(winnings)}</b> with {safe_picks} correct picks!\nMultiplier: <b>{multiplier:.2f}x</b>", parse_mode=ParseMode.HTML),
+                    reply_markup=kb
+                )
+            else:
+                await query.edit_message_text(
+                    f"{pe('withdraw')} <b>Cashed Out!</b> (ID: <code>{game_id}</code>)\n\nYou won <b>{dformat(winnings)}</b> with {safe_picks} correct picks!\nMultiplier: <b>{multiplier:.2f}x</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb
+                )
+            # del game_sessions[game_id] # FIX: Don't delete history
+            return
+
+        try:
+            cell = int(parts[3])
+        except (ValueError, IndexError): return
+
+        if cell in game["picks"]:
+            await query.answer("You have already picked this tile.", show_alert=True)
+            return
+
         if cell in game["mines"]:
             game["status"] = 'completed'
             game["win"] = False
@@ -222,11 +388,10 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             # Store provably fair record
             store_provably_fair_record(game_id, "mines", game["server_seed"], game["client_seed"], game["nonce"],
-                                       result_data=f"Hit mine at tile {cell} (Random), Mine positions: {game['mines']}")
+                                       result_data=f"Hit mine at tile {cell}, Mine positions: {game['mines']}")
 
-            # Send template instead of inline keyboard
+            # Send template
             username = f"@{user.username}" if user.username else f"User{user.id}"
-            winnings = 0.0
             template = _render_mines_sync(
                 username=username,
                 bet_amount=game['bet_amount'],
@@ -235,33 +400,34 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 mines=list(game['mines']),
                 won=False,
                 multiplier=0.0,
-                winnings=winnings,
+                winnings=0.0,
                 game_id=game_id,
                 safe_count=len(game['picks']),
             )
             pf_button = await create_provably_fair_button(game_id, context)
-            kb = InlineKeyboardMarkup([[pf_button]])
+            rebet_btn = apply_button_style(InlineKeyboardButton("Rebet", callback_data=f"mines_rebet_{game['bet_amount']}_{game['num_mines']}_{user.id}"), 'primary')
+            double_btn = apply_button_style(InlineKeyboardButton("Double", callback_data=f"mines_double_{game['bet_amount']}_{game['num_mines']}_{user.id}"), 'success')
+            kb = InlineKeyboardMarkup([[rebet_btn, double_btn], [pf_button]])
             if template:
                 await query.edit_message_media(
-                    InputMediaPhoto(template, caption=f"{pe('bust')} <b>Boom!</b> Random picked tile {cell} - it was a mine! (ID: <code>{game_id}</code>)\n\nYou lost your bet of <b>${game['bet_amount']:.2f}</b>.", parse_mode=ParseMode.HTML),
+                    InputMediaPhoto(template, caption=f"{pe('bust')} <b>Boom!</b> You hit a mine at tile {cell}. (ID: <code>{game_id}</code>)\n\nYou lost your bet of <b>${game['bet_amount']:.2f}</b>.", parse_mode=ParseMode.HTML),
                     reply_markup=kb
                 )
             else:
                 await query.edit_message_text(
-                    f"{pe('bust')} <b>Boom!</b> Random picked tile {cell} - it was a mine! (ID: <code>{game_id}</code>)\n\nYou lost your bet of <b>${game['bet_amount']:.2f}</b>.",
+                    f"{pe('bust')} <b>Boom!</b> You hit a mine at tile {cell}. (ID: <code>{game_id}</code>)\n\nYou lost your bet of <b>${game['bet_amount']:.2f}</b>.",
                     parse_mode=ParseMode.HTML,
                     reply_markup=kb
                 )
+            # del game_sessions[game_id] # FIX: Don't delete history
             return
 
-        # Safe pick
         game["picks"].append(cell)
         safe_picks = len(game["picks"])
         multiplier = get_mines_multiplier(game["num_mines"], safe_picks)
         potential_winnings = game["bet_amount"] * multiplier
 
         if safe_picks == (game["total_cells"] - game["num_mines"]):
-            # MAX WIN
             game["status"] = 'completed'
             game["win"] = True
             game["multiplier"] = multiplier
@@ -273,7 +439,7 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             # Store provably fair record
             store_provably_fair_record(game_id, "mines", game["server_seed"], game["client_seed"], game["nonce"],
-                                       result_data=f"Max win: {safe_picks} gems (Last Random), Multiplier: {multiplier:.2f}x, Mine positions: {game['mines']}")
+                                       result_data=f"Max win: {safe_picks} gems, Multiplier: {multiplier:.2f}x, Mine positions: {game['mines']}")
 
             # Send template
             username = f"@{user.username}" if user.username else f"User{user.id}"
@@ -290,197 +456,32 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 safe_count=safe_picks,
             )
             pf_button = await create_provably_fair_button(game_id, context)
-            kb = InlineKeyboardMarkup([[pf_button]])
+            rebet_btn = apply_button_style(InlineKeyboardButton("Rebet", callback_data=f"mines_rebet_{game['bet_amount']}_{game['num_mines']}_{user.id}"), 'primary')
+            double_btn = apply_button_style(InlineKeyboardButton("Double", callback_data=f"mines_double_{game['bet_amount']}_{game['num_mines']}_{user.id}"), 'success')
+            kb = InlineKeyboardMarkup([[rebet_btn, double_btn], [pf_button]])
             if template:
                 await query.edit_message_media(
-                    InputMediaPhoto(template, caption=f"{pe('win')} <b>MAX WIN!</b> (ID: <code>{game_id}</code>)\n\nRandom picked tile {cell} - You found all {safe_picks} gems and won <b>${potential_winnings:.2f}</b>!\nFinal Multiplier: <b>{multiplier:.2f}x</b>", parse_mode=ParseMode.HTML),
+                    InputMediaPhoto(template, caption=f"{pe('win')} <b>MAX WIN!</b> (ID: <code>{game_id}</code>)\n\nYou found all {safe_picks} gems and won <b>${potential_winnings:.2f}</b>!\nFinal Multiplier: <b>{multiplier:.2f}x</b>", parse_mode=ParseMode.HTML),
                     reply_markup=kb
                 )
             else:
                 await query.edit_message_text(
-                    f"{pe('win')} <b>MAX WIN!</b> (ID: <code>{game_id}</code>)\n\nRandom picked tile {cell} - You found all {safe_picks} gems and won <b>${potential_winnings:.2f}</b>!\nFinal Multiplier: <b>{multiplier:.2f}x</b>",
+                    f"{pe('win')} <b>MAX WIN!</b> (ID: <code>{game_id}</code>)\n\nYou found all {safe_picks} gems and won <b>${potential_winnings:.2f}</b>!\nFinal Multiplier: <b>{multiplier:.2f}x</b>",
                     parse_mode=ParseMode.HTML,
                     reply_markup=kb
                 )
+            # del game_sessions[game_id] # FIX: Don't delete history
             return
 
-        # Continue playing
-        await query.edit_message_text(
+        next_text = (
             f"{pe('bomb')} <b>Mines Game</b> (ID: <code>{game_id}</code>)\n\n"
-            f"{pe('check')} Safe! Random picked tile {cell} - it's a gem!\n\n"
+            f"{pe('check')} Safe! Tile {cell} is a gem!\n\n"
             f"Bet: <b>${game['bet_amount']:.2f}</b> | Mines: <b>{game['num_mines']}</b>\n"
             f"Safe Picks: <b>{safe_picks}</b> | Multiplier: <b>{multiplier:.2f}x</b>\n"
-            f"Potential Cashout: <b>${potential_winnings:.2f}</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=mines_keyboard(game_id)
+            f"Potential Cashout: <b>${potential_winnings:.2f}</b>"
         )
-        return
-
-    if action == "cashout":
-        safe_picks = len(game["picks"])
-        if safe_picks == 0:
-            await query.answer("You need to make at least one pick to cash out.", show_alert=True)
-            return
-
-        multiplier = get_mines_multiplier(game["num_mines"], safe_picks)
-        winnings = game["bet_amount"] * multiplier
-        credit_wallet(user.id, winnings)
-        game["status"] = 'completed'
-        game["win"] = True
-        game["multiplier"] = multiplier
-        # Note: nonce was incremented at game start for provably fair
-        await update_stats_on_bet(user.id, game_id, game['bet_amount'], win=True, multiplier=multiplier, context=context)
-        update_pnl(user.id)
-        save_user_data(user.id)
-
-        # Store provably fair record
-        store_provably_fair_record(game_id, "mines", game["server_seed"], game["client_seed"], game["nonce"],
-                                   result_data=f"Cashed out: {safe_picks} safe picks, Multiplier: {multiplier:.2f}x, Mine positions: {game['mines']}")
-
-        # Send template
-        username = f"@{user.username}" if user.username else f"User{user.id}"
-        template = _render_mines_sync(
-            username=username,
-            bet_amount=game['bet_amount'],
-            num_mines=game['num_mines'],
-            picks=list(game['picks']),
-            mines=list(game['mines']),
-            won=True,
-            multiplier=multiplier,
-            winnings=winnings,
-            game_id=game_id,
-            safe_count=safe_picks,
-        )
-        pf_button = await create_provably_fair_button(game_id, context)
-        rebet_btn = apply_button_style(InlineKeyboardButton("Rebet", callback_data=f"mines_rebet_{game['bet_amount']}_{game['num_mines']}_{user.id}"), 'primary')
-        double_btn = apply_button_style(InlineKeyboardButton("Double", callback_data=f"mines_double_{game['bet_amount']}_{game['num_mines']}_{user.id}"), 'success')
-        kb = InlineKeyboardMarkup([[rebet_btn, double_btn], [pf_button]])
-        if template:
-            await query.edit_message_media(
-                InputMediaPhoto(template, caption=f"{pe('withdraw')} <b>Cashed Out!</b> (ID: <code>{game_id}</code>)\n\nYou won <b>{dformat(winnings)}</b> with {safe_picks} correct picks!\nMultiplier: <b>{multiplier:.2f}x</b>", parse_mode=ParseMode.HTML),
-                reply_markup=kb
-            )
-        else:
-            await query.edit_message_text(
-                f"{pe('withdraw')} <b>Cashed Out!</b> (ID: <code>{game_id}</code>)\n\nYou won <b>{dformat(winnings)}</b> with {safe_picks} correct picks!\nMultiplier: <b>{multiplier:.2f}x</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb
-            )
-        # del game_sessions[game_id] # FIX: Don't delete history
-        return
-
-    try:
-        cell = int(parts[3])
-    except (ValueError, IndexError): return
-
-    if cell in game["picks"]:
-        await query.answer("You have already picked this tile.", show_alert=True)
-        return
-
-    if cell in game["mines"]:
-        game["status"] = 'completed'
-        game["win"] = False
-        # Note: nonce was incremented at game start for provably fair
-        await update_stats_on_bet(user.id, game_id, game['bet_amount'], win=False, context=context)
-        update_pnl(user.id)
-        save_user_data(user.id)
-
-        # Store provably fair record
-        store_provably_fair_record(game_id, "mines", game["server_seed"], game["client_seed"], game["nonce"],
-                                   result_data=f"Hit mine at tile {cell}, Mine positions: {game['mines']}")
-
-        # Send template
-        username = f"@{user.username}" if user.username else f"User{user.id}"
-        template = _render_mines_sync(
-            username=username,
-            bet_amount=game['bet_amount'],
-            num_mines=game['num_mines'],
-            picks=list(game['picks']),
-            mines=list(game['mines']),
-            won=False,
-            multiplier=0.0,
-            winnings=0.0,
-            game_id=game_id,
-            safe_count=len(game['picks']),
-        )
-        pf_button = await create_provably_fair_button(game_id, context)
-        rebet_btn = apply_button_style(InlineKeyboardButton("Rebet", callback_data=f"mines_rebet_{game['bet_amount']}_{game['num_mines']}_{user.id}"), 'primary')
-        double_btn = apply_button_style(InlineKeyboardButton("Double", callback_data=f"mines_double_{game['bet_amount']}_{game['num_mines']}_{user.id}"), 'success')
-        kb = InlineKeyboardMarkup([[rebet_btn, double_btn], [pf_button]])
-        if template:
-            await query.edit_message_media(
-                InputMediaPhoto(template, caption=f"{pe('bust')} <b>Boom!</b> You hit a mine at tile {cell}. (ID: <code>{game_id}</code>)\n\nYou lost your bet of <b>${game['bet_amount']:.2f}</b>.", parse_mode=ParseMode.HTML),
-                reply_markup=kb
-            )
-        else:
-            await query.edit_message_text(
-                f"{pe('bust')} <b>Boom!</b> You hit a mine at tile {cell}. (ID: <code>{game_id}</code>)\n\nYou lost your bet of <b>${game['bet_amount']:.2f}</b>.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb
-            )
-        # del game_sessions[game_id] # FIX: Don't delete history
-        return
-
-    game["picks"].append(cell)
-    safe_picks = len(game["picks"])
-    multiplier = get_mines_multiplier(game["num_mines"], safe_picks)
-    potential_winnings = game["bet_amount"] * multiplier
-
-    if safe_picks == (game["total_cells"] - game["num_mines"]):
-        game["status"] = 'completed'
-        game["win"] = True
-        game["multiplier"] = multiplier
-        credit_wallet(user.id, potential_winnings)
-        # Note: nonce was incremented at game start for provably fair
-        await update_stats_on_bet(user.id, game_id, game['bet_amount'], win=True, multiplier=multiplier, context=context)
-        update_pnl(user.id)
-        save_user_data(user.id)
-
-        # Store provably fair record
-        store_provably_fair_record(game_id, "mines", game["server_seed"], game["client_seed"], game["nonce"],
-                                   result_data=f"Max win: {safe_picks} gems, Multiplier: {multiplier:.2f}x, Mine positions: {game['mines']}")
-
-        # Send template
-        username = f"@{user.username}" if user.username else f"User{user.id}"
-        template = _render_mines_sync(
-            username=username,
-            bet_amount=game['bet_amount'],
-            num_mines=game['num_mines'],
-            picks=list(game['picks']),
-            mines=list(game['mines']),
-            won=True,
-            multiplier=multiplier,
-            winnings=potential_winnings,
-            game_id=game_id,
-            safe_count=safe_picks,
-        )
-        pf_button = await create_provably_fair_button(game_id, context)
-        rebet_btn = apply_button_style(InlineKeyboardButton("Rebet", callback_data=f"mines_rebet_{game['bet_amount']}_{game['num_mines']}_{user.id}"), 'primary')
-        double_btn = apply_button_style(InlineKeyboardButton("Double", callback_data=f"mines_double_{game['bet_amount']}_{game['num_mines']}_{user.id}"), 'success')
-        kb = InlineKeyboardMarkup([[rebet_btn, double_btn], [pf_button]])
-        if template:
-            await query.edit_message_media(
-                InputMediaPhoto(template, caption=f"{pe('win')} <b>MAX WIN!</b> (ID: <code>{game_id}</code>)\n\nYou found all {safe_picks} gems and won <b>${potential_winnings:.2f}</b>!\nFinal Multiplier: <b>{multiplier:.2f}x</b>", parse_mode=ParseMode.HTML),
-                reply_markup=kb
-            )
-        else:
-            await query.edit_message_text(
-                f"{pe('win')} <b>MAX WIN!</b> (ID: <code>{game_id}</code>)\n\nYou found all {safe_picks} gems and won <b>${potential_winnings:.2f}</b>!\nFinal Multiplier: <b>{multiplier:.2f}x</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb
-            )
-        # del game_sessions[game_id] # FIX: Don't delete history
-        return
-
-    next_text = (
-        f"{pe('bomb')} <b>Mines Game</b> (ID: <code>{game_id}</code>)\n\n"
-        f"{pe('check')} Safe! Tile {cell} is a gem!\n\n"
-        f"Bet: <b>${game['bet_amount']:.2f}</b> | Mines: <b>{game['num_mines']}</b>\n"
-        f"Safe Picks: <b>{safe_picks}</b> | Multiplier: <b>{multiplier:.2f}x</b>\n"
-        f"Potential Cashout: <b>${potential_winnings:.2f}</b>"
-    )
-    await query.edit_message_text(next_text, parse_mode=ParseMode.HTML, reply_markup=mines_keyboard(game_id))
-    await query.answer(f"Safe! Current multiplier: {multiplier:.2f}x")
+        await query.edit_message_text(next_text, parse_mode=ParseMode.HTML, reply_markup=mines_keyboard(game_id))
+        await query.answer(f"Safe! Current multiplier: {multiplier:.2f}x")
 
 @check_banned
 @check_maintenance
