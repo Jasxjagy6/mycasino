@@ -1298,6 +1298,23 @@ _withdrawal_locks: dict = {}
 
 _raffle_locks: dict = {}
 
+def _get_wallet_lock(user_id: int) -> asyncio.Lock:
+    """Per-user wallet lock factory.  Defined at the foundation layer so
+    that every plugin gets it via `from core.foundation import *`.
+    A separate (functionally identical) definition lives in core/helpers.py
+    for backwards-compat — both point at the same underlying `_wallet_locks`
+    dict so they remain a single source of truth at runtime."""
+    if user_id not in _wallet_locks:
+        _wallet_locks[user_id] = asyncio.Lock()
+    return _wallet_locks[user_id]
+
+def _get_game_lock(game_id: str) -> asyncio.Lock:
+    """Per-game lock factory.  See _get_wallet_lock above for the
+    rationale on the foundation-layer placement."""
+    if game_id not in _game_locks:
+        _game_locks[game_id] = asyncio.Lock()
+    return _game_locks[game_id]
+
 _banned_set: set = set()
 
 _tempbanned_set: set = set()
