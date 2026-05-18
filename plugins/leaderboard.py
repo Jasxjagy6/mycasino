@@ -637,12 +637,45 @@ async def _flush_leaderboard_buffer():
             logging.debug(f"[LEADERBOARD] batch of {len(batch)} processed")
 
 def update_leaderboards(user_id, bet_amount, win_amount=0, game_type="", multiplier=0):
-    """Update leaderboard data after each bet"""
+    """Update leaderboard data after each bet.
+
+    Phase 2: when ``MYCASINO_REDIS_BACKEND`` is set we also push the
+    wager/win deltas into Redis sorted sets via
+    :func:`core.redis_backend.lb_incr`.  The in-memory ``leaderboard_data``
+    structure stays authoritative for the player-facing UI until a later
+    PR flips reads over to Redis; the mirror just gets the data ready
+    for that switch and makes the leaderboard horizontally scalable
+    across stateless PTB workers in the meantime.
+    """
     global leaderboard_data, leaderboard_last_update
 
     # Get user info
     username = user_stats.get(user_id, {}).get('userinfo', {}).get('username', f'User-{user_id}')
     username = username.lstrip('@')
+
+    # Phase 2 Redis mirror — fire-and-forget so the legacy bet flow
+    # never blocks on Redis I/O.
+    try:
+        from core import redis_backend as _rb
+        if _rb.redis_enabled():
+            import asyncio as _aio
+            try:
+                _loop = _aio.get_running_loop()
+                if bet_amount and float(bet_amount) > 0:
+                    for _period in ("daily", "weekly", "monthly", "alltime"):
+                        _loop.create_task(
+                            _rb.lb_incr(_period, "wagered", int(user_id), float(bet_amount))
+                        )
+                if win_amount and float(win_amount) > 0:
+                    for _period in ("daily", "weekly", "monthly", "alltime"):
+                        _loop.create_task(
+                            _rb.lb_incr(_period, "won", int(user_id), float(win_amount))
+                        )
+            except RuntimeError:
+                # No running loop — fall through to legacy in-memory path.
+                pass
+    except Exception:  # noqa: BLE001
+        logging.exception("Redis leaderboard mirror failed for user=%s", user_id)
 
     # Check for weekly/monthly reset
     now = datetime.now(timezone.utc)

@@ -360,6 +360,14 @@ async def smart_rate_limit(chat_id, chat_type="private"):
     - In groups: faster rolling (0.5s between, 2s animation wait)
     - In DMs: moderate speed (0.7s between, 3s animation wait)
     - Tracks timestamps to avoid hitting Telegram limits
+
+    Phase 2: when ``MYCASINO_REDIS_BACKEND`` is set, the sliding-window
+    counter is shared across **every** stateless PTB worker via
+    :func:`core.redis_backend.check_rate_limit`.  Two workers serving
+    the same chat will not both blast Telegram in the same window —
+    the second worker waits.  The legacy per-process timestamp dict
+    is kept as a fallback so a Redis outage degrades to today's
+    behaviour.
     """
     global emoji_send_timestamps
 
@@ -375,6 +383,24 @@ async def smart_rate_limit(chat_id, chat_type="private"):
         # DM settings
         min_interval = 0.5
         animation_wait = 3.0
+
+    # Phase 2: cross-worker sliding-window guard via Redis.  We allow
+    # at most one emoji send per ``min_interval`` per chat — when the
+    # window is exhausted the helper *blocks* for ``retry_after_ms``
+    # rather than racing past the legacy timestamp guard.
+    try:
+        from core import redis_backend as _rb
+        if _rb.redis_enabled():
+            window_ms = max(1, int(min_interval * 1000))
+            res = await _rb.check_rate_limit(
+                f"emoji:{chat_id}",
+                limit=1,
+                window_ms=window_ms,
+            )
+            if not res.allowed and res.retry_after_ms > 0:
+                await asyncio.sleep(res.retry_after_ms / 1000.0)
+    except Exception:  # noqa: BLE001
+        logging.exception("Redis rate-limit failed for chat=%s; legacy path", chat_id)
 
     # Wait if needed to respect minimum interval
     time_since_last = now - last_send
