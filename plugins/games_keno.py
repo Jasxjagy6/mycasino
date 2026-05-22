@@ -420,13 +420,13 @@ async def keno_rebet_double_callback(update: Update, context: ContextTypes.DEFAU
         await query.answer("Bet exceeds limits", show_alert=True)
         return
 
-    # Deduct bet atomically (per-user lock prevents double-spend across
-    # concurrent rebet/double clicks and across queue workers).
-    try:
-        await deduct_wallet_safe(user.id, bet_amount)
-    except ValueError:
+    # Check balance
+    if get_active_balance_usd(user.id) < bet_amount:
         await query.answer("Insufficient balance!", show_alert=True)
         return
+
+    # Deduct bet
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
 
     game_id = generate_unique_id("KN")

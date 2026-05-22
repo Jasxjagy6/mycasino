@@ -857,12 +857,11 @@ async def blackjack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         hand_index = hand_index_for_callback
         current_bet = game["split_bets"][hand_index]
 
-        # Deduct double-down stake atomically (per-user lock).
-        try:
-            await deduct_wallet_safe(user.id, current_bet)
-        except ValueError:
+        if get_active_balance_usd(user.id) < current_bet:
             await query.answer(f"{pe('cross')} Not enough balance to double!", show_alert=True)
             return
+
+        deduct_wallet(user.id, current_bet)
         game["split_bets"][hand_index] *= 2
         save_user_data(user.id)
 

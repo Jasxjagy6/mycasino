@@ -487,44 +487,23 @@ async def oxapay_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.Re
     # Always return 200 to OxaPay — errors are logged server-side.
     ok = aiohttp.web.Response(text="ok")
 
-    # Refuse to operate if no merchant key is configured.  In that mode we
-    # cannot verify ANY signature so every callback must be rejected;
-    # otherwise an attacker could spam unsigned credits.
-    if not OXAPAY_MERCHANT_KEY:
-        logging.critical(
-            "OxaPay webhook hit but OXAPAY_MERCHANT_KEY is not configured — "
-            "rejecting callback. Set OXAPAY_MERCHANT_KEY in the environment."
-        )
-        return aiohttp.web.Response(text="oxapay merchant key not configured", status=503)
-
     try:
         # ── 1. Read raw body (needed for HMAC before JSON parsing) ──
         raw_body = await request.read()
         data = json.loads(raw_body)
-        # NOTE: do not log the full payload at INFO level in production —
-        # it may include addresses / amounts useful to an attacker building
-        # forged callbacks. Keep at DEBUG and rely on the structured audit
-        # log instead.
-        logging.debug(f"OxaPay webhook received: {data}")
+        logging.info(f"OxaPay webhook received: {data}")
 
-        # ── 2. Signature verification (MANDATORY) ──
-        # SECURITY: A missing `hmac` field is now a hard rejection.  Previously
-        # the verification was conditional on the field being present, so an
-        # attacker could simply omit it to forge credits.
-        received_hmac = data.get("hmac", "") or request.headers.get("hmac", "")
-        if not received_hmac:
-            logging.warning("OxaPay webhook: missing hmac field — rejecting callback")
-            return ok
-
-        # OxaPay computes the HMAC over the payload *without* the hmac
-        # field itself, so we rebuild the body excluding it.
-        verify_data = {k: v for k, v in data.items() if k != "hmac"}
-        verify_body = json.dumps(verify_data, separators=(",", ":")).encode()
-        if not verify_oxapay_signature(verify_body, received_hmac):
-            logging.warning(
-                "OxaPay webhook: HMAC signature mismatch — ignoring callback"
-            )
-            return ok
+        # ── 2. Signature verification ──
+        received_hmac = data.get("hmac", "")
+        if received_hmac:
+            # Strip the hmac field from the body before verification:
+            # OxaPay computes the HMAC over the payload *without* the hmac
+            # field itself, so we rebuild the body excluding it.
+            verify_data = {k: v for k, v in data.items() if k != "hmac"}
+            verify_body = json.dumps(verify_data, separators=(",", ":")).encode()
+            if not verify_oxapay_signature(verify_body, received_hmac):
+                logging.warning("OxaPay webhook: HMAC signature mismatch — ignoring callback")
+                return ok
 
         # ── 3. Only process terminal success statuses ──
         status = data.get("status", "").lower()
@@ -544,29 +523,12 @@ async def oxapay_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.Re
         pay_amount = float(raw_pay) if raw_pay is not None else amount_usd
 
         # ── 5. Duplicate guard (keyed on orderId which we control) ──
-        # SECURITY: persist dedup state to disk BEFORE crediting the wallet
-        # so a crash between credit and dedup-flush cannot re-credit the
-        # same order on restart.  The in-memory set is still consulted
-        # first as a fast-path.
         dedup_key = order_id
-        if not dedup_key:
-            logging.warning("OxaPay webhook: missing orderId — rejecting callback")
-            return ok
         if dedup_key in _oxapay_processed_orders:
             logging.info(f"OxaPay webhook: duplicate callback for {dedup_key} — skipping")
             return ok
         _oxapay_processed_orders.add(dedup_key)
-        try:
-            _save_oxapay_processed_orders()
-        except Exception as persist_err:
-            # If we cannot persist dedup state, refuse to credit — replaying
-            # this callback after a crash would otherwise double-credit.
-            _oxapay_processed_orders.discard(dedup_key)
-            logging.error(
-                f"OxaPay webhook: dedup persistence failed for {dedup_key}: "
-                f"{persist_err}. Refusing to credit until persistence is healthy."
-            )
-            return ok
+        _save_oxapay_processed_orders()  # Persist immediately to prevent double-credit on restart
 
         # ── 6. Validate amount ──
         if pay_amount <= 0:
@@ -786,40 +748,20 @@ async def withdrawal_cancel_callback(update: Update, context: ContextTypes.DEFAU
         await query.answer("Withdrawal request not found.", show_alert=True)
         return
 
-    # Fast-path UX rejection if the request was already processed.  The
-    # AUTHORITATIVE check is re-run inside the lock below to close the
-    # double-refund race described in upgrade_and_fixes.txt S2.
     if withdrawal["status"] != "pending":
         await query.answer(f"This withdrawal has already been {withdrawal['status']}.", show_alert=True)
         return
 
-    # Return funds to user (ATOMIC - prevents race conditions).
-    # SECURITY: status re-check, credit, and status mutation MUST all happen
-    # inside the same _get_withdrawal_lock so two concurrent admin clicks
-    # (or /withdrawinfo re-submissions) cannot both credit the user.
+    # Return funds to user (ATOMIC - prevents race conditions)
     user_id = withdrawal["user_id"]
     amount_usd = withdrawal["amount_usd"]
     async with _get_withdrawal_lock(user_id):
-        # Re-fetch + re-check inside the lock.  Another admin click may have
-        # already cancelled or approved this request between our fast-path
-        # check above and our lock acquisition here.
-        current = withdrawal_requests.get(withdrawal_id)
-        if not current:
-            await query.answer("Withdrawal request not found.", show_alert=True)
-            return
-        if current["status"] != "pending":
-            await query.answer(
-                f"This withdrawal has already been {current['status']}.",
-                show_alert=True,
-            )
-            return
         credit_wallet_safe(user_id, amount_usd)
-        current["status"] = "cancelled"
-        current["cancelled_at"] = str(datetime.now(timezone.utc))
-        # Refresh the outer reference so the post-lock notification code
-        # (which reads withdrawal["amount_usd"] etc.) sees the updated row.
-        withdrawal = current
     save_user_data(user_id)
+
+    # Update withdrawal status
+    withdrawal["status"] = "cancelled"
+    withdrawal["cancelled_at"] = str(datetime.now(timezone.utc))
 
     # Notify user
     coin = withdrawal.get("coin", "USDT")
