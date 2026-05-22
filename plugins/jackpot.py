@@ -46,16 +46,7 @@ def _jackpot_user_7d_wager(user_id) -> float:
 def _jackpot_credit(user_id: int, bet_amount_usd: float):
     """Hook called from ``update_stats_on_bet``. Adds the configured
     percentage of ``bet_amount_usd`` to the pool and records the bet
-    against the user's 7-day wager bucket.
-
-    Phase 2: when ``MYCASINO_REDIS_BACKEND`` is set, the pool delta is
-    also added to a Redis ``INCRBYFLOAT`` counter via
-    :func:`core.redis_backend.incr_jackpot`.  This is a *mirror*, not
-    a switch-over: the in-memory pool stays the source of truth for
-    the player-facing ``/jackpot`` UI until reads are flipped in a
-    later PR.  Multiple stateless workers can credit the same pool
-    without losing increments.
-    """
+    against the user's 7-day wager bucket."""
     if bet_amount_usd is None or bet_amount_usd <= 0:
         return
     _jackpot_load()
@@ -63,20 +54,6 @@ def _jackpot_credit(user_id: int, bet_amount_usd: float):
     contribution = float(bet_amount_usd) * rate
     if contribution > 0:
         _jackpot_state["pool"] = float(_jackpot_state.get("pool", 0.0)) + contribution
-        # Best-effort Redis mirror.  Schedule fire-and-forget so the
-        # sync caller never blocks on network I/O.
-        try:
-            from core import redis_backend as _rb
-            if _rb.redis_enabled():
-                import asyncio as _aio
-                try:
-                    _loop = _aio.get_running_loop()
-                    _loop.create_task(_rb.incr_jackpot("daily", contribution))
-                except RuntimeError:
-                    # No running loop (e.g. called from a sync test) — drop.
-                    pass
-        except Exception:  # noqa: BLE001
-            logging.exception("Redis jackpot mirror failed for user=%s", user_id)
     key = str(user_id)
     bucket = _jackpot_state["user_wagers"].setdefault(key, {})
     today = _jackpot_today_utc_key()

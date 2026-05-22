@@ -2,14 +2,6 @@
 from __future__ import annotations
 from core.foundation import *  # noqa: F401, F403
 
-# Phase 2: best-effort dual-write to the PG ledger.  The legacy
-# in-memory ``user_wallets`` dict stays authoritative for reads (the
-# bot UI calls ``ensure_wallet_dict`` directly from hundreds of
-# places), but every mutation is mirrored to ``ledger_entries`` so a
-# future PR can flip reads over to PG without backfilling at cutover.
-# When ``MYCASINO_PG_LEDGER`` is unset the writer is a no-op.
-from core import ledger_writer as _ledger_writer
-
 def format_crypto_amount(amount: float, coin: str) -> str:
     """Format crypto amount with appropriate precision."""
     precision = CRYPTO_PRECISION.get(coin, 5)
@@ -24,16 +16,10 @@ def get_total_balance_usd(user_id: int) -> float:
         total += amount * price
     return total
 
-def deduct_wallet(user_id: int, usd_amount: float, coin: str = None, *, intent_id: str = None, ref: str = None):
+def deduct_wallet(user_id: int, usd_amount: float, coin: str = None):
     """Deduct crypto equivalent of USD amount from user's wallet.
     Returns (crypto_amount, coin).
-    SECURITY: Validates amount and prevents going negative.
-
-    Phase 2: a best-effort mirror of the deduction is sent to the PG
-    ledger via :mod:`core.ledger_writer` so the journal stays in sync
-    with the in-memory wallet.  ``intent_id`` (when supplied) makes
-    the PG write idempotent across retries.
-    """
+    SECURITY: Validates amount and prevents going negative."""
     import math as _math_dw
     if _math_dw.isnan(usd_amount) or _math_dw.isinf(usd_amount) or usd_amount <= 0:
         logging.warning(f"deduct_wallet: rejected invalid amount {usd_amount} for user {user_id}")
@@ -48,29 +34,13 @@ def deduct_wallet(user_id: int, usd_amount: float, coin: str = None, *, intent_i
         logging.warning(f"deduct_wallet: INSUFFICIENT user {user_id} has {current} {coin} but needs {crypto_amount} {coin}")
         raise ValueError("INSUFFICIENT_FUNDS")
     wallet[coin] = max(0.0, current - crypto_amount)
-    _ledger_writer.enqueue_mutation(
-        user_id,
-        coin,
-        -crypto_amount,
-        kind="bet_debit",
-        intent_id=intent_id,
-        ref=ref,
-        metadata={"usd": float(usd_amount), "price": float(price)},
-    )
     return crypto_amount, coin
 
-async def deduct_wallet_safe(user_id: int, usd_amount: float, coin: str = None, *, intent_id: str = None, ref: str = None):
+async def deduct_wallet_safe(user_id: int, usd_amount: float, coin: str = None):
     """
     ATOMIC wallet deduction using per-user asyncio.Lock.
     Returns (crypto_amount, coin) or raises ValueError("INSUFFICIENT_FUNDS").
     Use this instead of deduct_wallet() everywhere a bet is placed.
-
-    Phase 2: when ``MYCASINO_PG_LEDGER=1`` is set, the deduction is
-    mirrored to the Postgres ledger via :func:`core.ledger_writer
-    .enqueue_bet_debit`.  ``intent_id``/``ref`` (typically the
-    plugin's ``game_id``) make the PG write idempotent — a retry
-    after a crash will re-find the existing ledger row instead of
-    double-debiting.
     """
     async with _get_wallet_lock(user_id):
         wallet = ensure_wallet_dict(user_id)
@@ -82,15 +52,6 @@ async def deduct_wallet_safe(user_id: int, usd_amount: float, coin: str = None, 
         if current < crypto_amount - 1e-10:
             raise ValueError("INSUFFICIENT_FUNDS")
         wallet[coin] = current - crypto_amount
-        _ledger_writer.enqueue_mutation(
-            user_id,
-            coin,
-            -crypto_amount,
-            kind="bet_debit",
-            intent_id=intent_id,
-            ref=ref,
-            metadata={"usd": float(usd_amount), "price": float(price)},
-        )
         return crypto_amount, coin
 
 def calculate_bet_deduction(user_id: int, bet_amount_usd: float) -> tuple:

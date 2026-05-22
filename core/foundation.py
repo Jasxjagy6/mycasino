@@ -1181,16 +1181,10 @@ def get_active_balance_usd(user_id: int) -> float:
     price = LIVE_PRICES.get(coin, 1.0)
     return crypto_balance * price
 
-def credit_wallet(user_id: int, usd_amount: float, coin: str = None, *, intent_id: str = None, ref: str = None, kind: str = "bet_credit"):
+def credit_wallet(user_id: int, usd_amount: float, coin: str = None):
     """Credit crypto equivalent of USD amount to user's wallet.
     Returns (crypto_amount, coin).
-    SECURITY: Validates amount before crediting to prevent exploit.
-
-    Phase 2: best-effort mirror to the PG ledger via
-    :mod:`core.ledger_writer` (no-op when ``MYCASINO_PG_LEDGER`` is
-    unset).  ``intent_id`` / ``ref`` (typically the plugin's game_id)
-    make the PG write idempotent across crash-retry.
-    """
+    SECURITY: Validates amount before crediting to prevent exploit."""
     import math as _math_cw
     if _math_cw.isnan(usd_amount) or _math_cw.isinf(usd_amount) or usd_amount <= 0:
         logging.warning(f"credit_wallet: rejected invalid amount {usd_amount} for user {user_id}")
@@ -1206,56 +1200,22 @@ def credit_wallet(user_id: int, usd_amount: float, coin: str = None, *, intent_i
     price = LIVE_PRICES.get(coin, 1.0)
     crypto_amount = usd_amount / price
     wallet[coin] = wallet.get(coin, 0.0) + crypto_amount
-    try:
-        from core import ledger_writer as _lw
-        _lw.enqueue_mutation(
-            user_id,
-            coin,
-            crypto_amount,
-            kind=kind,
-            intent_id=intent_id,
-            ref=ref,
-            metadata={"usd": float(usd_amount), "price": float(price)},
-        )
-    except Exception:  # noqa: BLE001
-        pass
     return crypto_amount, coin
 
-def credit_wallet_crypto(user_id: int, crypto_amount: float, coin: str, *, intent_id: str = None, ref: str = None, kind: str = "credit"):
+def credit_wallet_crypto(user_id: int, crypto_amount: float, coin: str):
     """Credit a specific crypto amount directly (no conversion).
-    SECURITY: Validates amount; allows negative only for rain deductions.
-
-    Phase 2: best-effort mirror to the PG ledger.  ``kind`` defaults
-    to a generic ``"credit"`` since this helper is used for tips,
-    rain, fees and refunds — callers can override (e.g. ``"tip_in"``)
-    so the journal records the semantic operation.
-    """
+    SECURITY: Validates amount; allows negative only for rain deductions."""
     import math as _math_cwc
     if _math_cwc.isnan(crypto_amount) or _math_cwc.isinf(crypto_amount):
         logging.warning(f"credit_wallet_crypto: rejected NaN/Inf for user {user_id}")
         return
     wallet = ensure_wallet_dict(user_id)
     wallet[coin] = wallet.get(coin, 0.0) + crypto_amount
-    try:
-        from core import ledger_writer as _lw
-        _lw.enqueue_mutation(
-            user_id,
-            coin,
-            crypto_amount,
-            kind=kind,
-            intent_id=intent_id,
-            ref=ref,
-        )
-    except Exception:  # noqa: BLE001
-        pass
 
-def credit_wallet_safe(user_id: int, usd_amount: float, coin: str = None, *, intent_id: str = None, ref: str = None, kind: str = "bet_credit"):
+def credit_wallet_safe(user_id: int, usd_amount: float, coin: str = None):
     """
     Credit is always safe (wins/refunds). No lock needed for credit-only ops.
     SECURITY: Validates amount before crediting.
-
-    Phase 2: best-effort mirror to the PG ledger (same idempotency
-    contract as :func:`credit_wallet`).
     """
     import math as _math_cws
     if _math_cws.isnan(usd_amount) or _math_cws.isinf(usd_amount) or usd_amount <= 0:
@@ -1267,19 +1227,6 @@ def credit_wallet_safe(user_id: int, usd_amount: float, coin: str = None, *, int
     price = LIVE_PRICES.get(coin, 1.0)
     crypto_amount = usd_amount / price
     wallet[coin] = wallet.get(coin, 0.0) + crypto_amount
-    try:
-        from core import ledger_writer as _lw
-        _lw.enqueue_mutation(
-            user_id,
-            coin,
-            crypto_amount,
-            kind=kind,
-            intent_id=intent_id,
-            ref=ref,
-            metadata={"usd": float(usd_amount), "price": float(price)},
-        )
-    except Exception:  # noqa: BLE001
-        pass
     return crypto_amount, coin
 
 leaderboard_data = {
