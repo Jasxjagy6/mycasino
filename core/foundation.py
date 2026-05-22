@@ -902,21 +902,6 @@ LIVE_PRICES = {
     "LTC": 70.0,
 }
 
-# Phase 1d (audit S19): track WHEN each coin's price was last updated
-# so callers can detect staleness. Hardcoded defaults above were the
-# source of an arbitrage exploit when the operator forgot to bump
-# them: a user could deposit while a coin was over-priced in our
-# dict and withdraw while it was under-priced. ``core.prices`` reads
-# this mapping via ``LivePricesSource`` to decide whether a price is
-# fresh enough to lock for a bet.
-import time as _time_for_prices
-LIVE_PRICES_UPDATED_AT: dict = {
-    # USDT is hardcoded 1.0 and never "stale" -- treat the import time
-    # as its last-updated time so freshness checks pass on first boot.
-    "USDT": _time_for_prices.time(),
-}
-del _time_for_prices
-
 CRYPTO_SYMBOLS = {
     "USDT": "💵", "BTC": "₿", "ETH": "💎", "SOL": "◎",
     "BNB": "🔶", "TRX": "🔷", "LTC": "🪙",
@@ -1160,7 +1145,7 @@ async def _get_http_client() -> httpx.AsyncClient:
 
 async def update_live_prices():
     """Background task: fetch live prices from MEXC API every 5 minutes."""
-    global LIVE_PRICES, LIVE_PRICES_UPDATED_AT
+    global LIVE_PRICES
     symbols_map = {
         "ETHUSDT": "ETH", "BNBUSDT": "BNB", "SOLUSDT": "SOL",
         "TRXUSDT": "TRX", "LTCUSDT": "LTC", "BTCUSDT": "BTC",
@@ -1172,15 +1157,10 @@ async def update_live_prices():
             if resp.status_code == 200:
                 data = resp.json()
                 price_map = {item["symbol"]: float(item["price"]) for item in data}
-                now_ts = time.time()
                 for api_sym, coin in symbols_map.items():
                     if api_sym in price_map and price_map[api_sym] > 0:
                         LIVE_PRICES[coin] = price_map[api_sym]
-                        # Phase 1d: stamp the freshness time so
-                        # core.prices can detect stale feeds.
-                        LIVE_PRICES_UPDATED_AT[coin] = now_ts
                 LIVE_PRICES["USDT"] = 1.0  # Always fixed
-                LIVE_PRICES_UPDATED_AT["USDT"] = now_ts
                 logging.info(f"Live prices updated: { {k: f'${v:,.2f}' for k, v in LIVE_PRICES.items()} }")
             else:
                 logging.warning(f"MEXC price API returned status {resp.status_code}")
@@ -1209,16 +1189,9 @@ def get_active_balance_usd(user_id: int) -> float:
     price = LIVE_PRICES.get(coin, 1.0)
     return crypto_balance * price
 
-def credit_wallet(user_id: int, usd_amount: float, coin: str = None,
-                  *, locked_price: float = None):
+def credit_wallet(user_id: int, usd_amount: float, coin: str = None):
     """Credit crypto equivalent of USD amount to user's wallet.
     Returns (crypto_amount, coin).
-
-    Phase 1d (audit S19): pass ``locked_price`` to credit at a price
-    that was locked when the bet started, instead of the current
-    ``LIVE_PRICES`` value. This prevents intra-game price drift from
-    silently moving money between the player and the house.
-
     SECURITY: Validates amount before crediting to prevent exploit."""
     import math as _math_cw
     if _math_cw.isnan(usd_amount) or _math_cw.isinf(usd_amount) or usd_amount <= 0:
@@ -1232,11 +1205,7 @@ def credit_wallet(user_id: int, usd_amount: float, coin: str = None,
     wallet = ensure_wallet_dict(user_id)
     if coin is None:
         coin = get_active_currency(user_id)
-    # Phase 1d: prefer the bet-time locked price if supplied.
-    if locked_price is not None and locked_price > 0:
-        price = float(locked_price)
-    else:
-        price = LIVE_PRICES.get(coin, 1.0)
+    price = LIVE_PRICES.get(coin, 1.0)
     crypto_amount = usd_amount / price
     wallet[coin] = wallet.get(coin, 0.0) + crypto_amount
     return crypto_amount, coin
@@ -1251,14 +1220,9 @@ def credit_wallet_crypto(user_id: int, crypto_amount: float, coin: str):
     wallet = ensure_wallet_dict(user_id)
     wallet[coin] = wallet.get(coin, 0.0) + crypto_amount
 
-def credit_wallet_safe(user_id: int, usd_amount: float, coin: str = None,
-                       *, locked_price: float = None):
+def credit_wallet_safe(user_id: int, usd_amount: float, coin: str = None):
     """
     Credit is always safe (wins/refunds). No lock needed for credit-only ops.
-
-    Phase 1d: ``locked_price`` lets callers settle a bet at the price
-    that was locked when the bet started (see ``core.prices``).
-
     SECURITY: Validates amount before crediting.
     """
     import math as _math_cws
@@ -1268,10 +1232,7 @@ def credit_wallet_safe(user_id: int, usd_amount: float, coin: str = None,
     wallet = ensure_wallet_dict(user_id)
     if coin is None:
         coin = get_active_currency(user_id)
-    if locked_price is not None and locked_price > 0:
-        price = float(locked_price)
-    else:
-        price = LIVE_PRICES.get(coin, 1.0)
+    price = LIVE_PRICES.get(coin, 1.0)
     crypto_amount = usd_amount / price
     wallet[coin] = wallet.get(coin, 0.0) + crypto_amount
     return crypto_amount, coin
@@ -9475,7 +9436,7 @@ def main():
         # Start live price engine as background task
         async def _price_update_job(context):
             """Wrapper to run price update once via job_queue."""
-            global LIVE_PRICES, LIVE_PRICES_UPDATED_AT
+            global LIVE_PRICES
             symbols_map = {
                 "ETHUSDT": "ETH", "BNBUSDT": "BNB", "SOLUSDT": "SOL",
                 "TRXUSDT": "TRX", "LTCUSDT": "LTC", "BTCUSDT": "BTC",
@@ -9486,14 +9447,10 @@ def main():
                     if resp.status_code == 200:
                         data = resp.json()
                         price_map = {item["symbol"]: float(item["price"]) for item in data}
-                        now_ts = time.time()
                         for api_sym, coin in symbols_map.items():
                             if api_sym in price_map and price_map[api_sym] > 0:
                                 LIVE_PRICES[coin] = price_map[api_sym]
-                                # Phase 1d: stamp freshness time.
-                                LIVE_PRICES_UPDATED_AT[coin] = now_ts
                         LIVE_PRICES["USDT"] = 1.0
-                        LIVE_PRICES_UPDATED_AT["USDT"] = now_ts
                         logging.info(f"Live prices updated via job_queue")
             except Exception as e:
                 logging.warning(f"Failed to fetch live prices: {e}")

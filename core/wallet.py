@@ -16,17 +16,9 @@ def get_total_balance_usd(user_id: int) -> float:
         total += amount * price
     return total
 
-def deduct_wallet(user_id: int, usd_amount: float, coin: str = None,
-                  *, locked_price: float = None):
+def deduct_wallet(user_id: int, usd_amount: float, coin: str = None):
     """Deduct crypto equivalent of USD amount from user's wallet.
     Returns (crypto_amount, coin).
-
-    Phase 1d (audit S19): pass ``locked_price`` to deduct at a quote
-    that was locked just before the call (e.g. taken with
-    ``core.prices.lock_price``). The matching credit/refund call
-    should pass the same ``locked_price`` to keep the round-trip
-    USD<->crypto conversion symmetric.
-
     SECURITY: Validates amount and prevents going negative."""
     import math as _math_dw
     if _math_dw.isnan(usd_amount) or _math_dw.isinf(usd_amount) or usd_amount <= 0:
@@ -35,10 +27,7 @@ def deduct_wallet(user_id: int, usd_amount: float, coin: str = None,
     wallet = ensure_wallet_dict(user_id)
     if coin is None:
         coin = get_active_currency(user_id)
-    if locked_price is not None and locked_price > 0:
-        price = float(locked_price)
-    else:
-        price = LIVE_PRICES.get(coin, 1.0)
+    price = LIVE_PRICES.get(coin, 1.0)
     crypto_amount = usd_amount / price
     current = wallet.get(coin, 0.0)
     if current < crypto_amount - 1e-10:
@@ -47,24 +36,17 @@ def deduct_wallet(user_id: int, usd_amount: float, coin: str = None,
     wallet[coin] = max(0.0, current - crypto_amount)
     return crypto_amount, coin
 
-async def deduct_wallet_safe(user_id: int, usd_amount: float, coin: str = None,
-                              *, locked_price: float = None):
+async def deduct_wallet_safe(user_id: int, usd_amount: float, coin: str = None):
     """
     ATOMIC wallet deduction using per-user asyncio.Lock.
     Returns (crypto_amount, coin) or raises ValueError("INSUFFICIENT_FUNDS").
     Use this instead of deduct_wallet() everywhere a bet is placed.
-
-    Phase 1d: pass ``locked_price`` to use a previously-locked quote
-    instead of the current ``LIVE_PRICES`` value.
     """
     async with _get_wallet_lock(user_id):
         wallet = ensure_wallet_dict(user_id)
         if coin is None:
             coin = get_active_currency(user_id)
-        if locked_price is not None and locked_price > 0:
-            price = float(locked_price)
-        else:
-            price = LIVE_PRICES.get(coin, 1.0)
+        price = LIVE_PRICES.get(coin, 1.0)
         crypto_amount = usd_amount / price
         current = wallet.get(coin, 0.0)
         if current < crypto_amount - 1e-10:
