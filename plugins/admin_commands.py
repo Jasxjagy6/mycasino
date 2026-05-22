@@ -207,55 +207,21 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # PvP game - cancel timeout jobs for all players
             _cancel_pvp_timeout_jobs(context, item_id)
 
-        # Refund players.
-        #
-        # Phase 1f (audit M3): refund the EXACT crypto amount each
-        # player originally bet via ``refund_bet`` (see core/wallet.py).
-        # The previous ``credit_wallet(player_id, bet_amount_usd)`` call
-        # converted USD to crypto at the *current* LIVE_PRICES, which let
-        # a user arbitrage the admin's response time -- bet at one
-        # price, ask for cancellation, get back more crypto if the
-        # price moved against the house. ``refund_bet`` reads the
-        # crypto amount that was stored at bet time
-        # (``crypto_bet_amount``, the PvP ``deducted`` map, or a
-        # locked price quote) and credits exactly that.
-        bet_amount = game_data.get("bet_amount") or game_data.get("bet_amount_usd") or 0.0
-        if 'players' in game_data:  # PvP
+        # Refund players
+        if 'players' in game_data: # PvP
+            bet_amount = game_data["bet_amount"]
             for player_id in game_data['players']:
-                credited_crypto, refund_coin = refund_bet(
-                    player_id, game_data,
-                    reason=f"admin-cancel-pvp:{item_id}",
-                )
+                credit_wallet(player_id, bet_amount)
                 save_user_data(player_id)
-                try:
-                    await context.bot.send_message(
-                        player_id,
-                        (
-                            f"Match {item_id} cancelled by owner. "
-                            f"Refunded {credited_crypto:.10f} {refund_coin} "
-                            f"(originally bet ${bet_amount:.2f})."
-                        ),
-                    )
-                except Exception as e:
-                    logging.warning(f"Could not notify player {player_id}: {e}")
-        elif 'user_id' in game_data:  # Solo
+                try: await context.bot.send_message(player_id, f"Match {item_id} cancelled by owner. Bet of ${bet_amount:.2f} refunded.")
+                except Exception as e: logging.warning(f"Could not notify player {player_id}: {e}")
+        elif 'user_id' in game_data: # Solo
             player_id = game_data['user_id']
-            credited_crypto, refund_coin = refund_bet(
-                player_id, game_data,
-                reason=f"admin-cancel-solo:{item_id}",
-            )
+            bet_amount = game_data['bet_amount']
+            credit_wallet(player_id, bet_amount)
             save_user_data(player_id)
-            try:
-                await context.bot.send_message(
-                    player_id,
-                    (
-                        f"Your game {item_id} was cancelled by the owner. "
-                        f"Refunded {credited_crypto:.10f} {refund_coin} "
-                        f"(originally bet ${bet_amount:.2f})."
-                    ),
-                )
-            except Exception as e:
-                logging.warning(f"Could not notify player {player_id}: {e}")
+            try: await context.bot.send_message(player_id, f"Your game {item_id} was cancelled by the owner. Your bet of ${bet_amount:.2f} has been refunded.")
+            except Exception as e: logging.warning(f"Could not notify player {player_id}: {e}")
 
         await update.message.reply_text(f"Game {item_id} cancelled. Bets refunded.")
         return
