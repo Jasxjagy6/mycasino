@@ -6999,19 +6999,9 @@ async def pvb_cashout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     match_data["cashout_amount"] = cashout_amount
     match_data["cashout_multiplier"] = cashout_mult
 
-    # Update house balance (house keeps bet - cashout).
-    #
-    # Phase 1e (audit S5): the old ``bot_settings["house_balance"] =
-    # bot_settings.get("house_balance", 0) + house_profit`` form was a
-    # read-modify-write that could race with a concurrent bet settle
-    # and silently lose either update. Centralised through
-    # ``apply_house_balance_delta`` it now serialises via
-    # ``_house_balance_lock`` and gets an audit log entry.
+    # Update house balance (house keeps bet - cashout)
     house_profit = bet_amount - cashout_amount
-    await apply_house_balance_delta(
-        house_profit,
-        reason=f"emoji-match-cashout:{match_id}:user={user.id}",
-    )
+    bot_settings["house_balance"] = bot_settings.get("house_balance", 0) + house_profit
 
     chat_id = match_data.get("chat_id")
     # Emoji-game match messages are no longer pinned.

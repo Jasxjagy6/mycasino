@@ -250,16 +250,8 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         creator_id = raffle.get('creator')
         ticket_participants = raffle.get('participants', {})
 
-        # Add raffle prize to house balance (not refunded to creator).
-        #
-        # Phase 1e (audit S5): centralised through
-        # ``apply_house_balance_delta`` so the read-modify-write is
-        # serialised with concurrent bet settles and logged for
-        # post-mortem.
-        await apply_house_balance_delta(
-            prize,
-            reason=f"raffle-cancel:{item_id}",
-        )
+        # Add raffle prize to house balance (not refunded to creator)
+        bot_settings["house_balance"] = bot_settings.get("house_balance", 0) + prize
 
         # Refund ticket costs to all participants
         refund_count = 0
@@ -742,15 +734,7 @@ async def set_house_balance_step(update: Update, context: ContextTypes.DEFAULT_T
     try:
         amount = float(update.message.text)
         if amount < 0: raise ValueError
-        # Phase 1e (audit S5): set_house_balance is async and
-        # serialises with bet-settle / cashout via
-        # ``_house_balance_lock`` so an admin override cannot race a
-        # winning bet credit. It also writes a WARNING-level audit
-        # log entry recording the admin's identity.
-        await set_house_balance(
-            amount,
-            reason=f"admin-set:user={update.effective_user.id}",
-        )
+        bot_settings['house_balance'] = amount
         save_bot_state()
         await update.message.reply_text(f"{pe('house')} House balance set to ${amount:,.2f}.", parse_mode=ParseMode.HTML)
     except ValueError:
