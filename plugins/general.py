@@ -937,8 +937,8 @@ async def games_category_callback(update: Update, context: ContextTypes.DEFAULT_
                 [apply_button_style(InlineKeyboardButton("Predict", callback_data="game_predict"), 'success', peb('crystal')),  # GREEN
                  apply_button_style(InlineKeyboardButton("Roulette", callback_data="game_roulette"), 'success', peb('darts'))],  # GREEN
                 [apply_button_style(InlineKeyboardButton("Slots", callback_data="game_slots"), 'success', peb('casino')),  # GREEN
-                 apply_button_style(InlineKeyboardButton("Tower", callback_data="game_tower_start"), 'success', peb('tower'))],  # GREEN
-                [apply_button_style(InlineKeyboardButton("Mines", callback_data="game_mines_start"), 'success', peb('bomb')),  # GREEN
+                 apply_button_style(InlineKeyboardButton("Tower", callback_data="tower_help"), 'success', peb('tower'))],  # GREEN
+                [apply_button_style(InlineKeyboardButton("Mines", callback_data="mines_help"), 'success', peb('bomb')),  # GREEN
                  apply_button_style(InlineKeyboardButton("Keno", callback_data="game_keno"), 'success', peb('darts'))],  # GREEN
                 [apply_button_style(InlineKeyboardButton("Coin Flip", callback_data="game_coin_flip"), 'success', peb('coin')),  # GREEN
                  apply_button_style(InlineKeyboardButton("High-Low", callback_data="game_highlow"), 'success', peb('hilow'))],  # GREEN
@@ -1349,6 +1349,30 @@ async def game_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 ])
             )
 
+    elif data.startswith("game_pvb_help_"):
+        _pvb_help_map = {
+            "dice_bot": ("Dice", "dice", "🎲"),
+            "darts": ("Darts", "darts", "🎯"),
+            "football": ("Football", "goal", "⚽"),
+            "bowling": ("Bowling", "bowl", "🎳"),
+        }
+        _pvb_game_key = data.replace("game_pvb_help_", "")
+        _pvb_name, _pvb_cmd, _pvb_emoji = _pvb_help_map.get(
+            _pvb_game_key,
+            (_pvb_game_key.replace("_", " ").title(), _pvb_game_key.replace("_bot", ""), "🎮")
+        )
+        await safe_edit_message(query,
+            f"{_pvb_emoji} <b>{_pvb_name} — Play vs Bot</b>\n\n"
+            f"Use the command below to play against the bot:\n"
+            f"• <code>/{_pvb_cmd} amount</code>\n\n"
+            f"<b>Example:</b> <code>/{_pvb_cmd} 5</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"game_{_pvb_game_key}")]])
+        )
+        # Set menu owner after editing to ensure buttons work for this user
+        set_menu_owner(query.message, query.from_user.id)
+        return
+
     # PvP games
     elif data.startswith("game_"):
         game_name_map = {
@@ -1358,8 +1382,8 @@ async def game_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         game_name = game_name_map.get(game_key, game_key.replace("_", " ").title())
 
         keyboard = [
-            [InlineKeyboardButton("Play vs Bot", callback_data=f"pvb_start_{game_key}")],
-            [InlineKeyboardButton("Play vs Player", callback_data=f"pvp_info_{game_key}")],
+            [InlineKeyboardButton("PvB", callback_data=f"game_pvb_help_{game_key}")],
+            [InlineKeyboardButton("PvP", callback_data=f"pvp_info_{game_key}")],
             [InlineKeyboardButton("Back to Regular Games", callback_data="games_emoji_regular")]
         ]
 

@@ -9261,6 +9261,8 @@ def main():
     app.add_handler(CallbackQueryHandler(tower_rebet_double_callback, pattern=r"^tower_(rebet|double)_", block=False))
 
     # 7. General game callback handlers
+    # Help buttons for Mines and Tower (must be BEFORE tower_/mines_ handlers)
+    app.add_handler(CallbackQueryHandler(game_help_callback, pattern=r"^(mines_help|tower_help)$", block=False))
     app.add_handler(CallbackQueryHandler(coin_flip_callback, pattern=r"^flip_", block=False))
     app.add_handler(CallbackQueryHandler(tower_callback, pattern=r"^tower_", block=False))
     app.add_handler(CallbackQueryHandler(roulette_callback, pattern=r"^roul_", block=False))
@@ -9270,8 +9272,6 @@ def main():
     app.add_handler(CallbackQueryHandler(mines_pick_callback, pattern=r"^mines_", block=False))
     app.add_handler(CallbackQueryHandler(blackjack_callback, pattern=r"^bj_", block=False))
     app.add_handler(CallbackQueryHandler(game_info_callback, pattern=r"^game_", block=False))
-    # Help buttons for Mines and Tower
-    app.add_handler(CallbackQueryHandler(game_help_callback, pattern=r"^(mines_help|tower_help)$", block=False))
     # History pagination and view callbacks
     app.add_handler(CallbackQueryHandler(history_page_callback, pattern=r"^hist_page_", block=False))
     app.add_handler(CallbackQueryHandler(history_view_callback, pattern=r"^hist_view_", block=False))
