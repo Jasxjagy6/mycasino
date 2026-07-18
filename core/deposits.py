@@ -55,66 +55,32 @@ class OxaPayService:
             return None
 
 def build_deposit_menu():
-    """Build deposit menu dynamically based on available chains.
+    """Build simplified deposit menu — only UPI and CCTip."""
 
-    NOTE: this view intentionally uses plain unicode emoji rather than
-    premium <tg-emoji> tags because invalid emoji IDs make Telegram reject
-    the entire message with MESSAGE_HAS_INVALID_CUSTOM_EMOJI_ID, which
-    would cause /deposit to show users "an error occurred".
-    """
-    # Build chain list based on availability
-    chains_text = [
-        "\U0001F539 <b>Ethereum (ETH)</b> - ETH, USDT, USDC",
-        "\U0001F538 <b>BNB Chain (BNB)</b> - BNB, USDT, USDC",
-        "\U0001F537 <b>Base</b> - ETH, USDC",
+    keyboard_rows = []
+
+    upi_row = [
+        apply_button_style(
+            InlineKeyboardButton("\U0001F3E6 Deposit via UPI/Bank", callback_data="deposit_sunpaytm"),
+            'success', None,
+        )
     ]
+    keyboard_rows.append(upi_row)
 
-    keyboard_rows = [
-        [
-            apply_button_style(InlineKeyboardButton("Ethereum", callback_data="deposit_ETH"), 'primary', None),
-            apply_button_style(InlineKeyboardButton("BNB Chain", callback_data="deposit_BNB"), 'primary', None)
-        ],
-        [
-            apply_button_style(InlineKeyboardButton("Base", callback_data="deposit_BASE"), 'primary', None),
-        ]
-    ]
-
-    # Add TRON if available
-    if TRON_AVAILABLE:
-        chains_text.append("\U0001F53A <b>TRON (TRX)</b> - TRX, USDT")
-        keyboard_rows[-1].append(apply_button_style(InlineKeyboardButton("TRON", callback_data="deposit_TRON"), 'primary', None))
-
-    # Add Solana if available
-    row_3 = []
-    if SOLANA_AVAILABLE:
-        chains_text.append("\u25CE <b>Solana (SOL)</b> - SOL, USDT, USDC")
-        row_3.append(apply_button_style(InlineKeyboardButton("Solana", callback_data="deposit_SOLANA"), 'primary', None))
-
-    # TON deposit removed as per requirements
-    # if TON_AVAILABLE:
-    #     chains_text.append("• 💎 <b>TON</b> - TON")
-    #     row_3.append(InlineKeyboardButton("TON", callback_data="deposit_TON"))
-
-    if row_3:
-        keyboard_rows.append(row_3)
-
-    # Add bottom row - History BLUE, Back RED
     keyboard_rows.append([
-        apply_button_style(InlineKeyboardButton("Deposit History", callback_data="deposit_history"), 'primary', None),  # BLUE
-        apply_button_style(InlineKeyboardButton("Back", callback_data="back_to_main"), 'danger', None)  # RED
+        apply_button_style(InlineKeyboardButton("Deposit via CWallet", callback_data="deposit_cwallet"), 'primary', None),
     ])
 
-    # Add OxaPay option if configured
-    if OXAPAY_MERCHANT_KEY:
-        keyboard_rows.append([
-            apply_button_style(InlineKeyboardButton("Deposit via OxaPay", callback_data="deposit_oxapay"), 'primary', None)
-        ])
+    keyboard_rows.append([
+        apply_button_style(InlineKeyboardButton("Deposit History", callback_data="deposit_history"), 'primary', None),
+        apply_button_style(InlineKeyboardButton("Back", callback_data="back_to_main"), 'danger', None)
+    ])
 
     text = (
-        "💰 <b>Deposit Funds</b>\n\n"
-        "Select a blockchain to get your unique deposit address:\n\n"
-        + "\n".join(chains_text) + "\n\n"
-        f"<i>Minimum deposit: ${MIN_DEPOSIT_USD}</i>"
+        "\U0001F4B0 <b>Deposit Funds</b>\n\n"
+        f"{pe('bank')} <b>UPI / Bank Deposit (\u20b9)</b> — 95 INR = 1 USD\n"
+        f"{pe('gem')} <b>CWallet (CCTip)</b> — Send tip via @cctip_bot\n\n"
+        f"<i>Choose a deposit method below:</i>"
     )
 
     return text, keyboard_rows
@@ -133,15 +99,6 @@ async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not DEPOSIT_ENABLED:
         await update.message.reply_text("\u274C Deposits are currently disabled.")
-        return
-
-    # In group chats, don't show inline buttons - redirect to DM
-    if update.effective_chat.type in ['group', 'supergroup']:
-        bot_username = await get_bot_username(context)
-        await update.message.reply_text(
-            f"\U0001F48E To deposit, please message me privately: @{bot_username}",
-            parse_mode=ParseMode.HTML
-        )
         return
 
     text, keyboard_rows = build_deposit_menu()
@@ -370,6 +327,31 @@ async def back_to_deposit_menu(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Use safe_edit_message to handle the transition from Photo -> Text
     await safe_edit_message(query, text, reply_markup=create_styled_keyboard(keyboard), parse_mode=ParseMode.HTML)
+
+async def cwallet_deposit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not check_menu_ownership(query, context):
+        await query.answer("This menu is not for you.", show_alert=True)
+        return
+    await query.answer()
+    bot_username = (CWALLET_BOT_USERNAME or 'cctip_bot').lower().lstrip('@')
+    text = (
+        f"{pe('money')} <b>CWallet Deposit</b>\n\n"
+        f"Send any crypto tip via <b>@{bot_username}</b> "
+        f"to <b>@{CWALLET_RECEIVE_USERNAME}</b> in any Telegram group "
+        f"and the USD value will be instantly added to your casino balance!\n\n"
+        f"{pe('gem')} <b>Supported currencies:</b>\n"
+        f"USDT, BTC, ETH, LTC, TRX, SOL, BNB, and many more\n\n"
+        f"{pe('sparkles')} <b>How to deposit:</b>\n"
+        f"1. Go to any group that has @{bot_username}\n"
+        f"2. Type: <code>/tip @{CWALLET_RECEIVE_USERNAME} &lt;amount&gt; &lt;currency&gt;</code>\n"
+        f"3. Confirm the tip in CWallet\n"
+        f"4. The USD value is added to your balance here!\n\n"
+        f"{pe('star')} Prices are calculated at live market rates.\n"
+        f"{pe('check')} No blockchain fees, no waiting for confirmations!"
+    )
+    keyboard = [[InlineKeyboardButton("Back", callback_data=f"back_to_deposit_menu_{query.from_user.id}")]]
+    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
 
 async def oxapay_deposit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point: user clicks '⚡ Deposit via OxaPay'."""
@@ -776,7 +758,7 @@ async def withdrawal_cancel_callback(update: Update, context: ContextTypes.DEFAU
                 f"<b>Amount:</b> ${withdrawal['amount_usd']:.2f} ({format_crypto_amount(crypto_amount, coin)} {coin})\n\n"
                 f"Your withdrawal request has been cancelled by the administrator.\n"
                 f"The funds have been returned to your balance.\n\n"
-                f"For more information, please contact support @jashanxjagy."
+                f"For more information, please contact support @Ittz_surajj."
             ),
             parse_mode=ParseMode.HTML
         )

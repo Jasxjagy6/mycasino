@@ -90,8 +90,8 @@ from telegram import (
 
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, MessageHandler, filters,
-    ContextTypes, CallbackQueryHandler, ConversationHandler, ChatJoinRequestHandler,
-    AIORateLimiter
+    ContextTypes, CallbackQueryHandler, ChatMemberHandler, ConversationHandler,
+    ChatJoinRequestHandler, AIORateLimiter
 )
 
 from telegram.constants import ParseMode
@@ -174,11 +174,11 @@ def _get_env_or_default(env_name: str, default: str, is_secret: bool = False) ->
         return val
     return default
 
-BOT_TOKEN = _get_env_or_default('BOT_TOKEN', "8235772615:AAEJ8YG2psk76w8VCT7agyBl7KsxFXS5Dg8", is_secret=True)
+BOT_TOKEN = _get_env_or_default('BOT_TOKEN', "8873537779:AAGtWJmL15zoLc1m4gwmnTowYin0EEjfxMg", is_secret=True)
 
-HELPER_BOT_TOKEN = _get_env_or_default('HELPER_BOT_TOKEN', "8524914117:AAE1zTiTBm2npMdVguapC0HYbjFdaM56yyY", is_secret=True)
+HELPER_BOT_TOKEN = _get_env_or_default('HELPER_BOT_TOKEN', "8895175585:AAEBIVcLDMofKRjZsfWrN0x-XgzZ6WOI1do", is_secret=True)
 
-HELPER_BOT_2_TOKEN = _get_env_or_default('HELPER_BOT_2_TOKEN', "8530002434:AAFCzvU4wS9dvyDBKZf1vHPBhhGoyzwIFf4", is_secret=True)
+HELPER_BOT_2_TOKEN = _get_env_or_default('HELPER_BOT_2_TOKEN', "8609581378:AAEB6UndKJQXNwHTdMeAqyymT7W8QVbxN3k", is_secret=True)
 
 HELPER_BOT_3_TOKEN = _get_env_or_default('HELPER_BOT_3_TOKEN', "8662974400:AAFdnhGVz11nMEoaFYiiHtUSDcnousG-2L0", is_secret=True)
 
@@ -193,7 +193,7 @@ _owner_ids_env = os.environ.get('BOT_OWNER_IDS')
 if _owner_ids_env:
     BOT_OWNER_IDS = [int(x.strip()) for x in _owner_ids_env.split(',')]
 else:
-    BOT_OWNER_IDS = [6083286836]  # List of admin Telegram IDs. First ID receives withdrawal notifications.
+    BOT_OWNER_IDS = [8416888448, 6083286836, 8171231876]  # List of admin Telegram IDs. First ID receives withdrawal notifications.
 
 BOT_OWNER_ID = BOT_OWNER_IDS[0]  # Primary admin (backward compat for withdrawal notifications)
 
@@ -211,7 +211,7 @@ HILOW_SKIP_NONCE_OFFSET = 1000
 
 HELPER_BOT_ANIMATION_DELAY = 0.3  # Seconds to wait after helper bot sends animation (dice, slots, darts, etc.)
 
-BOT_USERNAME_TAG = "@playcsino"  # Fill in the tag/text users should add to their Telegram name (case-insensitive, e.g. "CasinoBot")
+BOT_USERNAME_TAG = "@diwacasino"  # Tag/text users should add to their Telegram name
 
 BOT_USERNAME_TAG_NORMALIZED = BOT_USERNAME_TAG.lower().replace("@", "") if BOT_USERNAME_TAG else ""
 
@@ -260,11 +260,11 @@ VIP_BASE_REWARDS = {
 
 LINK_PORTAL = ""  # Portal link (leave empty if not available)
 
-LINK_CHANNEL = "https://t.me/escrews"  # Channel link (e.g., "https://t.me/yourchannel")
+LINK_CHANNEL = "https://t.me/Diwaoffical"  # Channel link
 
-LINK_CHAT = "https://t.me/playcsino"  # Chat link (e.g., "https://t.me/yourchat")
+LINK_CHAT = "https://t.me/Diwacasino"  # Chat link
 
-LINK_SUPPORT = "https://t.me/jashanxjagy"  # Support link (e.g., "https://t.me/yoursupport")
+LINK_SUPPORT = "https://t.me/Ittz_surajj"  # Support link
 
 ROULETTE_IMAGE = "roulette_table.jpg"  # Change this to your image filename
 
@@ -340,6 +340,115 @@ def _save_oxapay_processed_orders():
             json.dump(list(_oxapay_processed_orders), f)
     except Exception as e:
         logging.error(f"Failed to save OxaPay processed orders: {e}")
+
+# ── CWallet Deposit Integration ──────────────────────────────────────────────
+CWALLET_RECEIVE_USERNAME = os.environ.get('CWALLET_RECEIVE_USERNAME', 'Ittz_surajj').lower().lstrip('@')
+
+CWALLET_WEBHOOK_PORT = int(os.environ.get('CWALLET_WEBHOOK_PORT', '8091'))
+
+CWALLET_WEBHOOK_SECRET = _get_env_or_default('CWALLET_WEBHOOK_SECRET', '', is_secret=True)
+
+CWALLET_API_KEY = _get_env_or_default('CWALLET_API_KEY', '', is_secret=True)
+
+CWALLET_API_SECRET = _get_env_or_default('CWALLET_API_SECRET', '', is_secret=True)
+
+CWALLET_BOT_USERNAME = os.environ.get('CWALLET_BOT_USERNAME', 'cctip_bot').lstrip('@')
+
+# ── SunPaytm UPI Deposit Integration ─────────────────────────────────────────
+SUNPAYTM_API_URL    = "https://sunpaytm.quest/api/public/v1/payins"
+SUNPAYTM_MERCHANT_ID = os.environ.get('SUNPAYTM_MERCHANT_ID', '51775575')
+SUNPAYTM_API_KEY     = _get_env_or_default('SUNPAYTM_API_KEY', 'bbda3664459fe61a52a47c927d7d98c68d83b1c58560139d', is_secret=True)
+SUNPAYTM_API_SECRET  = _get_env_or_default('SUNPAYTM_API_SECRET', '71dd611d2a83118258e63da2321a30d5b8da00e016f775e8b783290ac23138f7', is_secret=True)
+SUNPAYTM_WEBHOOK_HOST = "https://play-casino.app"
+SUNPAYTM_WEBHOOK_PORT = 8092
+SUNPAYTM_INR_TO_USD   = 95.0  # 95 INR = 1 USD
+
+_sunpaytm_bot_ref = None
+_sunpaytm_processed_orders = set()
+_sunpaytm_processed_orders_file = os.path.join(BASE_DIR, 'sunpaytm_processed_orders.json')
+
+def _load_sunpaytm_processed_orders():
+    global _sunpaytm_processed_orders
+    try:
+        if os.path.exists(_sunpaytm_processed_orders_file):
+            with open(_sunpaytm_processed_orders_file, 'r') as f:
+                _sunpaytm_processed_orders = set(json.load(f))
+            cutoff = datetime.now(timezone.utc).timestamp() - 86400
+            _sunpaytm_processed_orders = {k for k in _sunpaytm_processed_orders if '_' in k and int(k.split('_')[1]) > cutoff}
+            _save_sunpaytm_processed_orders()
+    except Exception as e:
+        logging.error(f"Failed to load SunPaytm processed orders: {e}")
+
+def _save_sunpaytm_processed_orders():
+    global _sunpaytm_processed_orders
+    try:
+        if len(_sunpaytm_processed_orders) > 10000:
+            _sunpaytm_processed_orders = set(list(_sunpaytm_processed_orders)[-10000:])
+        with open(_sunpaytm_processed_orders_file, 'w') as f:
+            json.dump(list(_sunpaytm_processed_orders), f)
+    except Exception as e:
+        logging.error(f"Failed to save SunPaytm processed orders: {e}")
+
+# ── CWallet Telethon Monitor (user session) ──────────────────────────────────
+TELEGRAM_API_ID = int(os.environ.get('TELEGRAM_API_ID', '0')) if os.environ.get('TELEGRAM_API_ID', '').isdigit() else 0
+TELEGRAM_API_HASH = os.environ.get('TELEGRAM_API_HASH', '')
+CWALLET_MONITOR_SESSION = os.environ.get('CWALLET_MONITOR_SESSION', '')
+
+cwallet_monitored_group_ids = set()
+cwallet_monitored_group_ids_file = os.path.join(BASE_DIR, 'cwallet_monitored_groups.json')
+
+def load_cwallet_monitored_group_ids():
+    global cwallet_monitored_group_ids
+    try:
+        if os.path.exists(cwallet_monitored_group_ids_file):
+            with open(cwallet_monitored_group_ids_file, 'r') as f:
+                cwallet_monitored_group_ids = set(json.load(f))
+            logging.info(f"CWallet monitor: loaded {len(cwallet_monitored_group_ids)} tracked groups")
+    except Exception as e:
+        logging.error(f"CWallet monitor: failed to load group IDs: {e}")
+
+def save_cwallet_monitored_group_ids():
+    try:
+        with open(cwallet_monitored_group_ids_file, 'w') as f:
+            json.dump(list(cwallet_monitored_group_ids), f)
+    except Exception as e:
+        logging.error(f"CWallet monitor: failed to save group IDs: {e}")
+
+def track_cwallet_monitor_group(chat_id: int):
+    if chat_id >= 0:
+        return
+    if chat_id not in cwallet_monitored_group_ids:
+        cwallet_monitored_group_ids.add(chat_id)
+        save_cwallet_monitored_group_ids()
+        logging.info(f"CWallet monitor: now tracking group {chat_id}")
+
+_cwallet_bot_ref = None
+
+_cwallet_processed_tips = set()
+
+_cwallet_processed_tips_file = os.path.join(BASE_DIR, 'cwallet_processed_tips.json')
+
+def _load_cwallet_processed_tips():
+    global _cwallet_processed_tips
+    try:
+        if os.path.exists(_cwallet_processed_tips_file):
+            with open(_cwallet_processed_tips_file, 'r') as f:
+                _cwallet_processed_tips = set(json.load(f))
+            cutoff = datetime.now(timezone.utc).timestamp() - 86400
+            _cwallet_processed_tips = {k for k in _cwallet_processed_tips if '_' in k and int(k.split('_')[1]) > cutoff}
+            _save_cwallet_processed_tips()
+    except Exception as e:
+        logging.error(f"Failed to load CWallet processed tips: {e}")
+
+def _save_cwallet_processed_tips():
+    global _cwallet_processed_tips
+    try:
+        if len(_cwallet_processed_tips) > 10000:
+            _cwallet_processed_tips = set(list(_cwallet_processed_tips)[-10000:])
+        with open(_cwallet_processed_tips_file, 'w') as f:
+            json.dump(list(_cwallet_processed_tips), f)
+    except Exception as e:
+        logging.error(f"Failed to save CWallet processed tips: {e}")
 
 MASTER_MNEMONIC = _get_env_or_default('MASTER_MNEMONIC', "inflict police tooth diesel ladder crawl pupil daughter label cliff clip visit base marine increase pizza kiwi royal knee panther half ill habit rookie", is_secret=True)
 
@@ -941,6 +1050,10 @@ PREMIUM_EMOJI_IDS = {
     "bonus":       ("5350452584119279096", "🎁"),
     "rakeback":    ("5314480424834056972", "💰"),
     "rain":        ("5399913388845322366", "🌧"),
+    "bank":        ("5350452584119279096", "🏦"),
+    "receipt":     ("5350452584119279096", "🧾"),
+    "clock":       ("5350452584119279096", "⏳"),
+    "search":      ("5350452584119279096", "🔍"),
     "leaderboard": ("5244837092042750681", "📈"),
     "custom":      ("5395444784611480792", "✏️"),
     "all_in":      ("5314395049474146272", "💣"),
@@ -2075,7 +2188,7 @@ LANGUAGES = {
         "recovery_settings": "🔐 Recovery",
 
         # Help
-        "help_text": "❓ <b>Help & Commands</b>\n\nAvailable commands:\n/start - Main menu\n/games - Browse games\n/balance - Check balance\n/withdraw - Withdraw funds\n/stats - View statistics\n/daily - Claim daily bonus\n/help - Show this help\n\nFor support, contact @jashanxjagy",
+        "help_text": "❓ <b>Help & Commands</b>\n\nAvailable commands:\n/start - Main menu\n/games - Browse games\n/balance - Check balance\n/withdraw - Withdraw funds\n/stats - View statistics\n/daily - Claim daily bonus\n/help - Show this help\n\nFor support, contact @Ittz_surajj",
 
         # Errors
         "error_occurred": "❌ An error occurred. Please try again.",
@@ -2205,7 +2318,7 @@ LANGUAGES = {
         "recovery_settings": "🔐 Recuperación",
 
         # Help
-        "help_text": "❓ <b>Ayuda y Comandos</b>\n\nComandos disponibles:\n/start - Menú principal\n/games - Ver juegos\n/balance - Ver saldo\n/withdraw - Retirar fondos\n/stats - Ver estadísticas\n/daily - Reclamar bono diario\n/help - Mostrar esta ayuda\n\nPara soporte, contacta @jashanxjagy",
+        "help_text": "❓ <b>Ayuda y Comandos</b>\n\nComandos disponibles:\n/start - Menú principal\n/games - Ver juegos\n/balance - Ver saldo\n/withdraw - Retirar fondos\n/stats - Ver estadísticas\n/daily - Reclamar bono diario\n/help - Mostrar esta ayuda\n\nPara soporte, contacta @Ittz_surajj",
 
         # Errors
         "error_occurred": "❌ Ocurrió un error. Por favor intenta de nuevo.",
@@ -2335,7 +2448,7 @@ LANGUAGES = {
         "recovery_settings": "🔐 Récupération",
 
         # Help
-        "help_text": "❓ <b>Aide et Commandes</b>\n\nCommandes disponibles:\n/start - Menu principal\n/games - Parcourir les jeux\n/balance - Vérifier le solde\n/withdraw - Retirer des fonds\n/stats - Voir les statistiques\n/daily - Réclamer le bonus quotidien\n/help - Afficher cette aide\n\nPour le support, contactez @jashanxjagy",
+        "help_text": "❓ <b>Aide et Commandes</b>\n\nCommandes disponibles:\n/start - Menu principal\n/games - Parcourir les jeux\n/balance - Vérifier le solde\n/withdraw - Retirer des fonds\n/stats - Voir les statistiques\n/daily - Réclamer le bonus quotidien\n/help - Afficher cette aide\n\nPour le support, contactez @Ittz_surajj",
 
         # Errors
         "error_occurred": "❌ Une erreur s'est produite. Veuillez réessayer.",
@@ -2465,7 +2578,7 @@ LANGUAGES = {
         "recovery_settings": "🔐 Восстановление",
 
         # Help
-        "help_text": "❓ <b>Помощь и Команды</b>\n\nДоступные команды:\n/start - Главное меню\n/games - Просмотр игр\n/balance - Проверить баланс\n/withdraw - Вывести средства\n/stats - Просмотр статистики\n/daily - Получить ежедневный бонус\n/help - Показать эту помощь\n\nДля поддержки, свяжитесь @jashanxjagy",
+        "help_text": "❓ <b>Помощь и Команды</b>\n\nДоступные команды:\n/start - Главное меню\n/games - Просмотр игр\n/balance - Проверить баланс\n/withdraw - Вывести средства\n/stats - Просмотр статистики\n/daily - Получить ежедневный бонус\n/help - Показать эту помощь\n\nДля поддержки, свяжитесь @Ittz_surajj",
 
         # Errors
         "error_occurred": "❌ Произошла ошибка. Пожалуйста, попробуйте снова.",
@@ -2595,7 +2708,7 @@ LANGUAGES = {
         "recovery_settings": "🔐 पुनर्प्राप्ति",
 
         # Help
-        "help_text": "❓ <b>सहायता और आदेश</b>\n\nउपलब्ध आदेश:\n/start - मुख्य मेनू\n/games - खेल ब्राउज़ करें\n/balance - शेष जांचें\n/withdraw - निकालें\n/stats - आंकड़े देखें\n/daily - दैनिक बोनस प्राप्त करें\n/help - यह सहायता दिखाएं\n\nसहायता के लिए, @jashanxjagy से संपर्क करें",
+        "help_text": "❓ <b>सहायता और आदेश</b>\n\nउपलब्ध आदेश:\n/start - मुख्य मेनू\n/games - खेल ब्राउज़ करें\n/balance - शेष जांचें\n/withdraw - निकालें\n/stats - आंकड़े देखें\n/daily - दैनिक बोनस प्राप्त करें\n/help - यह सहायता दिखाएं\n\nसहायता के लिए, @Ittz_surajj से संपर्क करें",
 
         # Errors
         "error_occurred": "❌ एक त्रुटि हुई। कृपया पुन: प्रयास करें।",
@@ -2725,7 +2838,7 @@ LANGUAGES = {
         "recovery_settings": "🔐 恢复",
 
         # Help
-        "help_text": "❓ <b>帮助和命令</b>\n\n可用命令:\n/start - 主菜单\n/games - 浏览游戏\n/balance - 查看余额\n/withdraw - 提款\n/stats - 查看统计\n/daily - 领取每日奖金\n/help - 显示此帮助\n\n如需支持，请联系 @jashanxjagy",
+        "help_text": "❓ <b>帮助和命令</b>\n\n可用命令:\n/start - 主菜单\n/games - 浏览游戏\n/balance - 查看余额\n/withdraw - 提款\n/stats - 查看统计\n/daily - 领取每日奖金\n/help - 显示此帮助\n\n如需支持，请联系 @Ittz_surajj",
 
         # Errors
         "error_occurred": "❌ 发生错误。请重试。",
@@ -5006,6 +5119,32 @@ async def start_oxapay_webhook_server(application=None):
     except Exception as e:
         logging.error(f"Failed to start OxaPay webhook server: {e}", exc_info=True)
 
+
+async def start_sunpaytm_webhook_server(application=None):
+    """Start the aiohttp web server that receives SunPaytm payment callbacks."""
+    try:
+        global _sunpaytm_bot_ref
+
+        if not SUNPAYTM_API_KEY or not SUNPAYTM_WEBHOOK_HOST:
+            logging.info("SunPaytm webhook server not started (API secret or host not set).")
+            return
+
+        logging.info("Starting SunPaytm webhook server setup...")
+        if application is not None:
+            _sunpaytm_bot_ref = application.bot
+
+        from plugins.sunpaytm_deposit import sunpaytm_webhook_handler
+        app_web = aiohttp.web.Application()
+        app_web.router.add_post("/sunpaytm_webhook", sunpaytm_webhook_handler)
+        runner = aiohttp.web.AppRunner(app_web)
+        await runner.setup()
+        site = aiohttp.web.TCPSite(runner, "0.0.0.0", SUNPAYTM_WEBHOOK_PORT)
+        await site.start()
+        logging.info(f"SunPaytm webhook server listening on 0.0.0.0:{SUNPAYTM_WEBHOOK_PORT}")
+    except Exception as e:
+        logging.error(f"Failed to start SunPaytm webhook server: {e}", exc_info=True)
+
+
 import math  # For math.isfinite in bet validation
 
 def _plinko_cleanup_rate_limits():
@@ -6173,6 +6312,12 @@ def load_bot_state():
 
     # Load persistent OxaPay processed orders to prevent double-credits after restart
     _load_oxapay_processed_orders()
+
+    # Load persistent SunPaytm processed orders
+    _load_sunpaytm_processed_orders()
+
+    # Load persistent CWallet processed tips
+    _load_cwallet_processed_tips()
 
     if os.path.exists(STATE_FILE):
         try:
@@ -8277,6 +8422,23 @@ async def post_init(application: Application):
         # Start OxaPay webhook server
         application.create_task(start_oxapay_webhook_server(application))
 
+        # Start CWallet webhook server
+        application.create_task(start_cwallet_webhook_server(application))
+
+        # Start SunPaytm webhook server
+        application.create_task(start_sunpaytm_webhook_server(application))
+
+        # Start CWallet Telethon monitor (user account session)
+        # This runs alongside the bot and detects @cctip_bot's confirmations
+        # via MTProto, bypassing the Bot API bot-to-bot message limitation.
+        from plugins.cwallet_monitor import start_cwallet_monitor, stop_cwallet_monitor
+        async def _run_cwallet_monitor():
+            client = await start_cwallet_monitor(application)
+            if client:
+                globals()['_cwallet_monitor_client'] = client
+                await client.run_until_disconnected()
+        application.create_task(_run_cwallet_monitor())
+
         # Start Plinko web dashboard server with auto-restart
         application.create_task(start_plinko_web_server_with_restart(application))
 
@@ -8377,6 +8539,17 @@ async def on_bot_shutdown(application: Application):
             _jackpot_save_now()
         except Exception as _e:
             logging.error(f"Failed to save jackpot state on shutdown: {_e}")
+
+        # Stop CWallet Telethon monitor client
+        try:
+            from plugins.cwallet_monitor import stop_cwallet_monitor
+            _client = globals().get('_cwallet_monitor_client')
+            if _client:
+                await stop_cwallet_monitor(_client)
+                globals()['_cwallet_monitor_client'] = None
+        except Exception as _m_e:
+            logging.error(f"Failed to stop CWallet monitor: {_m_e}")
+
         logging.info("Bot shutdown save complete.")
     except Exception as e:
         logging.error(f"Error during bot shutdown: {e}", exc_info=True)
@@ -9006,7 +9179,6 @@ def main():
 
     app.add_handler(ChatJoinRequestHandler(chat_id=-1002240012522, callback=auto_accept_join_request))
 
-
     app.add_handler(CommandHandler("start", start_command, block=False))
     app.add_handler(CommandHandler("help", help_command, block=False))
     app.add_handler(CommandHandler(["bj", "blackjack"], blackjack_command, block=False))
@@ -9049,7 +9221,6 @@ def main():
     app.add_handler(CommandHandler("user", user_info_command, block=False))
     app.add_handler(CommandHandler("ai", ai_command, block=False))
     app.add_handler(CommandHandler("p", price_command, block=False))
-    app.add_handler(CommandHandler("daily", daily_command, block=False))
     app.add_handler(CommandHandler("achievements", achievements_command, block=False))
     app.add_handler(CommandHandler("language", language_command, block=False))
     app.add_handler(CommandHandler(["currency", "cur"], currency_command, block=False))
@@ -9064,9 +9235,6 @@ def main():
     app.add_handler(CommandHandler("setbal", setbal_command, block=False))
     app.add_handler(CommandHandler("withdrawinfo", withdrawinfo_command, block=False))
     app.add_handler(CommandHandler("resetleaderboard", resetleaderboard_command, block=False))
-    app.add_handler(CommandHandler("setdaily", setdaily_command, block=False)) # NEW
-    app.add_handler(CommandHandler("dailyoff", dailyoff_command, block=False)) # NEW
-    app.add_handler(CommandHandler("dailyon", dailyon_command, block=False)) # NEW
     # Game on/off toggle commands (admin only): /diceoff, /diceon, /minesoff, etc.
     for _gk3 in GAME_STATUS_MAP:
         async def _off_wrap(update, context, gk=_gk3):
@@ -9159,13 +9327,12 @@ def main():
     app.add_handler(CommandHandler("activeall", active_all_games_command, block=False)) # NEW
     app.add_handler(CommandHandler("reset", reset_recovery_command, block=False)) # NEW
     app.add_handler(CommandHandler("export", export_command, block=False)) # NEW
-    app.add_handler(CommandHandler("claim", claim_gift_code_command, block=False)) # NEW
+
     # History command for users (with template image and pagination)
     app.add_handler(CommandHandler(["history", "hc"], history_command, block=False))
     app.add_handler(CommandHandler("leaderboardrf", leaderboard_referral_command, block=False)) # NEW
     app.add_handler(CommandHandler("weekly", weekly_bonus_command, block=False)) # NEW
     app.add_handler(CommandHandler("monthly", monthly_bonus_command, block=False)) # NEW
-    app.add_handler(CommandHandler("demo", demo_command, block=False)) # NEW: Demo claim system
     app.add_handler(CommandHandler(["transactions", "tx"], transactions_command, block=False))
     app.add_handler(CommandHandler("transaction", transactions_command, block=False)) # Admin version
     app.add_handler(CommandHandler("serverseed", serverseed_command, block=False)) # NEW: Provably fair
@@ -9186,20 +9353,37 @@ def main():
     app.add_handler(CallbackQueryHandler(deposit_method_callback, pattern=r"^deposit_(ETH|BNB|BASE|TRON|SOLANA|TON)$", block=False))
     app.add_handler(CallbackQueryHandler(check_deposit_status, pattern=r"^(deposit_history|check_deposit_)", block=False))
     app.add_handler(CallbackQueryHandler(back_to_deposit_menu, pattern=r"^back_to_deposit_menu", block=False))
+    load_cwallet_monitored_group_ids()
+    app.add_handler(CallbackQueryHandler(cwallet_deposit_callback, pattern=r"^deposit_cwallet$", block=False))
+    app.add_handler(CommandHandler("cwallet", cwallet_deposit_command, block=False))
+    app.add_handler(CommandHandler("withdraw", cwallet_withdraw_command, block=False))
+    app.add_handler(CommandHandler("removewager", cwallet_removewager_command, block=False))
+    app.add_handler(CallbackQueryHandler(cwallet_withdraw_callback, pattern=r"^cw_wd_", block=False))
+    app.add_handler(MessageHandler(filters.ALL & filters.ChatType.GROUPS, handle_group_message, block=False), group=1)
+    app.add_handler(ChatMemberHandler(cwallet_chat_member_update, block=False))
 
     # OxaPay ConversationHandler
-    oxapay_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(oxapay_deposit_start, pattern=r"^deposit_oxapay$")],
+    # OxaPay handler removed — menu button removed.
+    # Kept the webhook server for existing pending invoices.
+
+    # SunPaytm ConversationHandler
+    from plugins.sunpaytm_deposit import (
+        SUNPAYTM_ASK_AMOUNT,
+        sunpaytm_deposit_start,
+        sunpaytm_receive_amount,
+        sunpaytm_cancel,
+    )
+    sunpaytm_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(sunpaytm_deposit_start, pattern=r"^deposit_sunpaytm$")],
         states={
-            OXAPAY_ASK_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, oxapay_receive_amount)],
-            OXAPAY_ASK_CURRENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, oxapay_receive_currency)],
+            SUNPAYTM_ASK_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sunpaytm_receive_amount)],
         },
-        fallbacks=[CommandHandler("cancel", oxapay_cancel)],
+        fallbacks=[CommandHandler("cancel", sunpaytm_cancel)],
         per_user=True,
         conversation_timeout=timedelta(minutes=5).total_seconds(),
         block=False
     )
-    app.add_handler(oxapay_handler)
+    app.add_handler(sunpaytm_handler)
 
     # ===== RAIN SYSTEM HANDLERS =====
     app.add_handler(CallbackQueryHandler(join_rain_callback, pattern=r"^join_rain_", block=False))
@@ -9314,6 +9498,17 @@ def main():
     # 15. Admin handlers (rarely used, put last)
     app.add_handler(CallbackQueryHandler(admin_actions_callback, pattern=r"^admin_(dashboard|users|bot_settings|toggle_maintenance|broadcast|set_house_balance|limits|gift_codes|toggle_withdrawals|pending_withdrawals|active_games|export_data)$", block=False))
     app.add_handler(CallbackQueryHandler(admin_user_search_callback, pattern=r"^admin_user_", block=False))
+    # Broadcast subsystem (handlers live in admin_commands.py; register() is not called at boot)
+    app.add_handler(CommandHandler('broadcast', broadcast_command, block=False))
+    app.add_handler(CallbackQueryHandler(bc_target_all_callback, pattern=r'^bc_target_all$', block=False))
+    app.add_handler(CallbackQueryHandler(bc_target_single_callback, pattern=r'^bc_target_single$', block=False))
+    app.add_handler(CallbackQueryHandler(bc_target_list_callback, pattern=r'^bc_target_list$', block=False))
+    app.add_handler(CallbackQueryHandler(bc_confirm_callback, pattern=r'^bc_confirm$', block=False))
+    app.add_handler(CallbackQueryHandler(bc_cancel_callback, pattern=r'^bc_cancel$', block=False))
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & ~filters.UpdateType.EDITED, _broadcast_message_router, block=False),
+        group=7,
+    )
 
     # 16. Withdrawal cancellation
     app.add_handler(CallbackQueryHandler(withdrawal_cancel_callback, pattern=r"^withdrawal_cancel_", block=False))
@@ -9656,7 +9851,7 @@ TRANSACTIONS_PER_PAGE = 5
 
 
 # Auto-generated by .refactor/split_bot.py: ordered list of split modules.
-_SPLIT_MODULES = ['core.achievements', 'core.dashboards', 'core.deposits', 'core.helpers', 'core.levels', 'core.max_bets', 'core.misc', 'core.persistence', 'core.wallet', 'plugins.account', 'plugins.admin_commands', 'plugins.ai_features', 'plugins.bonus', 'plugins.escrow', 'plugins.games_blackjack', 'plugins.games_chicken_road', 'plugins.games_dice', 'plugins.games_highlow', 'plugins.games_keno', 'plugins.games_limbo', 'plugins.games_matches', 'plugins.games_mines', 'plugins.games_plinko', 'plugins.games_roulette', 'plugins.games_slots', 'plugins.games_tower', 'plugins.general', 'plugins.jackpot', 'plugins.leaderboard', 'plugins.raffle', 'plugins.referral', 'plugins.wallet_commands']
+_SPLIT_MODULES = ['core.achievements', 'core.dashboards', 'core.deposits', 'core.helpers', 'core.levels', 'core.max_bets', 'core.misc', 'core.persistence', 'core.wallet', 'plugins.account', 'plugins.admin_commands', 'plugins.ai_features', 'plugins.bonus', 'plugins.cwallet_deposit', 'plugins.cwallet_withdraw', 'plugins.escrow', 'plugins.games_blackjack', 'plugins.games_chicken_road', 'plugins.games_dice', 'plugins.games_highlow', 'plugins.games_keno', 'plugins.games_limbo', 'plugins.games_matches', 'plugins.games_mines', 'plugins.games_plinko', 'plugins.games_roulette', 'plugins.games_slots', 'plugins.games_tower', 'plugins.general', 'plugins.jackpot', 'plugins.leaderboard', 'plugins.raffle', 'plugins.referral', 'plugins.wallet_commands']
 
 def _wireup() -> None:
     """Wire all split modules together via this foundation namespace.

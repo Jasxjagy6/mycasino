@@ -647,7 +647,7 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "🆘 <b>Support</b>\n\n"
             "Need help or have questions?\n"
             "Contact the bot owner:\n\n"
-            "👤 @jashanxjagy\n\n"
+            "👤 @Ittz_surajj\n\n"
             "We're here to help you 24/7!",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to More", callback_data="main_more")]])
@@ -696,9 +696,6 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif data.startswith("more_page_"):
         page = int(data.split("_")[-1])
         await more_menu(update, context, page)
-
-    elif data == "main_daily":
-        await daily_command(update, context, from_callback=True)
 
     elif data == "main_bonuses":
         await bonuses_menu(update, context)
@@ -4911,7 +4908,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_
         "• Reply with <code>/kick</code>, <code>/mute</code>, <code>/promote</code>, <code>/pin</code>, <code>/purge</code>, <code>/report</code>, <code>/translate</code>\n"
         "• <code>/lockall</code>, <code>/unlockall</code>\n"
         "• <code>/settings</code> — Configure the bot for your group (group admins only)\n\n"
-        "<b>Minimum bet: ${:.2f}</b>\nContact @jashanxjagy for support.".format(MIN_BALANCE)
+        "<b>Minimum bet: ${:.2f}</b>\nContact @Ittz_surajj for support.".format(MIN_BALANCE)
     )
 
     owner_help = (
@@ -7914,7 +7911,6 @@ def register(ctx):
     app.add_handler(CommandHandler('continue', continue_command, block=False))
     app.add_handler(CommandHandler('user', user_info_command, block=False))
     app.add_handler(CommandHandler('p', price_command, block=False))
-    app.add_handler(CommandHandler('daily', daily_command, block=False))
     app.add_handler(CommandHandler('language', language_command, block=False))
     app.add_handler(CommandHandler(['currency', 'cur'], currency_command, block=False))
     app.add_handler(CommandHandler(['maxbet', 'limits'], maxbet_command, block=False))
@@ -7924,9 +7920,6 @@ def register(ctx):
     app.add_handler(CallbackQueryHandler(games_history_page_callback, pattern='^admin_ghist_page_', block=False))
     app.add_handler(CommandHandler('setbal', setbal_command, block=False))
     app.add_handler(CommandHandler('resetleaderboard', resetleaderboard_command, block=False))
-    app.add_handler(CommandHandler('setdaily', setdaily_command, block=False))
-    app.add_handler(CommandHandler('dailyoff', dailyoff_command, block=False))
-    app.add_handler(CommandHandler('dailyon', dailyon_command, block=False))
     app.add_handler(CommandHandler('chicken', chicken_command, block=False))
     app.add_handler(CommandHandler(['7up', '7updown', '7ud'], seven_up_command, block=False))
     app.add_handler(CommandHandler(['sidebets', 'sides'], sidebets_command, block=False))
@@ -7947,7 +7940,6 @@ def register(ctx):
     app.add_handler(CommandHandler('reset', reset_recovery_command, block=False))
     app.add_handler(CommandHandler('export', export_command, block=False))
     app.add_handler(CommandHandler(['history', 'hc'], history_command, block=False))
-    app.add_handler(CommandHandler('demo', demo_command, block=False))
     app.add_handler(CommandHandler(['transactions', 'tx'], transactions_command, block=False))
     app.add_handler(CommandHandler('transaction', transactions_command, block=False))
     app.add_handler(CommandHandler('serverseed', serverseed_command, block=False))

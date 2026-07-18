@@ -378,7 +378,7 @@ def get_display_name(internal_name):
     return GAME_DISPLAY_NAMES.get(clean, internal_name.replace("_", " ").title())
 
 async def generate_stats_image(user_id: int, context: ContextTypes.DEFAULT_TYPE, period='all_time'):
-    """Generate stats template image with profile picture support."""
+    """Generate next-level stats template image with profile picture support."""
     try:
         stats = user_stats.get(user_id, {})
         userinfo = stats.get('userinfo', {})
@@ -404,99 +404,138 @@ async def generate_stats_image(user_id: int, context: ContextTypes.DEFAULT_TYPE,
             except (ValueError, AttributeError):
                 member_since = join_date[:10]
 
-        # Calculate stats
+        # Calculate stats based on period
+        now = datetime.now(timezone.utc)
         if period == '24h':
-            now = datetime.now(timezone.utc)
             cutoff = now - timedelta(hours=24)
-            user_game_ids = stats.get("game_sessions", [])
-            total_games = wins = losses = 0
-            total_wagered = total_pnl = 0.0
-            game_breakdown = {}
-            biggest_win = 0.0
-            biggest_win_game = ''
-
-            for gid in user_game_ids:
-                game = game_sessions.get(gid)
-                if not game:
-                    continue
-                try:
-                    ts = game.get("timestamp", "")
-                    game_time = datetime.fromisoformat(ts.replace('Z', '+00:00')) if ts else None
-                    if game_time and game_time >= cutoff:
-                        total_games += 1
-                        bet_amt = game.get("bet_amount", 0.0)
-                        total_wagered += bet_amt
-                        profit = game.get("profit", 0.0)
-                        total_pnl += profit
-                        gtype = game.get("game_type", "Unknown")
-                        if gtype not in game_breakdown:
-                            game_breakdown[gtype] = {"games": 0, "wins": 0, "wagered": 0.0, "pnl": 0.0}
-                        game_breakdown[gtype]["games"] += 1
-                        game_breakdown[gtype]["wagered"] += bet_amt
-                        game_breakdown[gtype]["pnl"] += profit
-                        if game.get("win") is True:
-                            wins += 1
-                            game_breakdown[gtype]["wins"] += 1
-                            if profit > biggest_win:
-                                biggest_win = profit
-                                biggest_win_game = gtype
-                        elif game.get("win") is False:
-                            losses += 1
-                except (ValueError, TypeError):
-                    continue
-            win_rate = (wins / total_games * 100) if total_games > 0 else 0
+        elif period == '7d':
+            cutoff = now - timedelta(days=7)
+        elif period == '30d':
+            cutoff = now - timedelta(days=30)
         else:
-            # All-time stats - use game_sessions for complete data
-            total_games = wins = losses = 0
-            total_wagered = total_pnl = 0.0
-            game_breakdown = {}
-            biggest_win = 0.0
-            biggest_win_game = ''
+            cutoff = None  # All time
 
-            # Use user's own game_sessions list for O(k) lookup instead of O(n) full scan
-            user_game_ids = user_stats.get(user_id, {}).get("game_sessions", [])
-            for gid in user_game_ids:
-                game = game_sessions.get(gid)
-                if not game:
+        user_game_ids = stats.get("game_sessions", [])
+        total_games = wins = losses = 0
+        total_wagered = total_pnl = 0.0
+        game_breakdown = {}
+        biggest_win = 0.0
+        biggest_win_game = ''
+        bet_amounts = []  # For distribution
+        hourly_activity = [0] * 24
+        recent_games_list = []
+        biggest_wins_list = []
+        current_win_streak = current_loss_streak = 0
+        best_win_streak = best_loss_streak = 0
+
+        for gid in user_game_ids:
+            game = game_sessions.get(gid)
+            if not game:
+                continue
+            try:
+                ts = game.get("timestamp", "")
+                game_time = datetime.fromisoformat(ts.replace('Z', '+00:00')) if ts else None
+                
+                # Filter by period
+                if cutoff and game_time and game_time < cutoff:
                     continue
-                try:
-                    total_games += 1
-                    bet_amt = game.get("bet_amount", 0.0)
-                    total_wagered += bet_amt
-                    profit = game.get("profit", 0.0)
-                    total_pnl += profit
-                    gtype = game.get("game_type", "unknown")
-                    if gtype not in game_breakdown:
-                        game_breakdown[gtype] = {"games": 0, "wins": 0, "wagered": 0.0, "pnl": 0.0}
-                    game_breakdown[gtype]["games"] += 1
-                    game_breakdown[gtype]["wagered"] += bet_amt
-                    game_breakdown[gtype]["pnl"] += profit
+                    
+                total_games += 1
+                bet_amt = game.get("bet_amount", 0.0)
+                total_wagered += bet_amt
+                bet_amounts.append(bet_amt)
+                profit = game.get("profit", 0.0)
+                total_pnl += profit
+                gtype = game.get("game_type", "unknown")
+                if gtype not in game_breakdown:
+                    game_breakdown[gtype] = {"games": 0, "wins": 0, "wagered": 0.0, "pnl": 0.0, "sparkline": []}
+                game_breakdown[gtype]["games"] += 1
+                game_breakdown[gtype]["wagered"] += bet_amt
+                game_breakdown[gtype]["pnl"] += profit
+                game_breakdown[gtype]["sparkline"].append(profit)
+                
+                # Hourly activity
+                if game_time:
+                    hourly_activity[game_time.hour] += 1
+                
+                # Track streaks and recent games (only for all-time to get full picture)
+                if not cutoff:
                     if game.get("win") is True:
                         wins += 1
-                        game_breakdown[gtype]["wins"] += 1
+                        game_breakdown[gtype]["wins"] = game_breakdown[gtype].get("wins", 0) + 1
+                        current_win_streak += 1
+                        current_loss_streak = 0
+                        best_win_streak = max(best_win_streak, current_win_streak)
+                        if profit > biggest_win:
+                            biggest_win = profit
+                            biggest_win_game = gtype
+                        biggest_wins_list.append({
+                            'amount': profit,
+                            'game': gtype,
+                            'multiplier': game.get('multiplier', 1.0),
+                            'timestamp': ts
+                        })
+                    elif game.get("win") is False:
+                        losses += 1
+                        current_loss_streak += 1
+                        current_win_streak = 0
+                        best_loss_streak = max(best_loss_streak, current_loss_streak)
+                    
+                    # Recent games (last 8)
+                    if len(recent_games_list) < 8:
+                        time_diff = now - game_time if game_time else timedelta(0)
+                        if time_diff.days > 0:
+                            time_ago = f"{time_diff.days}d ago"
+                        elif time_diff.seconds > 3600:
+                            time_ago = f"{time_diff.seconds // 3600}h ago"
+                        elif time_diff.seconds > 60:
+                            time_ago = f"{time_diff.seconds // 60}m ago"
+                        else:
+                            time_ago = "Just now"
+                        
+                        recent_games_list.append({
+                            'game': gtype,
+                            'won': game.get("win") is True,
+                            'amount': bet_amt,
+                            'profit': profit,
+                            'multiplier': game.get('multiplier', 1.0),
+                            'time_ago': time_ago,
+                            'timestamp': ts
+                        })
+                else:
+                    # For period-specific, still count wins/losses
+                    if game.get("win") is True:
+                        wins += 1
+                        game_breakdown[gtype]["wins"] = game_breakdown[gtype].get("wins", 0) + 1
                         if profit > biggest_win:
                             biggest_win = profit
                             biggest_win_game = gtype
                     elif game.get("win") is False:
                         losses += 1
-                except (ValueError, TypeError):
-                    continue
+                        
+            except (ValueError, TypeError):
+                continue
 
-            # Also sync with user_stats bets counters
-            total_bets = stats.get('bets', {}).get('count', 0)
-            if total_bets > 0:
-                wins = stats.get('bets', {}).get('wins', 0)
-                losses = stats.get('bets', {}).get('losses', 0)
-                total_games = total_bets
-                total_wagered = stats.get('bets', {}).get('amount', 0.0)
-                total_pnl = stats.get('pnl', 0.0)
-            win_rate = (wins / total_games * 100) if total_games > 0 else 0
+        win_rate = (wins / total_games * 100) if total_games > 0 else 0
 
         # Favorite game = most played (most games)
         fav_game = 'N/A'
+        fav_game_count = 0
         if game_breakdown:
             fav_game = max(game_breakdown.items(), key=lambda x: x[1]["games"])[0]
+            fav_game_count = game_breakdown[fav_game]["games"]
         avg_bet = (total_wagered / total_games) if total_games > 0 else 0
+        
+        # ROI calculation
+        roi = (total_pnl / total_wagered * 100) if total_wagered > 0 else 0
+        
+        # Median bet
+        median_bet = 0
+        if bet_amounts:
+            sorted_bets = sorted(bet_amounts)
+            mid = len(sorted_bets) // 2
+            median_bet = sorted_bets[mid] if len(sorted_bets) % 2 == 1 else (sorted_bets[mid-1] + sorted_bets[mid]) / 2
+
         total_bonuses = stats.get('rakeback_balance', 0.0)
         level_data = get_user_level(user_id)
 
@@ -506,41 +545,154 @@ async def generate_stats_image(user_id: int, context: ContextTypes.DEFAULT_TYPE,
         if pvp_wins > 0:
             pvp_entries.append({"name": "Emoji PvP", "games": pvp_wins, "pnl": f"-${total_pnl * 0.1:.2f}"})
 
-        sorted_games = sorted(game_breakdown.items(), key=lambda x: x[1]["games"], reverse=True)[:8]
+        # Process game breakdown for display
+        sorted_games = sorted(game_breakdown.items(), key=lambda x: x[1]["games"], reverse=True)[:10]
         game_list = []
+        _fmt = lambda amt: format_compact_for_user(user_id, amt)
+        
         for gname, gdata in sorted_games:
             ggames = gdata["games"]
-            gwr = (gdata["wins"] / ggames * 100) if ggames > 0 else 0
+            gwins = gdata.get("wins", 0)
+            gwr = (gwins / ggames * 100) if ggames > 0 else 0
             gpnl = gdata["pnl"]
+            gwagered = gdata["wagered"]
             display_name = get_display_name(gname)
-            # Pre-format pnl in the viewer's display currency; keep raw
-            # float too so the renderer knows whether it's positive.
             g_sign = "+" if gpnl >= 0 else "-"
-            g_str = f"{g_sign}{format_compact_for_user(user_id, abs(gpnl))}"
+            g_str = f"{g_sign}{_fmt(abs(gpnl))}"
+            gwagered_str = _fmt(gwagered)
+            
+            # Biggest win for this game
+            game_biggest_win = 0
+            for gid in user_game_ids:
+                game = game_sessions.get(gid)
+                if game and game.get("game_type") == gname and game.get("win") is True:
+                    p = game.get("profit", 0)
+                    if p > game_biggest_win:
+                        game_biggest_win = p
+            
             game_list.append({
                 "name": display_name,
                 "games": ggames,
+                "wins": gwins,
                 "wr": gwr,
                 "pnl": gpnl,
                 "pnl_str": g_str,
                 "pnl_positive": gpnl >= 0,
+                "wagered": gwagered,
+                "wagered_str": gwagered_str,
+                "biggest_win": game_biggest_win,
+                "biggest_win_str": f"+{_fmt(game_biggest_win)}" if game_biggest_win > 0 else "$0",
+                "sparkline": gdata.get("sparkline", [])[-20:]  # Last 20 data points
             })
 
-        # Calculate rank from ALL users by wagered amount.
-        # PERFORMANCE: Previously this iterated every user_stats entry and
-        # did an O(N log N) sort on every single dashboard view. At 5000
-        # users that's tens of megabytes of dict iteration + a sort per
-        # stats tap — a real CPU stall on the event loop. We now maintain
-        # a ranking cache recomputed at most every 60 seconds and shared
-        # across every user. Worst-case staleness: one minute, which is
-        # fine for a personal rank readout.
+        # Process biggest wins (top 5)
+        biggest_wins_list.sort(key=lambda x: x['amount'], reverse=True)
+        top_wins = biggest_wins_list[:5]
+        biggest_wins_display = []
+        for win in top_wins:
+            biggest_wins_display.append({
+                'amount_str': f"+{_fmt(win['amount'])}",
+                'game': get_display_name(win['game']),
+                'multiplier': f"{win['multiplier']:.1f}x"
+            })
+
+        # Calculate rank
         user_rank = _get_cached_wagered_rank(user_id)
         rank_str = f"#{user_rank}" if user_rank else "#---"
 
-        # Pre-format every monetary field in the user's DISPLAY
-        # currency (compact). The renderer prefers the *_str keys
-        # and falls back to USD formatting for backwards compat.
-        _fmt = lambda amt: format_compact_for_user(user_id, amt)
+        # Referral stats
+        referral_data = stats.get('referral', {})
+        referral_count = len(referral_data.get('referred_users', []))
+        referral_commission = referral_data.get('commission_earned', 0.0)
+        referral_code = referral_data.get('code', 'N/A')
+
+        # Social stats
+        tips_sent = stats.get('tips_sent', {})
+        tips_received = stats.get('tips_received', {})
+        rain_received = stats.get('rain_received', {})
+
+        # XP data for level progress
+        xp_current = stats.get('xp', 0)
+        # Estimate XP needed for next level based on current level
+        level_thresholds = {
+            'Bronze I': 1000, 'Bronze II': 2500, 'Bronze III': 5000,
+            'Silver I': 10000, 'Silver II': 20000, 'Silver III': 40000,
+            'Gold I': 75000, 'Gold II': 150000, 'Gold III': 300000,
+            'Platinum I': 600000, 'Platinum II': 1200000, 'Platinum III': 2500000,
+            'Diamond I': 5000000, 'Diamond II': 10000000, 'Diamond III': 20000000,
+            'Master': 50000000
+        }
+        xp_next = level_thresholds.get(level_data['name'], 1000000)
+
+        # VIP tier from level
+        vip_tier_map = {
+            'Bronze I': 1, 'Bronze II': 1, 'Bronze III': 1,
+            'Silver I': 2, 'Silver II': 2, 'Silver III': 2,
+            'Gold I': 3, 'Gold II': 3, 'Gold III': 3,
+            'Platinum I': 4, 'Platinum II': 4, 'Platinum III': 4,
+            'Diamond I': 5, 'Diamond II': 5, 'Diamond III': 5,
+            'Master': 6
+        }
+        vip_tier = vip_tier_map.get(level_data['name'], 0)
+
+        # Bet distribution buckets
+        bet_dist = {
+            '$0-1': 0, '$1-5': 0, '$5-10': 0, '$10-25': 0,
+            '$25-50': 0, '$50-100': 0, '$100-250': 0, '$250+': 0
+        }
+        for b in bet_amounts:
+            if b < 1: bet_dist['$0-1'] += 1
+            elif b < 5: bet_dist['$1-5'] += 1
+            elif b < 10: bet_dist['$5-10'] += 1
+            elif b < 25: bet_dist['$10-25'] += 1
+            elif b < 50: bet_dist['$25-50'] += 1
+            elif b < 100: bet_dist['$50-100'] += 1
+            elif b < 250: bet_dist['$100-250'] += 1
+            else: bet_dist['$250+'] += 1
+
+        # Achievements
+        user_achievements = stats.get('achievements', [])
+        achievement_defs = [
+            {'id': 'first_win', 'name': 'First Blood', 'icon': '🩸', 'color': (255, 70, 90), 'target': 1},
+            {'id': 'wager_1k', 'name': 'High Roller', 'icon': '🎰', 'color': (255, 200, 50), 'target': 1000},
+            {'id': 'wager_10k', 'name': 'Whale', 'icon': '🐋', 'color': (0, 220, 255), 'target': 10000},
+            {'id': 'wager_100k', 'name': 'Legend', 'icon': '👑', 'color': (190, 100, 255), 'target': 100000},
+            {'id': 'win_streak_5', 'name': 'Hot Streak', 'icon': '🔥', 'color': (255, 150, 40), 'target': 5},
+            {'id': 'win_streak_10', 'name': 'Unstoppable', 'icon': '⚡', 'color': (255, 70, 90), 'target': 10},
+            {'id': 'referral_5', 'name': 'Recruiter', 'icon': '👥', 'color': (255, 80, 180), 'target': 5},
+            {'id': 'referral_25', 'name': 'Influencer', 'icon': '⭐', 'color': (255, 200, 50), 'target': 25},
+            {'id': 'games_100', 'name': 'Veteran', 'icon': '🎖️', 'color': (0, 200, 180), 'target': 100},
+            {'id': 'games_1000', 'name': 'Addict', 'icon': '💀', 'color': (255, 70, 90), 'target': 1000},
+        ]
+        
+        achievements_display = []
+        for ach_def in achievement_defs:
+            ach_id = ach_def['id']
+            is_unlocked = ach_id in user_achievements
+            
+            # Calculate progress
+            if 'wager' in ach_id:
+                progress = total_wagered
+            elif 'win_streak' in ach_id:
+                progress = best_win_streak
+            elif 'referral' in ach_id:
+                progress = referral_count
+            elif 'games_' in ach_id:
+                progress = total_games
+            else:
+                progress = 1 if is_unlocked else 0
+            
+            achievements_display.append({
+                'id': ach_id,
+                'name': ach_def['name'],
+                'icon': ach_def['icon'],
+                'color': ach_def['color'],
+                'unlocked': is_unlocked,
+                'progress': progress,
+                'target': ach_def['target'],
+                'date': 'Unlocked!' if is_unlocked else ''
+            })
+
         pnl_sign = "+" if total_pnl >= 0 else ""
 
         text_data = {
@@ -551,7 +703,7 @@ async def generate_stats_image(user_id: int, context: ContextTypes.DEFAULT_TYPE,
             "rank": rank_str,
             "member_since": member_since,
             "bot_username": bot_username,
-            "period_label": "30d",
+            "period": period,
             "total_games": total_games,
             "total_wagered": total_wagered,
             "total_wagered_str": _fmt(total_wagered),
@@ -559,20 +711,49 @@ async def generate_stats_image(user_id: int, context: ContextTypes.DEFAULT_TYPE,
             "total_pnl_str": f"{pnl_sign}{_fmt(total_pnl)}",
             "pnl_positive": total_pnl >= 0,
             "win_rate": win_rate,
+            "wins": wins,
+            "losses": losses,
             "avg_bet": avg_bet,
             "avg_bet_str": _fmt(avg_bet),
+            "median_bet": median_bet,
+            "median_bet_str": _fmt(median_bet),
             "biggest_win": biggest_win,
-            "biggest_win_str": f"+{_fmt(biggest_win)}",
-            "biggest_win_game": biggest_win_game,
+            "biggest_win_str": f"+{_fmt(biggest_win)}" if biggest_win > 0 else "$0",
+            "biggest_win_game": get_display_name(biggest_win_game) if biggest_win_game else "N/A",
             "total_bonuses": total_bonuses,
             "total_bonuses_str": _fmt(total_bonuses),
-            "fav_game": fav_game,
+            "rakeback_str": _fmt(total_bonuses),
+            "fav_game": get_display_name(fav_game) if fav_game != 'N/A' else "N/A",
+            "fav_game_count": fav_game_count,
+            "roi": roi,
+            "current_win_streak": current_win_streak,
+            "current_loss_streak": current_loss_streak,
+            "best_win_streak": best_win_streak,
+            "best_loss_streak": best_loss_streak,
+            "biggest_wins": biggest_wins_display,
+            "hourly_activity": hourly_activity,
+            "bet_distribution": bet_dist,
+            "achievements": achievements_display,
+            "recent_games": recent_games_list,
+            "referral_count": referral_count,
+            "referral_earned_str": _fmt(referral_commission),
+            "referral_code": referral_code,
+            "tips_sent_count": tips_sent.get('count', 0),
+            "tips_sent_amt_str": _fmt(tips_sent.get('amount', 0)),
+            "tips_received_count": tips_received.get('count', 0),
+            "tips_received_amt_str": _fmt(tips_received.get('amount', 0)),
+            "rain_received_count": rain_received.get('count', 0),
+            "rain_received_amt_str": _fmt(rain_received.get('amount', 0)),
+            "xp_current": xp_current,
+            "xp_next": xp_next,
+            "vip_tier": vip_tier,
+            "bot_version": "2.0.0",
         }
 
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             _image_executor,
-            _render_stats_sync,
+            _render_stats_v2_sync,
             text_data,
             game_list,
             pvp_entries,
@@ -581,6 +762,8 @@ async def generate_stats_image(user_id: int, context: ContextTypes.DEFAULT_TYPE,
         return result
     except Exception as e:
         logging.error(f"Error generating stats image: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def _render_stats_sync(text_data, game_list, pvp_entries, profile_pic_data):
@@ -948,6 +1131,875 @@ def _render_stats_sync(text_data, game_list, pvp_entries, profile_pic_data):
         return buf
     except Exception as e:
         logging.error(f"Error rendering stats image: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def _render_stats_v2_sync(text_data, game_list, pvp_entries, profile_pic_data):
+    """
+    NEXT-LEVEL stats image renderer — comprehensive casino analytics dashboard.
+    
+    Layout (1200x1500):
+      ┌─────────────────────────────────────────────────────────────────┐
+      │  HEADER: Brand + Period (24h/7d/All) + Bot @username           │
+      ├─────────────────────────────────────────────────────────────────┤
+      │ PROFILE │ KEY METRICS (8 tiles)                                │
+      │ CARD    ├──────────────────────────────────────────────────────┤
+      │         │ GAME BREAKDOWN (visual bars + stats)                 │
+      ├─────────┼──────────────────────────────────────────────────────┤
+      │ BIG WINS GALLERY  │ STREAK TRACKER  │ ACTIVITY HEATMAP        │
+      ├───────────────────┼─────────────────┼─────────────────────────┤
+      │ BETTING DISTRIBUTION                    │ ACHIEVEMENTS        │
+      ├─────────────────────────────────────────┼─────────────────────┤
+      │ RECENT ACTIVITY FEED (last 8 games)     │ REFERRAL & SOCIAL   │
+      ├─────────────────────────────────────────┴─────────────────────┤
+      │ FOOTER: Responsible Gambling + Brand                          │
+      └─────────────────────────────────────────────────────────────────┘
+    """
+    try:
+        W, H = 1200, 1500
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # ═══════════════════════════════════════════════════════════════
+        # PALETTE — Dark Casino Cyberpunk Theme
+        # ═══════════════════════════════════════════════════════════════
+        C_BG_DEEP     = (4, 4, 12)
+        C_BG_CARD     = (10, 8, 24)
+        C_BG_CARD_HL  = (16, 12, 36)
+        C_BORDER      = (30, 40, 80)
+        C_BORDER_GLOW = (80, 160, 255, 60)
+        
+        C_TEXT_PRIMARY   = (245, 248, 255)
+        C_TEXT_SECONDARY = (160, 170, 200)
+        C_TEXT_MUTED     = (90, 100, 130)
+        C_TEXT_DIM       = (60, 70, 100)
+        
+        C_CYAN      = (0, 220, 255)
+        C_CYAN_DIM  = (0, 140, 200)
+        C_CYAN_GLOW = (0, 220, 255, 120)
+        C_BLUE      = (90, 200, 255)
+        C_BLUE_DIM  = (35, 110, 200)
+        C_GOLD      = (255, 200, 50)
+        C_GOLD_DIM  = (180, 140, 30)
+        C_GOLD_GLOW = (255, 200, 50, 100)
+        C_GREEN     = (50, 240, 130)
+        C_GREEN_DIM = (30, 160, 90)
+        C_GREEN_GLOW = (50, 240, 130, 100)
+        C_RED       = (255, 70, 90)
+        C_RED_DIM   = (180, 40, 60)
+        C_RED_GLOW  = (255, 70, 90, 100)
+        C_PURPLE    = (190, 100, 255)
+        C_PURPLE_DIM = (130, 70, 180)
+        C_ORANGE    = (255, 150, 40)
+        C_PINK      = (255, 80, 180)
+        C_TEAL      = (0, 200, 180)
+
+        # Game-specific colors
+        GAME_COLORS = {
+            'dice':       C_CYAN,
+            'limbo':      C_PURPLE,
+            'mines':      C_GREEN,
+            'plinko':     C_ORANGE,
+            'roulette':   C_RED,
+            'blackjack':  C_TEAL,
+            'slots':      C_GOLD,
+            'keno':       C_PINK,
+            'tower':      C_CYAN,
+            'highlow':    C_ORANGE,
+            'chicken_road': C_PINK,
+            'pvp':        C_PURPLE,
+            'coinflip':   C_GOLD,
+        }
+
+        # ═══════════════════════════════════════════════════════════════
+        # FONTS
+        # ═══════════════════════════════════════════════════════════════
+        def _tf(size, bold=False):
+            try:
+                if bold:
+                    # Try bold variant
+                    for p in [DASHBOARD_FONT_PATH.replace('.ttf', '-Bold.ttf'),
+                              DASHBOARD_FONT_PATH.replace('.ttf', 'Bold.ttf'),
+                              '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+                              '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf']:
+                        try:
+                            return ImageFont.truetype(p, size)
+                        except:
+                            pass
+                return ImageFont.truetype(DASHBOARD_FONT_PATH, size)
+            except Exception:
+                return ImageFont.load_default()
+
+        fDisplay   = _tf(48, bold=True)   # Hero numbers
+        fTitle     = _tf(32, bold=True)   # Section titles
+        fSubtitle  = _tf(18, bold=True)   # Sub-section titles
+        fHeader    = _tf(24, bold=True)   # Header text
+        fBody      = _tf(15)              # Body text
+        fBodyBold  = _tf(15, bold=True)
+        fSmall     = _tf(12)
+        fSmallBold = _tf(12, bold=True)
+        fTiny      = _tf(10)
+        fTinyBold  = _tf(10, bold=True)
+        fMicro     = _tf(9)
+        fMetric    = _tf(28, bold=True)   # Metric values
+        fMetricSm  = _tf(22, bold=True)   # Smaller metric values
+        fIcon      = _tf(22)              # Icon glyphs
+
+        # ═══════════════════════════════════════════════════════════════
+        # BACKGROUND — Deep gradient with atmospheric effects
+        # ═══════════════════════════════════════════════════════════════
+        # Base gradient
+        for yy in range(H):
+            t = yy / H
+            # Multi-stop gradient: deep navy → dark purple → deep blue
+            if t < 0.3:
+                u = t / 0.3
+                r = int(4 + u * 6)
+                g = int(4 + u * 4)
+                b = int(12 + u * 18)
+            elif t < 0.6:
+                u = (t - 0.3) / 0.3
+                r = int(10 + u * 4)
+                g = int(8 + u * 2)
+                b = int(30 + u * 20)
+            else:
+                u = (t - 0.6) / 0.4
+                r = int(14 + u * 4)
+                g = int(10 + u * 2)
+                b = int(50 + u * 10)
+            draw.line([(0, yy), (W, yy)], fill=(r, g, b))
+
+        # Atmospheric glow orbs (static but look dynamic)
+        rng = random.Random(12345)
+        glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow_layer)
+        
+        # Large ambient glows
+        for _ in range(6):
+            gx = rng.randint(-100, W + 100)
+            gy = rng.randint(-100, H + 100)
+            gr = rng.randint(200, 400)
+            color_choice = rng.choice([
+                (0, 180, 255, 25), (180, 100, 255, 20), 
+                (255, 180, 50, 20), (50, 220, 140, 18)
+            ])
+            gd.ellipse([gx - gr, gy - gr, gx + gr, gy + gr], fill=color_choice)
+        
+        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=80))
+        img.alpha_composite(glow_layer)
+        draw = ImageDraw.Draw(img)
+
+        # Subtle grid pattern overlay
+        grid_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        gld = ImageDraw.Draw(grid_layer)
+        for x in range(0, W, 60):
+            gld.line([(x, 0), (x, H)], fill=(255, 255, 255, 2), width=1)
+        for y in range(0, H, 60):
+            gld.line([(0, y), (W, y)], fill=(255, 255, 255, 2), width=1)
+        grid_layer = grid_layer.filter(ImageFilter.GaussianBlur(radius=0.5))
+        img.alpha_composite(grid_layer)
+        draw = ImageDraw.Draw(img)
+
+        # Corner accent lines
+        corner_color = (0, 180, 255, 80)
+        cl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        cld = ImageDraw.Draw(cl)
+        corner_size = 60
+        # Top-left
+        cld.line([(20, 20), (20 + corner_size, 20)], fill=corner_color, width=2)
+        cld.line([(20, 20), (20, 20 + corner_size)], fill=corner_color, width=2)
+        # Top-right
+        cld.line([(W - 20, 20), (W - 20 - corner_size, 20)], fill=corner_color, width=2)
+        cld.line([(W - 20, 20), (W - 20, 20 + corner_size)], fill=corner_color, width=2)
+        # Bottom-left
+        cld.line([(20, H - 20), (20 + corner_size, H - 20)], fill=corner_color, width=2)
+        cld.line([(20, H - 20), (20, H - 20 - corner_size)], fill=corner_color, width=2)
+        # Bottom-right
+        cld.line([(W - 20, H - 20), (W - 20 - corner_size, H - 20)], fill=corner_color, width=2)
+        cld.line([(W - 20, H - 20), (W - 20, H - 20 - corner_size)], fill=corner_color, width=2)
+        img.alpha_composite(cl)
+        draw = ImageDraw.Draw(img)
+
+        # ═══════════════════════════════════════════════════════════════
+        # HEADER BAR
+        # ═══════════════════════════════════════════════════════════════
+        header_h = 100
+        # Header background with gradient
+        header_grad = Image.new("RGBA", (W, header_h), (0, 0, 0, 0))
+        hgd = ImageDraw.Draw(header_grad)
+        for yy in range(header_h):
+            t = yy / header_h
+            r = int(8 + t * 12)
+            g = int(6 + t * 8)
+            b = int(24 + t * 20)
+            a = int(230 - t * 50)
+            hgd.line([(0, yy), (W, yy)], fill=(r, g, b, a))
+        # Bottom glow line
+        hgd.line([(0, header_h - 1), (W, header_h - 1)], fill=(0, 200, 255, 100), width=2)
+        img.alpha_composite(header_grad)
+        draw = ImageDraw.Draw(img)
+
+        # Bot brand (left)
+        bot_name = text_data.get('bot_username', 'CasinoBot').lstrip('@')
+        brand_text = f"@{bot_name}"
+        bw = draw.textlength(brand_text, font=fHeader)
+        draw.text((40, (header_h - fHeader.size) // 2 - 2), brand_text, fill=C_CYAN, font=fHeader)
+        
+        # Casino title (center)
+        title_text = "PLAYER STATISTICS"
+        tw = draw.textlength(title_text, font=fTitle)
+        draw.text(((W - tw) // 2, (header_h - fTitle.size) // 2 - 2), title_text, fill=C_TEXT_PRIMARY, font=fTitle)
+        
+        # Period badge (right of title)
+        period = text_data.get('period', 'all_time')
+        period_labels = {'24h': '24H', '7d': '7D', '30d': '30D', 'all_time': 'ALL TIME'}
+        period_label = period_labels.get(period, 'ALL TIME')
+        pw = draw.textlength(period_label, font=fSmallBold)
+        px = (W + tw) // 2 + 20
+        draw.rounded_rectangle([px, (header_h - 24) // 2, px + pw + 20, (header_h + 24) // 2], 
+                               radius=12, fill=(0, 120, 200, 180), outline=C_CYAN, width=1)
+        draw.text((px + 10, (header_h - fSmallBold.size) // 2 - 1), period_label, fill=C_TEXT_PRIMARY, font=fSmallBold)
+        
+        # Member since (far right)
+        ms_text = f"Member since {text_data.get('member_since', 'N/A')}"
+        msw = draw.textlength(ms_text, font=fTiny)
+        draw.text((W - msw - 40, (header_h - fTiny.size) // 2 + 20), ms_text, fill=C_TEXT_MUTED, font=fTiny)
+
+        # ═══════════════════════════════════════════════════════════════
+        # PROFILE CARD (Left column, top)
+        # ═══════════════════════════════════════════════════════════════
+        pc_x, pc_y = 30, header_h + 30
+        pc_w, pc_h = 340, 380
+        
+        # Card background with glass effect
+        card_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        cd = ImageDraw.Draw(card_layer)
+        
+        # Glow behind card
+        cd.rounded_rectangle([pc_x - 4, pc_y - 4, pc_x + pc_w + 4, pc_y + pc_h + 4], 
+                             radius=20, outline=C_CYAN_GLOW, width=3)
+        card_layer = card_layer.filter(ImageFilter.GaussianBlur(radius=8))
+        img.alpha_composite(card_layer)
+        draw = ImageDraw.Draw(img)
+        
+        # Card base
+        draw.rounded_rectangle([pc_x, pc_y, pc_x + pc_w, pc_y + pc_h], 
+                               radius=16, fill=C_BG_CARD, outline=C_BORDER, width=1)
+        
+        # Inner top accent line
+        draw.line([(pc_x + 20, pc_y + 20), (pc_x + pc_w - 20, pc_y + 20)], 
+                  fill=(0, 200, 255, 100), width=1)
+        
+        # Avatar
+        av_size = 100
+        av_x = pc_x + (pc_w - av_size) // 2
+        av_y = pc_y + 20
+        _paste_avatar_in_circle(img, draw, av_x + av_size//2, av_y + av_size//2, 
+                                av_size//2, av_size//2, profile_pic_data, 
+                                accent_rgba=(0, 220, 255, 220))
+        draw = ImageDraw.Draw(img)
+        
+        # Avatar ring
+        draw.ellipse([av_x - 3, av_y - 3, av_x + av_size + 3, av_y + av_size + 3], 
+                     outline=C_CYAN, width=2)
+        draw.ellipse([av_x - 6, av_y - 6, av_x + av_size + 6, av_y + av_size + 6], 
+                     outline=(0, 150, 220, 100), width=1)
+
+        # Name
+        name = text_data.get('first_name', 'Player')
+        if len(name) > 14:
+            name = name[:14] + '…'
+        nw = draw.textlength(name, font=fSubtitle)
+        draw.text((pc_x + (pc_w - nw) // 2, av_y + av_size + 18), name, fill=C_TEXT_PRIMARY, font=fSubtitle)
+        
+        # Username
+        uname = f"@{text_data.get('username', 'user')}"
+        uw = draw.textlength(uname, font=fSmall)
+        draw.text((pc_x + (pc_w - uw) // 2, av_y + av_size + 50), uname, fill=C_TEXT_SECONDARY, font=fSmall)
+        
+        # User ID
+        uid = f"ID: {text_data.get('user_id', 'N/A')}"
+        uidw = draw.textlength(uid, font=fTiny)
+        draw.text((pc_x + (pc_w - uidw) // 2, av_y + av_size + 72), uid, fill=C_TEXT_DIM, font=fTiny)
+
+        # Level & XP Bar
+        lvl_y = av_y + av_size + 100
+        level_name = text_data.get('level', 'Bronze I')
+        lw = draw.textlength(level_name, font=fBodyBold)
+        draw.text((pc_x + (pc_w - lw) // 2, lvl_y), level_name, fill=C_GOLD, font=fBodyBold)
+        
+        # XP Progress bar
+        xp_current = text_data.get('xp_current', 0)
+        xp_next = text_data.get('xp_next', 1000)
+        xp_pct = min(1.0, xp_current / max(1, xp_next))
+        bar_w = pc_w - 40
+        bar_h = 8
+        bar_x = pc_x + 20
+        bar_y = lvl_y + 28
+        draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], 
+                               radius=4, fill=(20, 15, 40), outline=C_BORDER, width=1)
+        if xp_pct > 0:
+            fill_w = int(bar_w * xp_pct)
+            grad = Image.new("RGBA", (fill_w, bar_h), (0, 0, 0, 0))
+            gd = ImageDraw.Draw(grad)
+            for i in range(fill_w):
+                t = i / fill_w
+                r = int(255 * t + 0 * (1-t))
+                g = int(200 * t + 180 * (1-t))
+                b = int(50 * t + 255 * (1-t))
+                gd.line([(i, 0), (i, bar_h)], fill=(r, g, b, 255))
+            img.paste(grad, (bar_x, bar_y), grad)
+        draw.text((pc_x + 20, bar_y + 12), f"XP: {xp_current:,} / {xp_next:,}", fill=C_TEXT_MUTED, font=fTiny)
+        draw.text((pc_x + pc_w - 20 - draw.textlength(f"{int(xp_pct*100)}%", font=fTiny), bar_y + 12), 
+                  f"{int(xp_pct*100)}%", fill=C_GOLD, font=fTiny)
+
+        # Rank badge
+        rank_y = bar_y + 30
+        rank = text_data.get('rank', '#---')
+        rw = draw.textlength(rank, font=fBodyBold)
+        rb_w = rw + 30
+        rb_h = 32
+        rb_x = pc_x + (pc_w - rb_w) // 2
+        draw.rounded_rectangle([rb_x, rank_y, rb_x + rb_w, rank_y + rb_h], 
+                               radius=16, fill=(40, 30, 10), outline=C_GOLD, width=2)
+        draw.text((rb_x + (rb_w - rw) // 2, rank_y + 4), rank, fill=C_GOLD, font=fBodyBold)
+
+        # VIP Tier indicator
+        vip_tier = text_data.get('vip_tier', 0)
+        if vip_tier > 0:
+            vip_y = rank_y + rb_h + 12
+            vip_names = {1: 'BRONZE', 2: 'SILVER', 3: 'GOLD', 4: 'PLATINUM', 5: 'DIAMOND', 6: 'MASTER'}
+            vip_name = vip_names.get(vip_tier, f'TIER {vip_tier}')
+            vip_color = {1: (205,127,50), 2: (192,192,192), 3: (255,215,0), 
+                         4: (229,228,226), 5: (185,242,255), 6: (255,50,100)}.get(vip_tier, C_CYAN)
+            draw.text((pc_x + (pc_w - draw.textlength(vip_name, font=fSmallBold)) // 2, vip_y), 
+                      f"VIP {vip_name}", fill=vip_color, font=fSmallBold)
+            # Stars
+            for i in range(vip_tier):
+                sx = pc_x + (pc_w - vip_tier * 14) // 2 + i * 14
+                draw.polygon([(sx+7, vip_y+2), (sx+10, vip_y+10), (sx+2, vip_y+10)], 
+                             fill=vip_color)
+
+        # ═══════════════════════════════════════════════════════════════
+        # KEY METRICS GRID (Right of profile, 2 rows x 4 cols)
+        # ═══════════════════════════════════════════════════════════════
+        gm_x = pc_x + pc_w + 30
+        gm_y = header_h + 30
+        gm_w = W - gm_x - 30
+        gm_tile_w = (gm_w - 45) // 4
+        gm_tile_h = 160
+        gm_gap = 15
+
+        metrics = [
+            # (value, label, color, icon, subtitle)
+            (text_data.get('total_games', 0), "TOTAL GAMES", C_CYAN, "⬢", None),
+            (text_data.get('total_wagered_str', '$0'), "TOTAL WAGERED", C_BLUE, "⬡", 
+             f"{text_data.get('total_games', 0)} bets placed"),
+            (f"{text_data.get('win_rate', 0):.1f}%", "WIN RATE", C_GOLD, "⬟", 
+             f"W:{text_data.get('wins', 0)} L:{text_data.get('losses', 0)}"),
+            (text_data.get('total_pnl_str', '$0'), "NET P&L", 
+             C_GREEN if text_data.get('pnl_positive', True) else C_RED, "⬠", 
+             f"ROI: {text_data.get('roi', 0):.1f}%"),
+            (text_data.get('avg_bet_str', '$0'), "AVG BET SIZE", C_CYAN, "◇", 
+             f"Median: {text_data.get('median_bet_str', '$0')}"),
+            (text_data.get('biggest_win_str', '$0'), "BIGGEST WIN", C_GOLD, "★", 
+             text_data.get('biggest_win_game', 'N/A')),
+            (text_data.get('fav_game', 'N/A'), "FAVORITE GAME", C_PURPLE, "◆", 
+             f"{text_data.get('fav_game_count', 0)} plays"),
+            (text_data.get('total_bonuses_str', '$0'), "TOTAL BONUSES", C_PINK, "◆", 
+             f"Rakeback: {text_data.get('rakeback_str', '$0')}"),
+        ]
+
+        for i, (value, label, color, icon, subtitle) in enumerate(metrics):
+            col = i % 4
+            row = i // 4
+            tx = gm_x + col * (gm_tile_w + gm_gap)
+            ty = gm_y + row * (gm_tile_h + gm_gap)
+            
+            # Tile background
+            draw.rounded_rectangle([tx, ty, tx + gm_tile_w, ty + gm_tile_h], 
+                                   radius=14, fill=C_BG_CARD, outline=C_BORDER, width=1)
+            
+            # Accent top bar
+            draw.rounded_rectangle([tx + 2, ty + 2, tx + gm_tile_w - 2, ty + 6], 
+                                   radius=2, fill=color)
+            
+            # Glow effect
+            glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            gd = ImageDraw.Draw(glow)
+            gd.rounded_rectangle([tx - 1, ty - 1, tx + gm_tile_w + 1, ty + gm_tile_h + 1], 
+                                 radius=15, outline=(*color[:3], 60), width=2)
+            glow = glow.filter(ImageFilter.GaussianBlur(radius=4))
+            img.alpha_composite(glow)
+            draw = ImageDraw.Draw(img)
+            
+            # Icon
+            ic_x = tx + gm_tile_w // 2
+            ic_y = ty + 45
+            draw.text((ic_x - draw.textlength(icon, font=fIcon) // 2, ic_y), 
+                      icon, fill=color, font=fIcon)
+            
+            # Value
+            vw = draw.textlength(str(value), font=fMetric)
+            draw.text((tx + (gm_tile_w - vw) // 2, ty + 80), str(value), fill=C_TEXT_PRIMARY, font=fMetric)
+            
+            # Label
+            lw = draw.textlength(label, font=fSmall)
+            draw.text((tx + (gm_tile_w - lw) // 2, ty + 120), label, fill=C_TEXT_SECONDARY, font=fSmall)
+            
+            # Subtitle
+            if subtitle:
+                sw = draw.textlength(subtitle, font=fTiny)
+                draw.text((tx + (gm_tile_w - sw) // 2, ty + 138), subtitle, fill=C_TEXT_DIM, font=fTiny)
+
+        # ═══════════════════════════════════════════════════════════════
+        # GAME BREAKDOWN (Below metrics, full width)
+        # ═══════════════════════════════════════════════════════════════
+        gb_y = gm_y + 2 * (gm_tile_h + gm_gap) + 30
+        gb_h = 320
+        
+        # Section header
+        draw.text((30, gb_y), "GAME BREAKDOWN", fill=C_TEXT_PRIMARY, font=fTitle)
+        # Decorative line
+        draw.line([(30 + draw.textlength("GAME BREAKDOWN ", font=fTitle), gb_y + fTitle.size // 2), 
+                   (W - 30, gb_y + fTitle.size // 2)], fill=C_BORDER, width=1)
+        
+        gb_y += 45
+        
+        # Table headers
+        col_x = [40, 280, 420, 560, 700, 840, 980]
+        col_w = [220, 120, 120, 120, 120, 120, 180]
+        headers = ["GAME", "PLAYED", "WON", "WIN %", "WAGERED", "P&L", "BEST WIN"]
+        
+        # Header row background
+        draw.rounded_rectangle([30, gb_y, W - 30, gb_y + 36], radius=8, 
+                               fill=(12, 10, 30), outline=C_BORDER, width=1)
+        for i, (hdr, cx) in enumerate(zip(headers, col_x)):
+            align = "ra" if i >= 4 else "la"
+            draw.text((cx, gb_y + 8), hdr, fill=C_TEXT_MUTED, font=fTinyBold, anchor=align if i >= 4 else "la")
+        
+        gb_y += 42
+        
+        # Game rows
+        rows = (game_list or [])[:10]
+        for idx, entry in enumerate(rows):
+            row_y = gb_y + idx * 28
+            bg_color = C_BG_CARD_HL if idx % 2 == 0 else C_BG_CARD
+            draw.rounded_rectangle([30, row_y, W - 30, row_y + 26], radius=6, fill=bg_color, outline=None)
+            
+            gname = entry.get('name', 'Unknown')
+            gcolor = GAME_COLORS.get(gname.lower().replace(' ', '_'), C_CYAN)
+            
+            # Game name with color dot
+            draw.ellipse([40, row_y + 7, 54, row_y + 21], fill=gcolor)
+            draw.text((60, row_y + 4), gname[:22], fill=C_TEXT_PRIMARY, font=fSmall)
+            
+            # Stats
+            draw.text((col_x[1], row_y + 4), str(entry.get('games', 0)), fill=C_TEXT_SECONDARY, font=fSmall)
+            draw.text((col_x[2], row_y + 4), str(entry.get('wins', 0)), fill=C_GREEN, font=fSmall)
+            
+            wr = entry.get('wr', 0)
+            wr_color = C_GREEN if wr >= 50 else (C_ORANGE if wr >= 30 else C_RED)
+            draw.text((col_x[3], row_y + 4), f"{wr:.1f}%", fill=wr_color, font=fSmallBold)
+            
+            draw.text((col_x[4], row_y + 4), entry.get('wagered_str', '$0'), fill=C_TEXT_SECONDARY, font=fSmall, anchor="ra")
+            
+            pnl = entry.get('pnl', 0)
+            pnl_color = C_GREEN if pnl >= 0 else C_RED
+            pnl_str = entry.get('pnl_str', f"{'+' if pnl >= 0 else '-'}${abs(pnl):,.2f}")
+            draw.text((col_x[5], row_y + 4), pnl_str, fill=pnl_color, font=fSmallBold, anchor="ra")
+            
+            draw.text((col_x[6], row_y + 4), entry.get('biggest_win_str', '$0'), fill=C_GOLD, font=fSmall, anchor="ra")
+            
+            # Mini sparkline (P&L trend)
+            spark_data = entry.get('sparkline', [])
+            if spark_data:
+                sx = col_x[6] + 20
+                sy = row_y + 2
+                sw = 100
+                sh = 22
+                if len(spark_data) > 1:
+                    min_v = min(spark_data)
+                    max_v = max(spark_data)
+                    rng_v = max_v - min_v if max_v != min_v else 1
+                    pts = []
+                    for i, v in enumerate(spark_data):
+                        px = sx + i * sw / (len(spark_data) - 1)
+                        py = sy + sh - (v - min_v) / rng_v * sh
+                        pts.append((px, py))
+                    if len(pts) > 1:
+                        for i in range(len(pts) - 1):
+                            pnl_c = C_GREEN if spark_data[i+1] >= spark_data[i] else C_RED
+                            draw.line([pts[i], pts[i+1]], fill=pnl_c, width=2)
+
+        # ═══════════════════════════════════════════════════════════════
+        # THREE-COLUMN SECTION: BIG WINS | STREAKS | HEATMAP
+        # ═══════════════════════════════════════════════════════════════
+        three_col_y = gb_y + len(rows) * 28 + 30
+        col_w3 = (W - 90) // 3
+        col_gap = 15
+        
+        # ─── BIG WINS GALLERY ───
+        bw_x = 30
+        bw_y = three_col_y
+        bw_w = col_w3
+        bw_h = 380
+        
+        draw.rounded_rectangle([bw_x, bw_y, bw_x + bw_w, bw_y + bw_h], radius=12, 
+                               fill=C_BG_CARD, outline=C_BORDER, width=1)
+        draw.text((bw_x + 20, bw_y + 16), "BIGGEST WINS", fill=C_TEXT_PRIMARY, font=fSubtitle)
+        draw.line([(bw_x + 20, bw_y + 50), (bw_x + bw_w - 20, bw_y + 50)], fill=C_BORDER, width=1)
+        
+        big_wins = text_data.get('biggest_wins', [])[:5]
+        if big_wins:
+            for i, win in enumerate(big_wins):
+                wy = bw_y + 60 + i * 62
+                # Medal
+                medal_colors = [C_GOLD, (192,192,192), (205,127,50), C_GOLD_DIM, C_GOLD_DIM]
+                mc = medal_colors[i] if i < len(medal_colors) else C_GOLD_DIM
+                mx = bw_x + 25
+                my = wy + 10
+                # Medal circle
+                draw.ellipse([mx, my, mx + 28, my + 28], fill=(mc[0]//3, mc[1]//3, mc[2]//3), outline=mc, width=2)
+                draw.text((mx + 14 - draw.textlength(f"#{i+1}", font=fTinyBold)//2, my + 3), 
+                          f"#{i+1}", fill=mc, font=fTinyBold)
+                
+                # Win details
+                win_amt = win.get('amount_str', '$0')
+                win_game = win.get('game', 'Unknown')
+                win_mult = win.get('multiplier', '0x')
+                
+                draw.text((mx + 40, wy), win_amt, fill=C_GOLD, font=fMetricSm)
+                draw.text((mx + 40, wy + 30), f"{win_game}  •  {win_mult}", fill=C_TEXT_SECONDARY, font=fSmall)
+                
+                # Game icon dot
+                gc = GAME_COLORS.get(win_game.lower().replace(' ', '_'), C_CYAN)
+                draw.ellipse([bw_x + bw_w - 30, wy + 10, bw_x + bw_w - 10, wy + 30], fill=gc)
+        else:
+            draw.text((bw_x + 20, bw_y + 100), "No big wins yet", fill=C_TEXT_MUTED, font=fBody)
+            draw.text((bw_x + 20, bw_y + 130), "Keep playing to hit it big!", fill=C_TEXT_DIM, font=fSmall)
+        
+        # ─── STREAK TRACKER ───
+        st_x = bw_x + bw_w + col_gap
+        st_y = three_col_y
+        st_w = col_w3
+        st_h = 380
+        
+        draw.rounded_rectangle([st_x, st_y, st_x + st_w, st_y + st_h], radius=12, 
+                               fill=C_BG_CARD, outline=C_BORDER, width=1)
+        draw.text((st_x + 20, st_y + 16), "STREAK TRACKER", fill=C_TEXT_PRIMARY, font=fSubtitle)
+        draw.line([(st_x + 20, st_y + 50), (st_x + st_w - 20, st_y + 50)], fill=C_BORDER, width=1)
+        
+        # Current streak
+        cw_streak = text_data.get('current_win_streak', 0)
+        cl_streak = text_data.get('current_loss_streak', 0)
+        best_w_streak = text_data.get('best_win_streak', 0)
+        best_l_streak = text_data.get('best_loss_streak', 0)
+        
+        streak_items = [
+            ("CURRENT WIN", cw_streak, C_GREEN, "🔥"),
+            ("CURRENT LOSS", cl_streak, C_RED, "❄️"),
+            ("BEST WIN STREAK", best_w_streak, C_GOLD, "🏆"),
+            ("BEST LOSS STREAK", best_l_streak, C_ORANGE, "📉"),
+        ]
+        
+        for i, (label, val, color, icon) in enumerate(streak_items):
+            sy = st_y + 70 + i * 75
+            # Card
+            draw.rounded_rectangle([st_x + 15, sy, st_x + st_w - 15, sy + 65], radius=10, 
+                                   fill=C_BG_CARD_HL, outline=(*color[:3], 80), width=1)
+            # Icon
+            draw.text((st_x + 25, sy + 10), icon, fill=color, font=fIcon)
+            # Value
+            vw = draw.textlength(str(val), font=fDisplay)
+            draw.text((st_x + st_w - 25 - vw, sy + 5), str(val), fill=color, font=fDisplay)
+            # Label
+            draw.text((st_x + 70, sy + 10), label, fill=C_TEXT_SECONDARY, font=fSmallBold)
+            draw.text((st_x + 70, sy + 34), "games in a row", fill=C_TEXT_DIM, font=fTiny)
+            
+            # Progress bar for best streaks (showing current vs best)
+            if "BEST" in label:
+                target = best_w_streak if "WIN" in label else best_l_streak
+                current = cw_streak if "WIN" in label else cl_streak
+                pct = min(1.0, current / max(1, target))
+                bw = st_w - 100
+                bx = st_x + 70
+                by = sy + 55
+                draw.rounded_rectangle([bx, by, bx + bw, by + 6], radius=3, fill=(20,15,40), outline=C_BORDER, width=1)
+                if pct > 0:
+                    fw = int(bw * pct)
+                    draw.rounded_rectangle([bx, by, bx + fw, by + 6], radius=3, fill=color)
+        
+        # ─── ACTIVITY HEATMAP (24h) ───
+        hm_x = st_x + st_w + col_gap
+        hm_y = three_col_y
+        hm_w = col_w3
+        hm_h = 380
+        
+        draw.rounded_rectangle([hm_x, hm_y, hm_x + hm_w, hm_y + hm_h], radius=12, 
+                               fill=C_BG_CARD, outline=C_BORDER, width=1)
+        draw.text((hm_x + 20, hm_y + 16), "ACTIVITY HEATMAP (24H)", fill=C_TEXT_PRIMARY, font=fSubtitle)
+        draw.line([(hm_x + 20, hm_y + 50), (hm_x + hm_w - 20, hm_y + 50)], fill=C_BORDER, width=1)
+        
+        # 24-hour grid (6 rows x 4 cols = 24 hours)
+        heat_data = text_data.get('hourly_activity', [0]*24)
+        max_heat = max(heat_data) if max(heat_data) > 0 else 1
+        
+        cell_w = (hm_w - 50) // 4
+        cell_h = (hm_h - 80) // 6
+        for h in range(24):
+            row = h // 4
+            col = h % 4
+            cx = hm_x + 20 + col * (cell_w + 5)
+            cy = hm_y + 60 + row * (cell_h + 5)
+            
+            intensity = heat_data[h] / max_heat
+            if intensity > 0:
+                # Color from cyan to gold based on intensity
+                r = int(0 + intensity * 255)
+                g = int(200 + intensity * 55)
+                b = int(255 - intensity * 205)
+                cell_color = (r, g, b)
+            else:
+                cell_color = (20, 15, 40)
+            
+            draw.rounded_rectangle([cx, cy, cx + cell_w, cy + cell_h], radius=4, fill=cell_color)
+            
+            # Hour label
+            hw = draw.textlength(f"{h:02d}:00", font=fMicro)
+            draw.text((cx + (cell_w - hw)//2, cy + 2), f"{h:02d}:00", fill=C_TEXT_DIM, font=fMicro)
+            
+            # Count
+            if heat_data[h] > 0:
+                cw = draw.textlength(str(heat_data[h]), font=fTinyBold)
+                draw.text((cx + (cell_w - cw)//2, cy + cell_h - 14), str(heat_data[h]), fill=C_TEXT_PRIMARY, font=fTinyBold)
+
+        # ═══════════════════════════════════════════════════════════════
+        # BETTING DISTRIBUTION & ACHIEVEMENTS
+        # ═══════════════════════════════════════════════════════════════
+        bd_y = three_col_y + 380 + 30
+        
+        # ─── BETTING DISTRIBUTION (Left, wider) ───
+        bd_x = 30
+        bd_w = W - 380
+        bd_h = 220
+        
+        draw.rounded_rectangle([bd_x, bd_y, bd_x + bd_w, bd_y + bd_h], radius=12, 
+                               fill=C_BG_CARD, outline=C_BORDER, width=1)
+        draw.text((bd_x + 20, bd_y + 16), "BET SIZE DISTRIBUTION", fill=C_TEXT_PRIMARY, font=fSubtitle)
+        draw.line([(bd_x + 20, bd_y + 50), (bd_x + bd_w - 20, bd_y + 50)], fill=C_BORDER, width=1)
+        
+        # Histogram
+        bet_buckets = text_data.get('bet_distribution', {
+            '$0-1': 0, '$1-5': 0, '$5-10': 0, '$10-25': 0, 
+            '$25-50': 0, '$50-100': 0, '$100-250': 0, '$250+': 0
+        })
+        bucket_labels = list(bet_buckets.keys())
+        bucket_values = list(bet_buckets.values())
+        max_bucket = max(bucket_values) if max(bucket_values) > 0 else 1
+        
+        hist_x = bd_x + 30
+        hist_y = bd_y + 60
+        hist_w = bd_w - 60
+        hist_h = bd_h - 80
+        bar_w = hist_w // len(bucket_labels) - 8
+        
+        for i, (label, val) in enumerate(zip(bucket_labels, bucket_values)):
+            bx = hist_x + i * (bar_w + 8)
+            bh = int((val / max_bucket) * (hist_h - 30))
+            by = hist_y + hist_h - bh - 30
+            
+            # Gradient bar
+            intensity = val / max_bucket
+            r = int(0 + intensity * 100)
+            g = int(180 + intensity * 75)
+            b = int(255 - intensity * 155)
+            bar_color = (r, g, b)
+            
+            draw.rounded_rectangle([bx, by, bx + bar_w, by + bh], radius=4, fill=bar_color)
+            
+            # Value on top
+            if val > 0:
+                vw = draw.textlength(str(val), font=fTinyBold)
+                draw.text((bx + (bar_w - vw)//2, by - 16), str(val), fill=C_TEXT_PRIMARY, font=fTinyBold)
+            
+            # Label
+            lw = draw.textlength(label, font=fMicro)
+            draw.text((bx + (bar_w - lw)//2, hist_y + hist_h - 24), label, fill=C_TEXT_DIM, font=fMicro)
+        
+        # ─── ACHIEVEMENTS (Right) ───
+        ach_x = bd_x + bd_w + 20
+        ach_w = 340
+        ach_h = 220
+        
+        draw.rounded_rectangle([ach_x, bd_y, ach_x + ach_w, bd_y + ach_h], radius=12, 
+                               fill=C_BG_CARD, outline=C_BORDER, width=1)
+        draw.text((ach_x + 20, bd_y + 16), "ACHIEVEMENTS", fill=C_TEXT_PRIMARY, font=fSubtitle)
+        draw.line([(ach_x + 20, bd_y + 50), (ach_x + ach_w - 20, bd_y + 50)], fill=C_BORDER, width=1)
+        
+        achievements = text_data.get('achievements', [])[:6]
+        if achievements:
+            for i, ach in enumerate(achievements):
+                ay = bd_y + 60 + i * 26
+                unlocked = ach.get('unlocked', False)
+                ach_color = ach.get('color', C_GOLD) if unlocked else C_TEXT_DIM
+                
+                # Icon background
+                draw.rounded_rectangle([ach_x + 20, ay, ach_x + 46, ay + 26], radius=6, 
+                                       fill=(*ach_color[:3], 40) if unlocked else (30,25,50), 
+                                       outline=ach_color if unlocked else C_BORDER, width=1)
+                draw.text((ach_x + 23, ay + 2), ach.get('icon', '🏆'), font=fSmall)
+                
+                # Name
+                draw.text((ach_x + 55, ay + 2), ach.get('name', 'Achievement'), 
+                          fill=C_TEXT_PRIMARY if unlocked else C_TEXT_DIM, font=fSmallBold)
+                
+                # Progress or date
+                if not unlocked:
+                    prog = ach.get('progress', 0)
+                    target = ach.get('target', 1)
+                    pct = prog / target
+                    pw = ach_w - 100
+                    draw.rounded_rectangle([ach_x + 55, ay + 18, ach_x + 55 + pw, ay + 22], radius=2, fill=(30,25,50))
+                    draw.rounded_rectangle([ach_x + 55, ay + 18, ach_x + 55 + int(pw * pct), ay + 22], radius=2, fill=ach_color)
+                    draw.text((ach_x + ach_w - 60, ay + 2), f"{int(pct*100)}%", fill=C_TEXT_MUTED, font=fTiny, anchor="ra")
+                else:
+                    draw.text((ach_x + 55, ay + 18), f"Unlocked {ach.get('date', '')}", fill=C_TEXT_MUTED, font=fTiny)
+        else:
+            draw.text((ach_x + 20, bd_y + 100), "No achievements yet", fill=C_TEXT_MUTED, font=fBody)
+            draw.text((ach_x + 20, bd_y + 130), "Play games to unlock!", fill=C_TEXT_DIM, font=fSmall)
+
+        # ═══════════════════════════════════════════════════════════════
+        # RECENT ACTIVITY FEED & REFERRAL/SOCIAL
+        # ═══════════════════════════════════════════════════════════════
+        ra_y = bd_y + bd_h + 30
+        ra_h = 280
+        
+        # ─── RECENT ACTIVITY (Left, wider) ───
+        ra_x = 30
+        ra_w = W - 380
+        
+        draw.rounded_rectangle([ra_x, ra_y, ra_x + ra_w, ra_y + ra_h], radius=12, 
+                               fill=C_BG_CARD, outline=C_BORDER, width=1)
+        draw.text((ra_x + 20, ra_y + 16), "RECENT ACTIVITY", fill=C_TEXT_PRIMARY, font=fSubtitle)
+        draw.line([(ra_x + 20, ra_y + 50), (ra_x + ra_w - 20, ra_y + 50)], fill=C_BORDER, width=1)
+        
+        recent_games = text_data.get('recent_games', [])[:8]
+        if recent_games:
+            for i, game in enumerate(recent_games):
+                gy = ra_y + 58 + i * 28
+                won = game.get('won', False)
+                game_name = game.get('game', 'Unknown')
+                amount = game.get('amount_str', '$0')
+                profit = game.get('profit_str', '$0')
+                mult = game.get('multiplier', '')
+                time_ago = game.get('time_ago', 'Just now')
+                
+                gcolor = GAME_COLORS.get(game_name.lower().replace(' ', '_'), C_CYAN)
+                result_color = C_GREEN if won else C_RED
+                
+                # Time
+                draw.text((ra_x + 20, gy + 2), time_ago, fill=C_TEXT_DIM, font=fTiny)
+                
+                # Game dot
+                draw.ellipse([ra_x + 85, gy + 6, ra_x + 99, gy + 20], fill=gcolor)
+                
+                # Game name
+                draw.text((ra_x + 110, gy), game_name[:18], fill=C_TEXT_PRIMARY, font=fSmall)
+                
+                # Multiplier
+                if mult:
+                    mw = draw.textlength(f"{mult}x", font=fTinyBold)
+                    draw.text((ra_x + 280, gy + 2), f"{mult}x", fill=C_GOLD, font=fTinyBold)
+                
+                # Bet amount
+                draw.text((ra_x + 350, gy), f"Bet: {amount}", fill=C_TEXT_SECONDARY, font=fSmall)
+                
+                # Profit/loss with arrow
+                arrow = "▲" if won else "▼"
+                pl_text = f"{arrow} {profit}"
+                pl_w = draw.textlength(pl_text, font=fSmallBold)
+                draw.text((ra_x + ra_w - 20 - pl_w, gy), pl_text, fill=result_color, font=fSmallBold, anchor="ra")
+        else:
+            draw.text((ra_x + 20, ra_y + 100), "No recent activity", fill=C_TEXT_MUTED, font=fBody)
+        
+        # ─── REFERRAL & SOCIAL (Right) ───
+        rs_x = ra_x + ra_w + 20
+        rs_w = 340
+        
+        draw.rounded_rectangle([rs_x, ra_y, rs_x + rs_w, ra_y + ra_h], radius=12, 
+                               fill=C_BG_CARD, outline=C_BORDER, width=1)
+        draw.text((rs_x + 20, ra_y + 16), "REFERRAL & SOCIAL", fill=C_TEXT_PRIMARY, font=fSubtitle)
+        draw.line([(rs_x + 20, ra_y + 50), (rs_x + rs_w - 20, ra_y + 50)], fill=C_BORDER, width=1)
+        
+        ref_count = text_data.get('referral_count', 0)
+        ref_earned = text_data.get('referral_earned_str', '$0')
+        tips_sent = text_data.get('tips_sent_count', 0)
+        tips_sent_amt = text_data.get('tips_sent_amt_str', '$0')
+        tips_rcvd = text_data.get('tips_received_count', 0)
+        tips_rcvd_amt = text_data.get('tips_received_amt_str', '$0')
+        rain_rcvd = text_data.get('rain_received_count', 0)
+        rain_amt = text_data.get('rain_received_amt_str', '$0')
+        
+        social_stats = [
+            ("REFERRALS", ref_count, ref_earned, C_PURPLE, "👥"),
+            ("TIPS SENT", tips_sent, tips_sent_amt, C_CYAN, "💸"),
+            ("TIPS RECEIVED", tips_rcvd, tips_rcvd_amt, C_GREEN, "🎁"),
+            ("RAIN RECEIVED", rain_rcvd, rain_amt, C_GOLD, "🌧️"),
+        ]
+        
+        for i, (label, count, amount, color, icon) in enumerate(social_stats):
+            sy = ra_y + 65 + i * 52
+            draw.rounded_rectangle([rs_x + 15, sy, rs_x + rs_w - 15, sy + 46], radius=8, 
+                                   fill=C_BG_CARD_HL, outline=(*color[:3], 60), width=1)
+            draw.text((rs_x + 25, sy + 5), icon, fill=color, font=fIcon)
+            draw.text((rs_x + 60, sy + 2), label, fill=C_TEXT_SECONDARY, font=fSmallBold)
+            cw = draw.textlength(str(count), font=fMetricSm)
+            draw.text((rs_x + rs_w - 25 - cw, sy + 2), str(count), fill=color, font=fMetricSm)
+            draw.text((rs_x + 60, sy + 24), f"Total: {amount}", fill=C_TEXT_PRIMARY, font=fSmall)
+        
+        # Referral code
+        ref_code = text_data.get('referral_code', 'N/A')
+        rcy = ra_y + 65 + 4 * 52 + 10
+        draw.rounded_rectangle([rs_x + 15, rcy, rs_x + rs_w - 15, rcy + 40], radius=8, 
+                               fill=(30, 20, 50), outline=C_PURPLE, width=1)
+        draw.text((rs_x + 25, rcy + 5), "YOUR CODE:", fill=C_TEXT_MUTED, font=fTiny)
+        rc_w = draw.textlength(ref_code, font=fBodyBold)
+        draw.text((rs_x + rs_w - 25 - rc_w, rcy + 5), ref_code, fill=C_PURPLE, font=fBodyBold)
+
+        # ═══════════════════════════════════════════════════════════════
+        # FOOTER
+        # ═══════════════════════════════════════════════════════════════
+        ftr_y = H - 60
+        draw.line([(30, ftr_y), (W - 30, ftr_y)], fill=C_BORDER, width=1)
+        
+        # Responsible gambling
+        rg_text = "PLAY RESPONSIBLY  •  GAMBLE WITH CONTROL  •  18+"
+        rg_w = draw.textlength(rg_text, font=fSmall)
+        draw.text(((W - rg_w) // 2, ftr_y + 10), rg_text, fill=C_TEXT_MUTED, font=fSmall)
+        
+        # Brand + version
+        brand = f"@{bot_name}  •  v{text_data.get('bot_version', '1.0.0')}"
+        bw = draw.textlength(brand, font=fTiny)
+        draw.text((W - bw - 30, ftr_y + 14), brand, fill=C_CYAN, font=fTiny)
+        
+        # Diamond corner
+        dx, dy = W - 30, ftr_y + 20
+        draw.polygon([(dx, dy - 8), (dx + 8, dy), (dx, dy + 8), (dx - 8, dy)], fill=C_CYAN)
+
+        # ═══════════════════════════════════════════════════════════════
+        # SAVE
+        # ═══════════════════════════════════════════════════════════════
+        buf = BytesIO()
+        img = img.convert("RGB")
+        img.save(buf, format="PNG", optimize=True, quality=95)
+        buf.seek(0)
+        return buf
+        
+    except Exception as e:
+        logging.error(f"Error rendering stats v2 image: {e}")
         import traceback
         traceback.print_exc()
         return None

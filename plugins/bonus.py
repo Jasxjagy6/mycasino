@@ -18,120 +18,96 @@ async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     code = context.args[0].upper()
 
-    if code not in surprise_drops:
-        await update.message.reply_text(f"{pe('cross')} Invalid code. This code does not exist.")
-        return
-
-    drop = surprise_drops[code]
-
-    if drop.get("status") != "active" or drop.get("claimed_by") is not None:
+    # Check surprise drops first
+    if code in surprise_drops:
+        drop = surprise_drops[code]
+        if drop.get("status") == "active" and drop.get("claimed_by") is None:
+            user_wagered = user_stats.get(user.id, {}).get("bets", {}).get("amount", 0.0)
+            if user_wagered < drop["wager_requirement"]:
+                await update.message.reply_text(
+                    f"{pe('cross')} <b>Wager requirement not met!</b>\n\n"
+                    f"You need <b>${drop['wager_requirement']:.2f}</b> wagered in the last 30 days.\n"
+                    f"Your current 30-day wager: <b>${user_wagered:.2f}</b>",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            drop["claimed_by"] = user.id
+            drop["claimed_by_username"] = normalize_username(user.username) or f"User_{user.id}"
+            drop["status"] = "claimed"
+            credit_wallet(user.id, drop["amount"])
+            user_stats.setdefault(user.id, {})["unwagered_deposit"] = user_stats.get(user.id, {}).get("unwagered_deposit", 0.0) + drop["amount"]
+            save_user_data(user.id)
+            claimer_display = get_privacy_display_name(user.id, drop["claimed_by_username"])
+            await update.message.reply_text(
+                f"\U0001f389 <b>Code Claimed!</b>\n\n"
+                f"You claimed <b>${drop['amount']:.2f}</b> from surprise code <code>{code}</code>!\n"
+                f"\u26a0\ufe0f This amount has a <b>2x</b> wager requirement before withdrawal.",
+                parse_mode=ParseMode.HTML
+            )
+            try:
+                bot_username = await get_bot_username(context)
+                new_img = generate_surprise_drop_image(code, drop["amount"], drop["wager_requirement"], bot_username, claimed_by=claimer_display)
+                await context.bot.edit_message_media(
+                    chat_id=drop["chat_id"],
+                    message_id=drop["message_id"],
+                    media=InputMediaPhoto(
+                        media=new_img,
+                        caption=(
+                            f"\U0001f381 <b>SURPRISE CODE DROP!</b> \U0001f381\n\n"
+                            f"A surprise bonus of <b>${drop['amount']:.2f}</b> was dropped!\n"
+                            f"<b>CLAIMED</b> by @{claimer_display}!\n\n"
+                            f"Code: <code>{code}</code>\n"
+                            f"\u26a0\ufe0f Better luck next time!"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                )
+            except Exception as e:
+                logging.warning(f"Could not update surprise drop message: {e}")
+            return
         await update.message.reply_text(f"{pe('cross')} This code has already been claimed!")
         return
 
-    # Check wager requirement
-    user_wagered = user_stats.get(user.id, {}).get("bets", {}).get("amount", 0.0)
-    if user_wagered < drop["wager_requirement"]:
-        await update.message.reply_text(
-            f"{pe('cross')} <b>Wager requirement not met!</b>\n\n"
-            f"You need <b>${drop['wager_requirement']:.2f}</b> wagered in the last 30 days.\n"
-            f"Your current 30-day wager: <b>${user_wagered:.2f}</b>",
-            parse_mode=ParseMode.HTML
-        )
-        return
+    # Fallback: check gift codes
+    raw_code = context.args[0]
+    if raw_code in gift_codes:
+        code_data = gift_codes[raw_code]
 
-    # Claim the code
-    drop["claimed_by"] = user.id
-    drop["claimed_by_username"] = normalize_username(user.username) or f"User_{user.id}"
-    drop["status"] = "claimed"
-
-    # Credit the user with the amount (marked as deposit for 2x wager requirement)
-    credit_wallet(user.id, drop["amount"])
-    user_stats.setdefault(user.id, {})["unwagered_deposit"] = user_stats.get(user.id, {}).get("unwagered_deposit", 0.0) + drop["amount"]
-    save_user_data(user.id)
-
-    claimer_display = get_privacy_display_name(user.id, drop["claimed_by_username"])
-
-    await update.message.reply_text(
-        f"\U0001f389 <b>Code Claimed!</b>\n\n"
-        f"You claimed <b>${drop['amount']:.2f}</b> from surprise code <code>{code}</code>!\n"
-        f"\u26a0\ufe0f This amount has a <b>2x</b> wager requirement before withdrawal.",
-        parse_mode=ParseMode.HTML
-    )
-
-    # Update the original message with claimed status
-    try:
-        bot_username = await get_bot_username(context)
-        new_img = generate_surprise_drop_image(code, drop["amount"], drop["wager_requirement"], bot_username, claimed_by=claimer_display)
-
-        await context.bot.edit_message_media(
-            chat_id=drop["chat_id"],
-            message_id=drop["message_id"],
-            media=InputMediaPhoto(
-                media=new_img,
-                caption=(
-                    f"\U0001f381 <b>SURPRISE CODE DROP!</b> \U0001f381\n\n"
-                    f"A surprise bonus of <b>${drop['amount']:.2f}</b> was dropped!\n"
-                    f"<b>CLAIMED</b> by @{claimer_display}!\n\n"
-                    f"Code: <code>{code}</code>\n"
-                    f"\u26a0\ufe0f Better luck next time!"
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-        )
-    except Exception as e:
-        logging.warning(f"Could not update surprise drop message: {e}")
-
-@check_banned
-@check_maintenance
-async def claim_gift_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await ensure_user_in_wallets(user.id, user.username, context=context)
-
-    if not context.args or len(context.args) != 1:
-        await update.message.reply_text("Usage: /claim <code>")
-        return
-
-    code = context.args[0]
-
-    if code not in gift_codes:
-        await update.message.reply_text("Invalid or expired gift code.")
-        return
-
-    code_data = gift_codes[code]
-
-    if code_data["claims_left"] <= 0:
-        await update.message.reply_text("This gift code has already been fully claimed.")
-        return
-
-    if user.id in code_data["claimed_by"]:
-        await update.message.reply_text("You have already claimed this gift code.")
-        return
-
-    # Check wager requirement
-    wager_requirement = code_data.get("wager_requirement", 0)
-    if wager_requirement > 0:
-        user_total_wagered = user_stats[user.id].get("bets", {}).get("amount", 0.0)
-        if user_total_wagered < wager_requirement:
-            await update.message.reply_text(
-                f"{pe('cross')} You don't meet the wager requirement for this gift code.\n\n"
-                f"Required: ${wager_requirement:.2f} wagered\n"
-                f"Your total wagered: ${user_total_wagered:.2f}\n"
-                f"You need to wager ${wager_requirement - user_total_wagered:.2f} more in the casino to claim this code."
-            )
+        if code_data["claims_left"] <= 0:
+            await update.message.reply_text("This gift code has already been fully claimed.")
             return
 
-    # All checks passed, award the user
-    amount = code_data["amount"]
-    credit_wallet(user.id, amount)
-    user_stats[user.id].setdefault("claimed_gift_codes", []).append(code)
+        if user.id in code_data["claimed_by"]:
+            await update.message.reply_text("You have already claimed this gift code.")
+            return
 
-    code_data["claims_left"] -= 1
-    code_data["claimed_by"].append(user.id)
+        wager_requirement = code_data.get("wager_requirement", 0)
+        if wager_requirement > 0:
+            user_total_wagered = user_stats[user.id].get("bets", {}).get("amount", 0.0)
+            if user_total_wagered < wager_requirement:
+                await update.message.reply_text(
+                    f"{pe('cross')} You don't meet the wager requirement for this gift code.\n\n"
+                    f"Required: ${wager_requirement:.2f} wagered\n"
+                    f"Your total wagered: ${user_total_wagered:.2f}\n"
+                    f"You need to wager ${wager_requirement - user_total_wagered:.2f} more in the casino to claim this code."
+                )
+                return
 
-    save_user_data(user.id)
-    save_gift_code(code)
+        amount = code_data["amount"]
+        credit_wallet(user.id, amount)
+        user_stats[user.id].setdefault("claimed_gift_codes", []).append(raw_code)
 
-    await update.message.reply_text(f"{pe('win')} Success! You have claimed a gift code and received ${amount:.2f}!")
+        code_data["claims_left"] -= 1
+        code_data["claimed_by"].append(user.id)
+
+        save_user_data(user.id)
+        save_gift_code(raw_code)
+
+        await update.message.reply_text(f"{pe('win')} Success! You have claimed a gift code and received ${amount:.2f}!")
+        return
+
+    await update.message.reply_text(f"{pe('cross')} Invalid code. This code does not exist.")
+
 
 async def calculate_all_user_bonuses(bonus_type: str) -> dict:
     """Calculate bonuses for all users. Returns dict with user_id: bonus_amount"""
@@ -638,7 +614,6 @@ def register(ctx):
     """Auto-generated from main()'s add_handler list."""
     app = ctx.application
     app.add_handler(CommandHandler('claim', claim_command, block=False))
-    app.add_handler(CommandHandler('claim', claim_gift_code_command, block=False))
     app.add_handler(CommandHandler('weekly', weekly_bonus_command, block=False))
     app.add_handler(CommandHandler('monthly', monthly_bonus_command, block=False))
     app.add_handler(CallbackQueryHandler(bonus_adjust_callback, pattern='^bonus_adjust_', block=False))
