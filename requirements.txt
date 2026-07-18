@@ -20,3 +20,4 @@ solana>=0.34         # optional: Solana support
 base58>=2.1
 tronpy>=0.4
 pytoniq-core>=0.1.36
+telethon>=1.34,<2

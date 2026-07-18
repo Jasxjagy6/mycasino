@@ -165,7 +165,7 @@ async def escrow_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         elif decision == 'releasecancel': await query.edit_message_text("Release cancelled.")
         elif decision == 'dispute':
             deal['status'] = 'disputed'; save_escrow_deal(deal_id)
-            dispute_text = f"{pe('alarm')} A dispute has been opened for deal <code>{deal_id}</code>. Contact @jashanxjagy for assistance."
+            dispute_text = f"{pe('alarm')} A dispute has been opened for deal <code>{deal_id}</code>. Contact @Ittz_surajj for assistance."
             await query.edit_message_text(dispute_text, parse_mode="HTML")
             other_party_id = deal['buyer']['id'] if user.id == deal['seller']['id'] else deal['seller']['id']
             await context.bot.send_message(chat_id=other_party_id, text=dispute_text, parse_mode="HTML")
@@ -518,7 +518,7 @@ async def release_escrow_funds(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logging.error(f"FATAL ERROR releasing funds for deal {deal_id}: {e}", exc_info=True)
         deal['status'] = 'release_failed'; save_escrow_deal(deal_id)
-        fail_msg = f"🚨 An error occurred releasing funds for deal {deal_id}. Contact @jashanxjagy immediately."
+        fail_msg = f"🚨 An error occurred releasing funds for deal {deal_id}. Contact @Ittz_surajj immediately."
         await context.bot.send_message(deal['seller']['id'], fail_msg); await context.bot.send_message(deal['buyer']['id'], fail_msg)
         await context.bot.send_message(BOT_OWNER_ID, f"FATAL ERROR releasing funds for deal {deal_id}: {e}")
 
@@ -558,11 +558,11 @@ async def escrow_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     seller_id = deal['seller']['id']
     buyer_id = deal['buyer']['id']
 
-    seller_msg = (f"{pe('check')} Deposit for deal <code>{deal_id}</code> has been confirmed by @jashanxjagy. Funds are secured.\n\n"
+    seller_msg = (f"{pe('check')} Deposit for deal <code>{deal_id}</code> has been confirmed by @Ittz_surajj. Funds are secured.\n\n"
                   f"Amount: ${deal['amount']:.2f} USDT\n\n"
                   f"You may now proceed with the buyer. Once they confirm receipt, use the button below to release the funds to them.")
 
-    buyer_msg = (f"{pe('check')} The seller's deposit for deal <code>{deal_id}</code> has been confirmed by @jashanxjagy.\n\n"
+    buyer_msg = (f"{pe('check')} The seller's deposit for deal <code>{deal_id}</code> has been confirmed by @Ittz_surajj.\n\n"
                  f"Amount: ${deal['amount']:.2f} USDT\n\n"
                  f"The funds are now secured by the bot. Please proceed with the transaction. Let the seller know once you have received the goods/services as agreed.")
 

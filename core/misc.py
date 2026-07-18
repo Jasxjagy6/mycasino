@@ -1031,8 +1031,6 @@ async def bonuses_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-@check_banned
-@check_maintenance
 async def save_bot_settings_only():
     """Non-blocking save for bot_settings only (doesn't save all user data)."""
     try:
