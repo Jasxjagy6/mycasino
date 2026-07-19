@@ -55,7 +55,7 @@ class OxaPayService:
             return None
 
 def build_deposit_menu():
-    """Build simplified deposit menu — only UPI and CCTip."""
+    """Build simplified deposit menu — only UPI, OxaPay and CCTip."""
 
     keyboard_rows = []
 
@@ -68,6 +68,10 @@ def build_deposit_menu():
     keyboard_rows.append(upi_row)
 
     keyboard_rows.append([
+        apply_button_style(InlineKeyboardButton("Deposit via OxaPay", callback_data="deposit_oxapay"), 'primary', None),
+    ])
+
+    keyboard_rows.append([
         apply_button_style(InlineKeyboardButton("Deposit via CWallet", callback_data="deposit_cwallet"), 'primary', None),
     ])
 
@@ -78,7 +82,8 @@ def build_deposit_menu():
 
     text = (
         "\U0001F4B0 <b>Deposit Funds</b>\n\n"
-        f"{pe('bank')} <b>UPI / Bank Deposit (\u20b9)</b> — 95 INR = 1 USD\n"
+        "\U0001F3E6 <b>UPI / Bank Deposit (\u20b9)</b> — 95 INR = 1 USD\n"
+        f"{pe('gem')} <b>OxaPay</b> — Pay with crypto (BTC/ETH/USDT etc.)\n"
         f"{pe('gem')} <b>CWallet (CCTip)</b> — Send tip via @cctip_bot\n\n"
         f"<i>Choose a deposit method below:</i>"
     )
@@ -336,19 +341,21 @@ async def cwallet_deposit_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
     bot_username = (CWALLET_BOT_USERNAME or 'cctip_bot').lower().lstrip('@')
     text = (
-        f"{pe('money')} <b>CWallet Deposit</b>\n\n"
-        f"Send any crypto tip via <b>@{bot_username}</b> "
-        f"to <b>@{CWALLET_RECEIVE_USERNAME}</b> in any Telegram group "
-        f"and the USD value will be instantly added to your casino balance!\n\n"
-        f"{pe('gem')} <b>Supported currencies:</b>\n"
-        f"USDT, BTC, ETH, LTC, TRX, SOL, BNB, and many more\n\n"
-        f"{pe('sparkles')} <b>How to deposit:</b>\n"
-        f"1. Go to any group that has @{bot_username}\n"
-        f"2. Type: <code>/tip @{CWALLET_RECEIVE_USERNAME} &lt;amount&gt; &lt;currency&gt;</code>\n"
-        f"3. Confirm the tip in CWallet\n"
-        f"4. The USD value is added to your balance here!\n\n"
-        f"{pe('star')} Prices are calculated at live market rates.\n"
-        f"{pe('check')} No blockchain fees, no waiting for confirmations!"
+        "\U0001FA99 <b>CWallet Deposit</b>\n\n"
+        "<b>Instructions:</b>\n"
+        "1. Go to our chat @Diwacasino\n"
+        "2. Make sure you have a balance in @cctip_bot\n"
+        "3. Send a tip using @cctip_bot to us:\n\n"
+        "<b>Format:</b>\n"
+        "<code>/tip 10 USDT @Ittz_surajj</code>\n"
+        "<code>/tip 0.1 ETH @Ittz_surajj</code>\n"
+        "<code>/tip 1 SOL @Ittz_surajj</code>\n\n"
+        "<b>Supported Coins:</b>\n"
+        "\u2022 USDT \u00B7 USDC \u00B7 TON \u00B7 ETH \u00B7 BNB \u00B7 SOL \u00B7 LTC\n\n"
+        "<b>Notes:</b>\n"
+        "\u2022 Use only @cctip_bot.\n"
+        "\u2022 All coins are auto-converted to USD at live market rates.\n"
+        "\u2022 The bot will detect your tip and credit your balance instantly."
     )
     keyboard = [[InlineKeyboardButton("Back", callback_data=f"back_to_deposit_menu_{query.from_user.id}")]]
     await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
@@ -370,7 +377,7 @@ async def oxapay_deposit_start(update: Update, context: ContextTypes.DEFAULT_TYP
     return OXAPAY_ASK_AMOUNT
 
 async def oxapay_receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User sends USD amount."""
+    """User sends USD amount. Ask which crypto via inline buttons."""
     text = update.message.text.strip()
     try:
         amount = float(text)
@@ -380,23 +387,22 @@ async def oxapay_receive_amount(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"{pe('cross')} Invalid amount. Please enter a positive number, e.g. <code>20</code>.", parse_mode=ParseMode.HTML)
         return OXAPAY_ASK_AMOUNT
     context.user_data['oxapay_amount'] = amount
+
+    keyboard = [
+        [InlineKeyboardButton("USDT", callback_data="oxapay_curr_USDT")],
+        [InlineKeyboardButton("Cancel", callback_data="deposit_oxapay_cancel")],
+    ]
     await update.message.reply_text(
-        "Which crypto would you like to pay with?\n\n"
-        "Supported: <code>BTC</code>, <code>ETH</code>, <code>USDT</code>, <code>LTC</code>, <code>TRX</code>\n\n"
-        "Type the currency symbol (e.g. <code>USDT</code>).\n<i>Type /cancel to abort.</i>",
-        parse_mode=ParseMode.HTML
+        "Choose a crypto to pay with:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return OXAPAY_ASK_CURRENCY
 
 async def oxapay_receive_currency(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User sends currency, create OxaPay invoice and send link."""
-    currency = update.message.text.strip().upper()
-    if currency not in OXAPAY_SUPPORTED_CURRENCIES:
-        await update.message.reply_text(
-            f"{pe('cross')} Unsupported currency. Choose from: {', '.join(sorted(OXAPAY_SUPPORTED_CURRENCIES))}",
-            parse_mode=ParseMode.HTML
-        )
-        return OXAPAY_ASK_CURRENCY
+    """User picks currency via inline button, create OxaPay invoice and send link."""
+    query = update.callback_query
+    await query.answer()
+    currency = query.data.split("_", 2)[2]  # oxapay_curr_USDT -> USDT
 
     amount_usd = context.user_data.get('oxapay_amount', 0)
     user_id = update.effective_user.id
@@ -404,7 +410,8 @@ async def oxapay_receive_currency(update: Update, context: ContextTypes.DEFAULT_
     # Get crypto price for display only (OxaPay handles conversion internally)
     crypto_price = LIVE_PRICES.get(currency, None)
     if crypto_price is None or crypto_price <= 0:
-        await update.message.reply_text(
+        await safe_edit_message(
+            query,
             f"{pe('cross')} Unable to get live price for {currency}. Please try again later."
         )
         return ConversationHandler.END
@@ -418,18 +425,17 @@ async def oxapay_receive_currency(update: Update, context: ContextTypes.DEFAULT_
     pay_url = await svc.create_invoice(user_id, amount_usd, "USD")
 
     if pay_url:
-        await update.message.reply_text(
+        text = (
             f"{pe('check')} <b>OxaPay Invoice Created!</b>\n\n"
             f"Amount: <b>${amount_usd:.2f}</b> (≈ {amount_crypto:.{precision}f} {currency})\n"
             f"Rate: 1 {currency} = ${crypto_price:,.2f}\n\n"
             f"👉 <a href=\"{pay_url}\">Click here to complete payment</a>\n\n"
-            f"<i>You can choose your preferred cryptocurrency on the payment page.</i>\n"
-            f"<i>Your balance will be credited automatically after payment confirmation.</i>",
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
+            f"<i>You will be credited automatically after payment confirmation.</i>"
         )
+        await safe_edit_message(query, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     else:
-        await update.message.reply_text(
+        await safe_edit_message(
+            query,
             "❌ Failed to create OxaPay invoice. Please try again later or contact support."
         )
     return ConversationHandler.END
@@ -438,6 +444,13 @@ async def oxapay_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel OxaPay flow."""
     if update.message:
         await update.message.reply_text(f"{pe('cross')} OxaPay deposit cancelled.")
+    return ConversationHandler.END
+
+async def oxapay_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle Cancel button callback in OxaPay flow."""
+    query = update.callback_query
+    await query.answer()
+    await safe_edit_message(query, f"{pe('cross')} OxaPay deposit cancelled.")
     return ConversationHandler.END
 
 def verify_oxapay_signature(raw_body: bytes, received_hmac: str) -> bool:

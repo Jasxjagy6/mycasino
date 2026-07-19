@@ -210,11 +210,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except (ValueError, TypeError, BadRequest, Forbidden):
                 referrer_id = None # Invalid referral ID or can't message
 
-        elif deep_link_arg.startswith("escrow_"):
-            deal_id = deep_link_arg.replace("escrow_", "")
-            await handle_escrow_deep_link(update, context, deal_id)
-            return
-
         elif deep_link_arg.startswith("provablyfair_"):
             pf_id = deep_link_arg.replace("provablyfair_", "")
             await handle_provably_fair_deep_link(update, context, pf_id)
@@ -506,7 +501,25 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
-        # Check if withdrawal address is set
+        # Show withdrawal method selection
+        text = (
+            f"{pe('withdraw')} <b>Withdrawal</b>\n\n"
+            f"Choose a withdrawal method:"
+        )
+        keyboard = [
+            [apply_button_style(InlineKeyboardButton("USDT BEP20 Withdrawal", callback_data="withdraw_usdt_bep20"), 'primary', peb('dollar'))],
+            [apply_button_style(InlineKeyboardButton("CCTip/CWallet Withdrawal", callback_data="withdraw_cwallet_info"), 'success', peb('moneybag'))],
+            [apply_button_style(InlineKeyboardButton("Back", callback_data="back_to_main"), 'danger', peb('cross'))],
+        ]
+        await safe_edit_message(
+            query, text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=create_styled_keyboard(keyboard),
+        )
+        return
+
+    elif data == "withdraw_usdt_bep20":
+        # Existing USDT BEP20 flow — check address and show coin selection
         withdrawal_address = user_stats[user.id].get("withdrawal_address")
         if not withdrawal_address:
             await safe_edit_message(
@@ -521,7 +534,6 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
-        # Ask for withdrawal: Step 1 - Select crypto
         wallet = ensure_wallet_dict(user.id)
         keyboard = []
         for coin in SUPPORTED_CRYPTOS:
@@ -554,6 +566,24 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        return
+
+    elif data == "withdraw_cwallet_info":
+        text = (
+            "\U00002139\uFE0F <b>Cctip / Cwallet Withdrawal</b>\n\n"
+            "<b>How it works:</b>\n"
+            "1\U000020E3 Use the command in the group chat where @Ittz_surajj is present:\n"
+            "   <code>/withdraw &lt;amount&gt; usdt cctip</code>\n\n"
+            "2\U000020E3 Example: <code>/withdraw 10 usdt cctip</code>\n\n"
+            "3\U000020E3 Confirm the withdrawal, and @Ittz_surajj will tip you the USDT via Cctip/Cwallet.\n\n"
+            "\u26A0\uFE0F <b>Limits & Fees:</b>\n"
+            "\u2022 Max per transaction: $50 USDT\n"
+            "\u2022 Fee: 1% + $0.10 deducted from withdrawal amount\n"
+            "\u2022 Min withdrawal: $1.00\n\n"
+            "\u2714\uFE0F Fast & instant \u2014 no wallet address needed!"
+        )
+        keyboard = [[apply_button_style(InlineKeyboardButton("Back", callback_data="main_withdraw"), 'primary', peb('back'))]]
+        await safe_edit_message(query, text, reply_markup=create_styled_keyboard(keyboard), parse_mode=ParseMode.HTML)
         return
 
     elif data == "main_games":

@@ -1,624 +1,637 @@
-"""Auto-split from bot.py — plugins.escrow."""
+"""P2P Escrow System — bot holds funds, releases on confirmation.
+
+Flow:
+  1. Seller uses /escrow <amount> @buyer (or reply to buyer's message)
+  2. Bot shows deal in group with Accept (green) / Decline (red) buttons
+  3. Bot pins the deal message
+  4. Buyer taps Accept -> amount deducted from seller's wallet (held by bot)
+  5. Release (seller only) -> final confirm -> amount credited to buyer
+  6. Dispute (both) -> admins can /refund (back to seller) or /release (to buyer)
+"""
 from __future__ import annotations
-from core.foundation import *  # noqa: F401, F403
+from core.foundation import *
+import secrets
+from datetime import datetime, timezone
 
-@check_banned
-@check_maintenance
-async def escrow_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_callback=False):
-    user = update.effective_user
-    await ensure_user_in_wallets(user.id, user.username, context=context)
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-    # NEW: Check if escrow feature is enabled
-    if not bot_settings.get("escrow_enabled", True):
-        error_msg = f"{pe('cross')} This feature is currently disabled by the owner."
-        if from_callback:
-            await safe_edit_message(
-                update.callback_query,
-                error_msg,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to More", callback_data="main_more")]])
-            )
-        else:
-            await update.message.reply_text(error_msg)
-        return
+def _generate_escrow_id() -> str:
+    return "ESC_" + secrets.token_hex(4).upper()
 
-    if not all([ESCROW_DEPOSIT_ADDRESS, ESCROW_WALLET_PRIVATE_KEY]):
-        error_msg = "Escrow system is not configured by the owner yet."
-        if from_callback: await safe_edit_message(update.callback_query, error_msg)
-        else: await update.message.reply_text(error_msg)
-        return
 
-    context.user_data['escrow_step'] = 'ask_amount'
-    context.user_data['escrow_data'] = {'creator_id': user.id, 'creator_username': user.username}
-    text = f"{pe('shield')} <b>New Escrow Deal</b>\n\nPlease enter the deal amount in USDT (BEP20)."
-    keyboard = [[InlineKeyboardButton("Cancel", callback_data="escrow_action_cancel_setup")]]
-    if from_callback:
-        await safe_edit_message(update.callback_query, text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+def _get_available_balance(user_id: int) -> float:
+    currency = get_active_currency(user_id)
+    wallet = ensure_wallet_dict(user_id)
+    balance = wallet.get(currency, 0.0)
+    locked = get_locked_balance_in_games(user_id)['total']
+    price = LIVE_PRICES.get(currency, 1.0)
+    locked_currency = locked / price if price > 0 else 0
+    return max(0.0, balance - locked_currency)
 
-@check_banned
-@check_maintenance
-async def handle_escrow_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    step = context.user_data.get('escrow_step')
-    deal_data = context.user_data.get('escrow_data', {})
-    cancel_button = [[InlineKeyboardButton("Cancel", callback_data="escrow_action_cancel_setup")]]
 
-    if step == 'ask_amount':
+def _format_deal_text(deal: dict, include_footer: bool = True) -> str:
+    status_map = {
+        'pending_acceptance': (pe('clock'), 'Pending Acceptance'),
+        'active':             (pe('lock'), 'Active — Funds Held by Bot'),
+        'completed':          (pe('check'), 'Completed'),
+        'disputed':           (pe('warning'), 'Disputed — Awaiting Admin'),
+        'cancelled':          (pe('cross'), 'Cancelled'),
+        'refunded':           ('\U0001F9FE', 'Refunded to Seller'),
+        'released_by_admin':  (pe('shield'), 'Released by Admin'),
+    }
+    emoji, status_str = status_map.get(deal['status'], (pe('escrow'), deal['status'].title()))
+
+    lines = [
+        f"{pe('escrow')} <b>Escrow Deal #{deal['id']}</b>\n",
+        f"{pe('dollar')} <b>Amount:</b> {deal['amount']} {deal['currency']}",
+        f"{pe('moneybag')} <b>Seller:</b> @{deal['seller_username']}",
+        f"{pe('shopping')} <b>Buyer:</b> @{deal['buyer_username']}",
+        f"{emoji} <b>Status:</b> {status_str}",
+        f"{pe('clock')} <b>Created:</b> {deal['created_at']}",
+    ]
+    if deal.get('accepted_at'):
+        lines.append(f"{pe('lock')} <b>Accepted:</b> {deal['accepted_at']}")
+    if deal.get('completed_at'):
+        lines.append(f"{pe('check')} <b>Completed:</b> {deal['completed_at']}")
+    if include_footer:
+        lines.append(f"\n{pe('star')} <i>This deal is secured by the bot.</i>")
+    return "\n".join(lines)
+
+
+async def _get_buyer_from_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[int, str] | None:
+    """Extract buyer (user_id, username) from command reply or @mention."""
+    msg = update.message
+    if not msg:
+        return None
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        if not u.is_bot:
+            return (u.id, u.username or str(u.id))
+    if msg.entities:
+        for ent in msg.entities:
+            if ent.type == "text_mention" and ent.user and not ent.user.is_bot:
+                return (ent.user.id, ent.user.username or str(ent.user.id))
+    return None
+
+
+async def _notify_owner(context: ContextTypes.DEFAULT_TYPE, deal: dict):
+    """Send DM to bot owner about new escrow deal."""
+    for owner_id in BOT_OWNER_IDS:
         try:
-            amount = float(update.message.text)
-            if amount <= 0: raise ValueError
-            deal_data['amount'] = amount
-            context.user_data['escrow_step'] = 'ask_role'
-            keyboard = [
-                [InlineKeyboardButton(f"{pe('house')} I am the Seller", callback_data="escrow_role_seller")],
-                [InlineKeyboardButton(f"{pe('shopping')} I am the Buyer", callback_data="escrow_role_buyer")],
-                [InlineKeyboardButton("Cancel", callback_data="escrow_action_cancel_setup")]
-            ]
-            await update.message.reply_text(f"{pe('check')} Amount set to ${amount:.2f} USDT.\n\nPlease select your role:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
-        except (ValueError, TypeError):
-            await update.message.reply_text(f"{pe('cross')} Invalid amount. Please enter a positive number.", reply_markup=InlineKeyboardMarkup(cancel_button))
-            return
+            chat = await context.bot.get_chat(deal['group_id'])
+            link = chat.invite_link or f"https://t.me/c/{str(deal['group_id']).replace('-100', '')}/{deal['pinned_message_id']}"
+            await context.bot.send_message(
+                chat_id=owner_id,
+                text=(
+                    f"{pe('escrow')} <b>New Escrow Deal</b>\n\n"
+                    f"<b>ID:</b> <code>{deal['id']}</code>\n"
+                    f"{pe('dollar')} Amount: {deal['amount']} {deal['currency']}\n"
+                    f"{pe('moneybag')} Seller: @{deal['seller_username']}\n"
+                    f"{pe('shopping')} Buyer: @{deal['buyer_username']}\n"
+                    f"{pe('link')} <a href=\"{link}\">View in Group</a>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logging.error(f"Escrow notify owner {owner_id}: {e}")
 
-    elif step == 'ask_details':
-        deal_data['details'] = update.message.text
-        # REMOVED: ask_partner_method step. Forcing link creation.
-        await create_and_finalize_escrow_deal(update, context, by_link=True)
+
+# ── /escrow command ──────────────────────────────────────────────────────────
 
 @check_banned
 @check_maintenance
-async def escrow_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    user, data = query.from_user, query.data.split('_')
-    action = data[1]
-    await ensure_user_in_wallets(user.id, user.username, context=context)
-
-    if action == 'role':
-        role = data[2]
-        context.user_data['escrow_data']['creator_role'] = role
-        context.user_data['escrow_data']['partner_role'] = 'Buyer' if role == 'seller' else 'Seller'
-        context.user_data['escrow_step'] = 'ask_details'
-        cancel_button = [[InlineKeyboardButton("Cancel", callback_data="escrow_action_cancel_setup")]]
-        await query.edit_message_text(f"{pe('check')} Role selected. Now, please provide the deal details (e.g., 'Sale of item X').", reply_markup=InlineKeyboardMarkup(cancel_button))
-
-    # REMOVED: partner action, as we now force link creation.
-
-    elif action == 'confirm':
-        deal_id, decision = data[2], data[3]
-        deal = escrow_deals.get(deal_id)
-        if not deal or (user.id != deal.get('buyer', {}).get('id') and user.id != deal.get('seller', {}).get('id')):
-            await query.edit_message_text("This deal is not for you or has expired.")
-            return
-        if user.id == deal.get('creator_id'):
-            await query.answer("Waiting for the other party to respond.", show_alert=True); return
-
-        if decision == 'accept':
-            deal['status'] = 'accepted_awaiting_deposit'
-            save_escrow_deal(deal_id)
-            seller_id, buyer_id = deal['seller']['id'], deal['buyer']['id']
-            await query.edit_message_text(f"{pe('check')} You accepted the deal. Seller will now be prompted to deposit ${deal['amount']:.2f} USDT.")
-            deposit_text = (f"{{pe('check')}} The other party accepted the deal!\n\n<b>Deal ID:</b> <code>{deal_id}</code>\n"
-                            f"Please deposit exactly <code>{deal['amount']}</code> USDT (BEP20) to:\n<code>{ESCROW_DEPOSIT_ADDRESS}</code>\n\n"
-                            f"{pe('warning')} Send from your own wallet (NOT from an exchange). Have enough BNB for gas.")
-            await context.bot.send_message(chat_id=seller_id, text=deposit_text, parse_mode='HTML')
-            context.job_queue.run_repeating(monitor_escrow_deposit, interval=20, first=10, data={'deal_id': deal_id}, name=f"escrow_monitor_{deal_id}")
-        else: # Decline
-            deal['status'] = 'declined_by_partner'; save_escrow_deal(deal_id)
-            await query.edit_message_text("You have declined the deal. It has been cancelled.")
-            await context.bot.send_message(chat_id=deal['creator_id'], text=f"The other party has declined your escrow deal ({deal_id}).")
-
-    elif action == 'action':
-        if data[2] == "cancel" and data[3] == "setup":
-             context.user_data.clear()
-             await query.edit_message_text("Escrow setup cancelled.")
-             await more_menu(update, context)
-             return
-
-        deal_id, decision = data[2], data[3]
-        deal = escrow_deals.get(deal_id)
-        if not deal or user.id not in [deal['seller']['id'], deal['buyer']['id']]: return
-
-        if decision == 'release':
-            if user.id != deal['seller']['id']: await query.answer("Only the seller can release funds.", show_alert=True); return
-            if deal['status'] != 'funds_secured': await query.answer("Funds are not in a releasable state.", show_alert=True); return
-            keyboard = [
-                [InlineKeyboardButton("Yes, Release Funds", callback_data=f"escrow_action_{deal_id}_releaseconfirm")],
-                [InlineKeyboardButton("No, Cancel", callback_data=f"escrow_action_{deal_id}_releasecancel")]
-            ]
-            await query.edit_message_text(f"{pe('warning')} Are you sure you want to release the funds to the buyer? This action is irreversible.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
-        elif decision == 'releaseconfirm':
-            if user.id != deal['seller']['id']: return
-            # NEW: Credit buyer's casino balance directly instead of asking for withdrawal address
-            buyer_id = deal['buyer']['id']
-            amount = deal['amount']
-
-            # Add funds to buyer's casino balance
-            await ensure_user_in_wallets(buyer_id, context=context)
-            credit_wallet(buyer_id, amount)
-            save_user_data(buyer_id)
-
-            # Update deal status
-            deal['status'] = 'completed'
-            deal['completed_at'] = str(datetime.now(timezone.utc))
-            save_escrow_deal(deal_id)
-
-            # Notify both parties
-            seller_msg = (
-                f"{pe('check')} <b>Deal Completed!</b>\n\n"
-                f"<b>Deal ID:</b> <code>{deal_id}</code>\n"
-                f"<b>Amount:</b> ${amount:.2f}\n\n"
-                f"The funds have been credited to the buyer's casino balance.\n"
-                f"Thank you for using our escrow service!"
-            )
-            buyer_msg = (
-                f"{pe('check')} <b>Funds Received!</b>\n\n"
-                f"<b>Deal ID:</b> <code>{deal_id}</code>\n"
-                f"<b>Amount:</b> ${amount:.2f}\n\n"
-                f"The funds have been added to your casino balance.\n"
-                f"You can now withdraw them using the withdrawal feature.\n\n"
-                f"Use /withdraw to request a withdrawal."
-            )
-
-            await query.edit_message_text(seller_msg, parse_mode=ParseMode.HTML)
-            await context.bot.send_message(chat_id=buyer_id, text=buyer_msg, parse_mode=ParseMode.HTML)
-
-        elif decision == 'releasecancel': await query.edit_message_text("Release cancelled.")
-        elif decision == 'dispute':
-            deal['status'] = 'disputed'; save_escrow_deal(deal_id)
-            dispute_text = f"{pe('alarm')} A dispute has been opened for deal <code>{deal_id}</code>. Contact @Ittz_surajj for assistance."
-            await query.edit_message_text(dispute_text, parse_mode="HTML")
-            other_party_id = deal['buyer']['id'] if user.id == deal['seller']['id'] else deal['seller']['id']
-            await context.bot.send_message(chat_id=other_party_id, text=dispute_text, parse_mode="HTML")
-            await context.bot.send_message(BOT_OWNER_ID, text=f"New dispute for deal {deal_id}.")
-
-async def create_and_finalize_escrow_deal(update: Update, context: ContextTypes.DEFAULT_TYPE, by_link=False):
+async def escrow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    deal_data = context.user_data.get('escrow_data', {})
-    if deal_data['creator_role'] == 'seller':
-        deal_data['seller'] = {'id': user.id, 'username': user.username}
-        deal_data['buyer'] = {'id': None, 'username': None} # Partner joins via link
-    else:
-        deal_data['buyer'] = {'id': user.id, 'username': user.username}
-        deal_data['seller'] = {'id': None, 'username': None} # Partner joins via link
+    msg = update.effective_message
+    chat = update.effective_chat
 
-    deal_id = generate_unique_id("ESC")
-    deal_data.update({'id': deal_id, 'status': 'pending_confirmation', 'timestamp': str(datetime.now(timezone.utc))})
-    escrow_deals[deal_id] = deal_data
-    save_escrow_deal(deal_id)
-
-    await ensure_user_in_wallets(user.id, user.username, context=context)
-    user_stats[user.id]['escrow_deals'].append(deal_id)
-    save_user_data(user.id)
-
-    context.user_data.pop('escrow_step', None); context.user_data.pop('escrow_data', None)
-
-    buyer_username = deal_data.get('buyer', {}).get('username') or "TBD (via link)"
-    seller_username = deal_data.get('seller', {}).get('username') or "TBD (via link)"
-    deal_summary = (f"🛡️ <b>New Escrow Deal Created</b>\n\n<b>Deal ID:</b> <code>{deal_id}</code>\n"
-                    f"<b>Amount:</b> ${deal_data['amount']:.2f} USDT\n<b>Seller:</b> @{seller_username}\n"
-                    f"<b>Buyer:</b> @{buyer_username}\n<b>Details:</b> {deal_data['details']}")
-
-    bot_username = await get_bot_username(context)
-    deal_link = f"https://t.me/{bot_username}?start=escrow_{deal_id}"
-
-    reply_target = update.callback_query.message if update.callback_query else update.message
-    await reply_target.reply_text(f"{deal_summary}\n\nShare this link with the other party to join:\n<code>{deal_link}</code>", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-async def handle_escrow_deep_link(update: Update, context: ContextTypes.DEFAULT_TYPE, deal_id: str):
-    user = update.effective_user
-    await ensure_user_in_wallets(user.id, user.username, context=context)
-    deal = escrow_deals.get(deal_id)
-    if not deal: await update.message.reply_text("This escrow deal link is invalid or has expired."); return
-
-    is_joinable = (deal['creator_role'] == 'seller' and deal.get('buyer', {}).get('id') is None) or \
-                  (deal['creator_role'] == 'buyer' and deal.get('seller', {}).get('id') is None)
-    if not is_joinable or deal['status'] != 'pending_confirmation':
-        await update.message.reply_text("This deal has already been accepted or is no longer valid."); return
-    if user.id == deal['creator_id']:
-        await update.message.reply_text("You cannot accept your own deal. Share the link with the other party."); return
-
-    if deal['creator_role'] == 'seller': deal['buyer'] = {'id': user.id, 'username': user.username}
-    else: deal['seller'] = {'id': user.id, 'username': user.username}
-    user_stats[user.id]['escrow_deals'].append(deal_id)
-    save_user_data(user.id)
-    save_escrow_deal(deal_id)
-
-    deal_summary = (f"🛡️ <b>You are joining an Escrow Deal</b>\n\n<b>Deal ID:</b> <code>{deal_id}</code>\n"
-                    f"<b>Amount:</b> ${deal['amount']:.2f} USDT\n<b>Seller:</b> @{deal['seller']['username']}\n"
-                    f"<b>Buyer:</b> @{deal['buyer']['username']}\n<b>Details:</b> {deal['details']}")
-    keyboard = [[InlineKeyboardButton("Accept Deal", callback_data=f"escrow_confirm_{deal_id}_accept"), InlineKeyboardButton("Decline Deal", callback_data=f"escrow_confirm_{deal_id}_decline")]]
-    await update.message.reply_text(f"{deal_summary}\n\nPlease confirm to proceed.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
-
-def generate_verification_code(pf_record):
-    """Generate game-specific verification code"""
-    game_type = pf_record['game_type']
-    server_seed = pf_record['server_seed']
-    client_seed = pf_record['client_seed']
-    nonce = pf_record['nonce']
-
-    # Base verification functions used by all games
-    base_code = f"""import hashlib
-
-# Your Game Data
-server_seed = "{server_seed}"
-client_seed = "{client_seed}"
-nonce = {nonce}
-
-# Core Verification Functions
-def create_hash(server_seed, client_seed, nonce):
-    combined = f"{{server_seed}}:{{client_seed}}:{{nonce}}"
-    return hashlib.sha256(combined.encode()).hexdigest()
-
-def get_provably_fair_result(server_seed, client_seed, nonce, max_value):
-    hash_result = create_hash(server_seed, client_seed, nonce)
-    hex_value = int(hash_result[:8], 16)
-    return hex_value % max_value
-
-"""
-
-    # Game-specific verification code
-    if game_type == "roulette":
-        game_code = """# Roulette Verification
-RED_NUMBERS = {{1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}}
-
-winning_number = get_provably_fair_result(server_seed, client_seed, nonce, 37)
-
-if winning_number == 0:
-    color = "Green 🟢"
-elif winning_number in RED_NUMBERS:
-    color = "Red 🔴"
-else:
-    color = "Black ⚫"
-
-print(f"=== Roulette Verification ===")
-print(f"Winning Number: {{winning_number}} ({{color}})")
-print(f"Hash: {{create_hash(server_seed, client_seed, nonce)[:16]}}...")
-"""
-
-    elif game_type == "hilo":
-        game_code = """# Hi-Lo (High-Low) Card Game Verification
-# Generate shuffled deck
-deck = list(range(1, 14)) * 4  # 1-13, 4 suits (52 cards)
-
-# Fisher-Yates shuffle with provably fair results
-for i in range(len(deck) - 1, 0, -1):
-    j = get_provably_fair_result(server_seed, client_seed, nonce + i, i + 1)
-    deck[i], deck[j] = deck[j], deck[i]
-
-card_names = {{1:'ACE', 2:'2', 3:'3', 4:'4', 5:'5', 6:'6', 7:'7', 8:'8', 9:'9', 10:'10', 11:'JACK', 12:'QUEEN', 13:'KING'}}
-
-print("=== Hi-Lo Card Sequence ===")
-print("First 10 cards from shuffled deck:")
-for i in range(min(10, len(deck))):
-    card_value = deck[-(i+1)]  # Cards are popped from end
-    print(f"  Card {{i+1}}: {{card_names[card_value]}} ({{card_value}})")
-"""
-
-    elif game_type == "mines":
-        # Extract mine count from result data if available
-        result_data = pf_record.get('result_data', '')
-        num_mines = 3  # Default
-        # Try to extract from result_data
-        import re
-        if result_data:
-            match = re.search(r'Mine positions: \[([^\]]+)\]', result_data)
-            if match:
-                try:
-                    positions_str = match.group(1)
-                    num_mines = len(positions_str.split(','))
-                except:
-                    pass
-
-        game_code = f"""# Mines Game Verification
-def generate_mine_positions(server_seed, client_seed, nonce, num_mines):
-    positions = []
-    offset = 0
-    # IMPORTANT: Use nonce * 1000 to ensure unique results for consecutive games
-    base_nonce = nonce * 1000
-    while len(positions) < num_mines:
-        pos = get_provably_fair_result(server_seed, client_seed, base_nonce + offset, 25)
-        if pos not in positions:
-            positions.append(pos)
-        offset += 1
-    return sorted(positions)
-
-# Mine count from your game
-num_mines = {num_mines}
-
-mine_positions = generate_mine_positions(server_seed, client_seed, nonce, num_mines)
-
-print("=== Mines Verification ===")
-print(f"Mine Positions (0-24): {{mine_positions}}")
-print(f"Number of mines: {{len(mine_positions)}}")
-print("\\nGrid (5x5, rows 0-4, cols 0-4):")
-for row in range(5):
-    row_str = ""
-    for col in range(5):
-        idx = row * 5 + col
-        row_str += "💣 " if idx in mine_positions else "💎 "
-    print(f"Row {{row}}: {{row_str}}")
-"""
-
-    elif game_type == "tower":
-        # Extract difficulty from result data if available
-        result_data = pf_record.get('result_data', '')
-        difficulty = 'medium'  # Default
-        if 'easy' in result_data.lower():
-            difficulty = 'easy'
-        elif 'hard' in result_data.lower():
-            difficulty = 'hard'
-        elif 'medium' in result_data.lower():
-            difficulty = 'medium'
-
-        game_code = f"""# Tower Game Verification
-def generate_tower_positions(server_seed, client_seed, nonce, difficulty, num_floors=9):
-    tiles_per_floor = {{'easy': 4, 'medium': 3, 'hard': 2}}.get(difficulty, 3)
-    positions = []
-    # IMPORTANT: Use nonce * 1000 to ensure unique results for consecutive games
-    base_nonce = nonce * 1000
-    for floor in range(num_floors):
-        snake_pos = get_provably_fair_result(server_seed, client_seed, base_nonce + floor, tiles_per_floor)
-        positions.append(snake_pos)
-    return positions
-
-# Difficulty from your game
-difficulty = '{difficulty}'
-snake_positions = generate_tower_positions(server_seed, client_seed, nonce, difficulty, 9)
-tiles = {{'easy': 4, 'medium': 3, 'hard': 2}}[difficulty]
-
-print(f"=== Tower Verification ({{difficulty.title()}}) ===")
-print(f"Tiles per floor: {{tiles}}")
-print("Snake positions by floor (position 0 to {{tiles-1}}):")
-for i, pos in enumerate(snake_positions):
-    floor_num = i + 1
-    grid = ['🌴' for _ in range(tiles)]
-    grid[pos] = '🐍'
-    print(f"Floor {{floor_num}}: {{' '.join(grid)}} (Snake at position {{pos}})")
-"""
-
-    elif game_type == "blackjack":
-        game_code = """# Blackjack Verification
-# Generate and shuffle deck
-suits = ['♠', '♥', '♦', '♣']
-ranks = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
-deck = [f"{{r}}{{s}}" for s in suits for r in ranks]
-
-# Fisher-Yates shuffle
-for i in range(len(deck) - 1, 0, -1):
-    j = get_provably_fair_result(server_seed, client_seed, nonce + i, i + 1)
-    deck[i], deck[j] = deck[j], deck[i]
-
-print("=== Blackjack Deck Verification ===")
-print("Initial deal (first 4 cards):")
-print(f"  Player: {{deck[-1]}}, {{deck[-2]}}")
-print(f"  Dealer: {{deck[-3]}}, {{deck[-4]}} (hidden)")
-print("\\nNext cards available:")
-for i in range(5, min(10, len(deck))):
-    print(f"  Card {{i-4}}: {{deck[-i]}}")
-"""
-
-    elif game_type == "coinflip":
-        game_code = """# Coinflip Verification
-result = get_provably_fair_result(server_seed, client_seed, nonce, 2)
-outcome = "Heads" if result == 0 else "Tails"
-
-print("=== Coinflip Verification ===")
-print(f"Result: {{result}} ({{outcome}})")
-print(f"Hash: {{create_hash(server_seed, client_seed, nonce)[:16]}}...")
-"""
-
-    elif game_type == "keno":
-        game_code = """# Keno Verification
-def generate_keno_numbers(server_seed, client_seed, nonce, count=10):
-    numbers = []
-    offset = 0
-    # IMPORTANT: Use nonce * 1000 to ensure unique results for consecutive games
-    base_nonce = nonce * 1000
-    while len(numbers) < count:
-        num = get_provably_fair_result(server_seed, client_seed, base_nonce + offset, 40) + 1
-        if num not in numbers:
-            numbers.append(num)
-        offset += 1
-    return sorted(numbers)
-
-keno_numbers = generate_keno_numbers(server_seed, client_seed, nonce, 10)
-
-print("=== Keno Verification ===")
-print(f"Drawn Numbers (1-40): {{keno_numbers}}")
-print(f"Total drawn: {{len(keno_numbers)}}")
-"""
-
-    else:
-        # Generic verification for other games
-        game_code = """# Generic Game Verification
-game_hash = create_hash(server_seed, client_seed, nonce)
-
-print(f"=== Game Verification ===")
-print(f"Game Hash: {{game_hash}}")
-print(f"First 8 hex chars: {{game_hash[:8]}}")
-print(f"Decimal value: {{int(game_hash[:8], 16)}}")
-
-# Common game results
-print("\\nPossible results for different games:")
-print(f"  Coinflip (0-1): {{get_provably_fair_result(server_seed, client_seed, nonce, 2)}}")
-print(f"  Dice (1-6): {{get_provably_fair_result(server_seed, client_seed, nonce, 6) + 1}}")
-print(f"  Roulette (0-36): {{get_provably_fair_result(server_seed, client_seed, nonce, 37)}}")
-"""
-
-    return f"```python\n{base_code}{game_code}\n```"
-
-async def monitor_escrow_deposit(context: ContextTypes.DEFAULT_TYPE):
-    deal_id = context.job.data["deal_id"]
-    deal = escrow_deals.get(deal_id)
-    if not deal or deal['status'] != 'accepted_awaiting_deposit':
-        logging.info(f"Stopping monitor for deal {deal_id}, status is {deal.get('status', 'N/A')}"); context.job.schedule_removal(); return
-
-    logging.info(f"Checking for escrow deposit for deal {deal_id}...")
-    try:
-        url = f"https://api.bscscan.com/api?module=account&action=tokentx&contractaddress={ESCROW_DEPOSIT_TOKEN_CONTRACT}&address={ESCROW_DEPOSIT_ADDRESS}&sort=desc&apikey={DEPOSIT_API_KEY}"
-        async with httpx.AsyncClient() as client: response = await client.get(url, timeout=20.0); data = response.json()
-
-        if data['status'] == '1' and data['result']:
-            for tx in data['result']:
-                if tx['to'].lower() == ESCROW_DEPOSIT_ADDRESS.lower() and tx['hash'] not in deal.get('processed_txs', []):
-                    tx_amount_usdt = int(tx['value']) / (10**ESCROW_DEPOSIT_TOKEN_DECIMALS)
-                    if tx_amount_usdt >= deal['amount']:
-                        logging.info(f"Detected valid deposit for deal {deal_id}, tx: {tx['hash']}. Amount: {tx_amount_usdt} USDT.")
-                        deal.update({'amount': tx_amount_usdt, 'status': 'funds_secured', 'deposit_tx_hash': tx['hash']})
-                        if 'processed_txs' not in deal: deal['processed_txs'] = []
-                        deal['processed_txs'].append(tx['hash'])
-                        save_escrow_deal(deal_id)
-
-                        seller_id, buyer_id = deal['seller']['id'], deal['buyer']['id']
-                        seller_msg = (f"{pe('check')} Deposit of ${tx_amount_usdt:.2f} USDT confirmed for deal <code>{deal_id}</code>. Funds are secured.\n\n"
-                                      f"You may now proceed with the buyer. Once they confirm receipt, use the button below to release the funds to them.")
-                        buyer_msg = (f"{pe('check')} The seller has deposited ${tx_amount_usdt:.2f} USDT for deal <code>{deal_id}</code>. The funds are now secured by the bot.\n\n"
-                                     f"Please proceed with the transaction. Let the seller know once you have received the goods/services as agreed.")
-
-                        # Enhanced attractive buttons
-                        keyboard_seller = [
-                            [InlineKeyboardButton("Release Funds to Buyer", callback_data=f"escrow_action_{deal_id}_release")],
-                            [InlineKeyboardButton("Open Dispute", callback_data=f"escrow_action_{deal_id}_dispute")]
-                        ]
-                        keyboard_buyer = [
-                            [InlineKeyboardButton("Open Dispute", callback_data=f"escrow_action_{deal_id}_dispute")]
-                        ]
-
-                        await context.bot.send_message(seller_id, seller_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard_seller))
-                        await context.bot.send_message(buyer_id, buyer_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard_buyer))
-                        context.job.schedule_removal()
-                        return
-    except Exception as e: logging.error(f"Error monitoring escrow deposit for deal {deal_id}: {e}", exc_info=True)
-
-async def release_escrow_funds(update: Update, context: ContextTypes.DEFAULT_TYPE, deal_id: str):
-    deal = escrow_deals.get(deal_id)
-    if not deal or deal['status'] != 'funds_secured': await update.message.reply_text("This deal is not ready for fund release."); return
-    if not all([ESCROW_WALLET_PRIVATE_KEY, w3_bsc]):
-        await update.message.reply_text("Escrow wallet not configured. Contacting admin.")
-        await context.bot.send_message(BOT_OWNER_ID, f"FATAL: Attempted to release funds for deal {deal_id} but PK or web3 is missing!")
+    if chat.type not in ("group", "supergroup"):
+        await msg.reply_text(f"{pe('cross')} Escrow deals can only be created in groups.")
         return
 
-    try:
-        w3 = w3_bsc
-        contract = w3.eth.contract(address=Web3.to_checksum_address(ESCROW_DEPOSIT_TOKEN_CONTRACT), abi=ERC20_ABI)
-        amount_wei = int(deal['amount'] * (10**ESCROW_DEPOSIT_TOKEN_DECIMALS))
-        to_address, from_address = Web3.to_checksum_address(deal['buyer']['withdrawal_address']), Web3.to_checksum_address(ESCROW_DEPOSIT_ADDRESS)
-        tx = contract.functions.transfer(to_address, amount_wei).build_transaction({
-            'chainId': 56, 'gas': 150000, 'gasPrice': w3.eth.gas_price, 'nonce': w3.eth.get_transaction_count(from_address)})
-        signed_tx = w3.eth.account.sign_transaction(tx, private_key=ESCROW_WALLET_PRIVATE_KEY)
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    args = context.args
+    if not args:
+        await msg.reply_text(
+            f"{pe('escrow')} <b>Usage:</b>\n"
+            f"<code>/escrow amount @buyer</code>\n"
+            f"<code>/escrow all @buyer</code> (entire available balance)\n"
+            f"<code>/escrow half @buyer</code> (half of available balance)\n"
+            f"<code>/escrow amount</code> (reply to buyer's message)",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
-        if receipt.status == 1:
-            deal.update({'status': 'completed', 'release_tx_hash': tx_hash.hex()}); save_escrow_deal(deal_id)
-            explorer_url = f"https://bscscan.com/tx/{tx_hash.hex()}"
-            success_msg = f"{pe('check')} Deal {deal_id} completed! ${deal['amount']:.2f} USDT sent to the buyer. Explorer: {explorer_url}"
-            await context.bot.send_message(deal['seller']['id'], success_msg); await context.bot.send_message(deal['buyer']['id'], success_msg)
-        else: raise Exception("Transaction failed on-chain.")
+    raw = args[0].lower()
+    currency = get_active_currency(user.id)
+    available = _get_available_balance(user.id)
+
+    if raw == "all":
+        amount = available
+    elif raw == "half":
+        amount = available / 2
+    else:
+        try:
+            amount = float(raw.replace(',', ''))
+            if amount <= 0:
+                raise ValueError
+        except (ValueError, IndexError):
+            await msg.reply_text(f"{pe('cross')} Invalid amount. Please enter a positive number, 'all', or 'half'.")
+            return
+
+    if amount <= 0:
+        await msg.reply_text(f"{pe('cross')} You have no available balance to escrow.", parse_mode=ParseMode.HTML)
+        return
+
+    if available < amount:
+        await msg.reply_text(
+            f"{pe('cross')} <b>Insufficient available balance.</b>\n\n"
+            f"{pe('dollar')} Required: {amount} {currency}\n"
+            f"{pe('money')} Available: {available:.2f} {currency}\n\n"
+            f"{pe('lock')} Balance locked in active games is not counted.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    buyer_info = await _get_buyer_from_command(update, context)
+    if not buyer_info:
+        await msg.reply_text(
+            f"{pe('cross')} Could not identify buyer. Either reply to the buyer's message or @mention them.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    buyer_id, buyer_username = buyer_info
+    if buyer_id == user.id:
+        await msg.reply_text(f"{pe('cross')} You cannot create an escrow deal with yourself.")
+        return
+
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    await ensure_user_in_wallets(buyer_id, buyer_username, context=context)
+
+    deal_id = _generate_escrow_id()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    deal = {
+        'id': deal_id,
+        'status': 'pending_acceptance',
+        'amount': amount,
+        'currency': currency,
+        'seller_id': user.id,
+        'seller_username': user.username or str(user.id),
+        'buyer_id': buyer_id,
+        'buyer_username': buyer_username,
+        'group_id': chat.id,
+        'group_title': chat.title or str(chat.id),
+        'created_at': now,
+        'accepted_at': '',
+        'completed_at': '',
+        'disputed_at': '',
+        'disputed_by': 0,
+    }
+
+    escrow_deals[deal_id] = deal
+    save_escrow_deal(deal_id)
+
+    text = _format_deal_text(deal)
+    keyboard = [
+        [
+            apply_button_style(InlineKeyboardButton("Accept", callback_data=f"es_accept_{deal_id}"), 'success', peb('check')),
+        ],
+        [
+            apply_button_style(InlineKeyboardButton("Cancel Deal", callback_data=f"es_cancel_{deal_id}"), 'danger', peb('bust')),
+        ],
+    ]
+
+    try:
+        sent = await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+        deal['pinned_message_id'] = sent.message_id
+        save_escrow_deal(deal_id)
+        try:
+            await sent.pin(disable_notification=True)
+        except Exception as e:
+            logging.warning(f"Escrow: could not pin message: {e}")
+        await _notify_owner(context, deal)
     except Exception as e:
-        logging.error(f"FATAL ERROR releasing funds for deal {deal_id}: {e}", exc_info=True)
-        deal['status'] = 'release_failed'; save_escrow_deal(deal_id)
-        fail_msg = f"🚨 An error occurred releasing funds for deal {deal_id}. Contact @Ittz_surajj immediately."
-        await context.bot.send_message(deal['seller']['id'], fail_msg); await context.bot.send_message(deal['buyer']['id'], fail_msg)
-        await context.bot.send_message(BOT_OWNER_ID, f"FATAL ERROR releasing funds for deal {deal_id}: {e}")
+        logging.error(f"Escrow: failed to send deal message: {e}", exc_info=True)
+        escrow_deals.pop(deal_id, None)
+        try:
+            import os
+            os.remove(os.path.join(ESCROW_DIR, f"{deal_id}.json"))
+        except Exception:
+            pass
+        await msg.reply_text(f"{pe('cross')} Failed to create escrow deal. Please try again.")
+
+
+# ── Callback handler ─────────────────────────────────────────────────────────
+
+async def escrow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    data = query.data
+
+    if not data.startswith("es_"):
+        return
+
+    parts = data.split("_", 2)
+    if len(parts) < 3:
+        await query.answer("Invalid request.", show_alert=True)
+        return
+
+    action = parts[1]
+    rest = parts[2]
+
+    # deal_id always starts with "ESC_" — action may contain
+    # underscores (e.g. confirm_release) so extract deal_id by
+    # finding "ESC_" in the remainder.
+    if rest.startswith("ESC_"):
+        deal_id = rest
+    elif "ESC_" in rest:
+        esc_idx = rest.find("ESC_")
+        # rebuild the action with the prefix (e.g. confirm_release)
+        action = f"{action}_{rest[:esc_idx].rstrip('_')}"
+        deal_id = rest[esc_idx:]
+    else:
+        await query.answer("Invalid request.", show_alert=True)
+        return
+
+    deal = escrow_deals.get(deal_id)
+    if not deal:
+        await query.answer("This escrow deal no longer exists.", show_alert=True)
+        await safe_edit_message(query, f"{pe('cross')} Escrow deal not found.", parse_mode=ParseMode.HTML)
+        return
+
+    is_seller = user.id == deal['seller_id']
+    is_buyer = user.id == deal['buyer_id']
+    is_admin_user = is_admin(user.id)
+
+    # ── Accept ──
+    if action == "accept":
+        if not is_buyer:
+            await query.answer("Only the buyer can accept this deal.", show_alert=True)
+            return
+        if deal['status'] != 'pending_acceptance':
+            await query.answer("This deal is no longer pending.", show_alert=True)
+            return
+
+        # Check seller still has balance
+        available = _get_available_balance(deal['seller_id'])
+        if available < deal['amount']:
+            await query.answer("Seller no longer has sufficient balance to proceed.", show_alert=True)
+            return
+
+        await query.answer("Deal accepted! Holding funds...")
+
+        # Deduct from seller (convert to USD for wallet functions)
+        coin_price = LIVE_PRICES.get(deal['currency'], 1.0)
+        usd_equiv = deal['amount'] * coin_price
+        try:
+            deduct_wallet(deal['seller_id'], usd_equiv, deal['currency'])
+        except ValueError:
+            await query.answer("Seller has insufficient funds now.", show_alert=True)
+            return
+
+        deal['status'] = 'active'
+        deal['accepted_at'] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        save_escrow_deal(deal_id)
+
+        text = _format_deal_text(deal)
+        keyboard = [
+            [
+                apply_button_style(InlineKeyboardButton("Release All", callback_data=f"es_release_{deal_id}"), 'success', peb('check')),
+                apply_button_style(InlineKeyboardButton("Dispute", callback_data=f"es_dispute_{deal_id}"), 'danger', peb('warning')),
+            ],
+        ]
+        await safe_edit_message(query, text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.reply_text(
+            f"{pe('check')} <b>Deal Accepted!</b>\n\n"
+            f"{pe('lock')} The amount of <b>{deal['amount']} {deal['currency']}</b> is now held by the bot.\n"
+            f"@{deal['seller_username']} can release the funds when ready.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── Decline ──
+    if action == "decline":
+        if not is_buyer:
+            await query.answer("Only the buyer can decline this deal.", show_alert=True)
+            return
+        if deal['status'] != 'pending_acceptance':
+            await query.answer("This deal is no longer pending.", show_alert=True)
+            return
+
+        await query.answer("Deal declined.")
+        deal['status'] = 'cancelled'
+        save_escrow_deal(deal_id)
+
+        await safe_edit_message(
+            query,
+            _format_deal_text(deal, include_footer=False),
+            parse_mode=ParseMode.HTML,
+        )
+        await query.message.reply_text(
+            f"{pe('cross')} @{deal['buyer_username']} declined the escrow deal #{deal_id}.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── Cancel (seller cancels while pending) ──
+    if action == "cancel":
+        if not is_seller:
+            await query.answer("Only the seller can cancel this deal.", show_alert=True)
+            return
+        if deal['status'] != 'pending_acceptance':
+            await query.answer("This deal cannot be cancelled at this stage.", show_alert=True)
+            return
+
+        await query.answer("Deal cancelled.")
+        deal['status'] = 'cancelled'
+        save_escrow_deal(deal_id)
+
+        await safe_edit_message(
+            query,
+            _format_deal_text(deal, include_footer=False),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── Release (seller initiates release) ──
+    if action == "release":
+        if not is_seller:
+            await query.answer("Only the seller can release funds.", show_alert=True)
+            return
+        if deal['status'] != 'active':
+            await query.answer("This deal is not in active state.", show_alert=True)
+            return
+
+        await query.answer()
+        text = (
+            f"{pe('warning')} <b>Final Confirmation Required</b>\n\n"
+            f"You are about to release <b>{deal['amount']} {deal['currency']}</b> "
+            f"to @{deal['buyer_username']}.\n\n"
+            f"{pe('cross')} <i>This action cannot be undone.</i>"
+        )
+        keyboard = [
+            [
+                apply_button_style(InlineKeyboardButton("Confirm Release", callback_data=f"es_confirm_release_{deal_id}"), 'success', peb('check')),
+                apply_button_style(InlineKeyboardButton("Cancel", callback_data=f"es_cancel_release_{deal_id}"), 'danger', peb('cross')),
+            ],
+        ]
+        await safe_edit_message(query, text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # ── Confirm Release ──
+    if action == "confirm_release":
+        if not is_seller:
+            await query.answer("Only the seller can confirm release.", show_alert=True)
+            return
+        if deal['status'] != 'active':
+            await query.answer("This deal is no longer active.", show_alert=True)
+            return
+
+        await query.answer("Funds released!")
+
+        coin_price = LIVE_PRICES.get(deal['currency'], 1.0)
+        usd_equiv = deal['amount'] * coin_price
+        credit_wallet(deal['buyer_id'], usd_equiv, deal['currency'])
+        deal['status'] = 'completed'
+        deal['completed_at'] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        save_escrow_deal(deal_id)
+
+        await safe_edit_message(
+            query,
+            _format_deal_text(deal),
+            parse_mode=ParseMode.HTML,
+        )
+        try:
+            await query.message.reply_text(
+                f"{pe('trophy')} <b>Escrow Deal Completed!</b>\n\n"
+                f"{pe('dollar')} <b>{deal['amount']} {deal['currency']}</b> has been released to @{deal['buyer_username']}.\n\n"
+                f"{pe('star')} Deal #{deal['id']} is now closed.",
+                parse_mode=ParseMode.HTML,
+            )
+            await context.bot.send_message(
+                chat_id=deal['buyer_id'],
+                text=(
+                    f"{pe('trophy')} <b>Escrow Received!</b>\n\n"
+                    f"@{deal['seller_username']} has released <b>{deal['amount']} {deal['currency']}</b> to you.\n\n"
+                    f"\U0001F9FE Deal ID: <code>{deal['id']}</code>\n"
+                    f"Use /balance to check your updated balance.",
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logging.error(f"Escrow release notification: {e}")
+        return
+
+    # ── Cancel Release (seller backs out of confirm) ──
+    if action == "cancel_release":
+        if not is_seller:
+            await query.answer()
+            return
+        if deal['status'] != 'active':
+            await query.answer()
+            return
+
+        await query.answer("Release cancelled.")
+        text = _format_deal_text(deal)
+        keyboard = [
+            [
+                apply_button_style(InlineKeyboardButton("Release All", callback_data=f"es_release_{deal_id}"), 'success', peb('check')),
+                apply_button_style(InlineKeyboardButton("Dispute", callback_data=f"es_dispute_{deal_id}"), 'danger', peb('warning')),
+            ],
+        ]
+        await safe_edit_message(query, text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # ── Dispute ──
+    if action == "dispute":
+        if not is_seller and not is_buyer and not is_admin_user:
+            await query.answer("You are not part of this deal.", show_alert=True)
+            return
+        if deal['status'] != 'active':
+            await query.answer("This deal cannot be disputed at this stage.", show_alert=True)
+            return
+
+        await query.answer("Dispute raised. Admins have been notified.")
+
+        deal['status'] = 'disputed'
+        deal['disputed_at'] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        deal['disputed_by'] = user.id
+        save_escrow_deal(deal_id)
+
+        await safe_edit_message(
+            query,
+            _format_deal_text(deal),
+            parse_mode=ParseMode.HTML,
+        )
+        await query.message.reply_text(
+            f"{pe('warning')} <b>Dispute Raised</b>\n\n"
+            f"@{user.username or user.id} has disputed escrow deal #{deal_id}.\n"
+            f"The funds are locked. An admin will review and take action.",
+            parse_mode=ParseMode.HTML,
+        )
+
+        for owner_id in BOT_OWNER_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=owner_id,
+                    text=(
+                        f"{pe('warning')} <b>Escrow Dispute</b>\n\n"
+                        f"<b>Deal:</b> <code>{deal['id']}</code>\n"
+                        f"{pe('dollar')} Amount: {deal['amount']} {deal['currency']}\n"
+                        f"{pe('moneybag')} Seller: @{deal['seller_username']}\n"
+                        f"{pe('shopping')} Buyer: @{deal['buyer_username']}\n"
+                        f"{pe('bust')} Disputed by: @{user.username or user.id}\n\n"
+                        f"Use /escrowinfo {deal['id']} to review.\n"
+                        f"Use /refund {deal['id']} to return to seller.\n"
+                        f"Use /release {deal['id']} to release to buyer.",
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logging.error(f"Escrow dispute notify owner {owner_id}: {e}")
+        return
+
+
+# ── Admin commands ───────────────────────────────────────────────────────────
 
 @check_banned
-@check_maintenance
-async def escrow_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner-only command to manually mark escrow deposit as received"""
+async def escrowinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-
-    # Check if user is owner
     if not is_admin(user.id):
-        await update.message.reply_text("This command is only available to the bot owner.")
+        await update.message.reply_text(f"{pe('cross')} Admin only.")
         return
 
-    # Check if escrow_id is provided
-    if not context.args or len(context.args) != 1:
-        await update.message.reply_text("Usage: /add <escrow_id>\n\nExample: /add ESC_ABC123")
+    args = context.args
+    if not args:
+        await update.message.reply_text(f"{pe('cross')} Usage: /escrowinfo ESC_ID")
         return
 
-    deal_id = context.args[0]
+    deal_id = args[0].upper()
     deal = escrow_deals.get(deal_id)
-
     if not deal:
         await update.message.reply_text(f"{pe('cross')} Escrow deal {deal_id} not found.")
         return
 
-    if deal['status'] != 'accepted_awaiting_deposit':
-        await update.message.reply_text(f"{pe('cross')} Deal {deal_id} is not awaiting deposit. Current status: {deal['status']}")
-        return
-
-    # Mark deposit as received
-    deal['status'] = 'funds_secured'
-    deal['deposit_tx_hash'] = 'MANUAL_CONFIRMATION_BY_OWNER'
-    save_escrow_deal(deal_id)
-
-    # Notify both parties
-    seller_id = deal['seller']['id']
-    buyer_id = deal['buyer']['id']
-
-    seller_msg = (f"{pe('check')} Deposit for deal <code>{deal_id}</code> has been confirmed by @Ittz_surajj. Funds are secured.\n\n"
-                  f"Amount: ${deal['amount']:.2f} USDT\n\n"
-                  f"You may now proceed with the buyer. Once they confirm receipt, use the button below to release the funds to them.")
-
-    buyer_msg = (f"{pe('check')} The seller's deposit for deal <code>{deal_id}</code> has been confirmed by @Ittz_surajj.\n\n"
-                 f"Amount: ${deal['amount']:.2f} USDT\n\n"
-                 f"The funds are now secured by the bot. Please proceed with the transaction. Let the seller know once you have received the goods/services as agreed.")
-
-    # Create enhanced buttons with better styling
-    keyboard_seller = [
-        [InlineKeyboardButton("Release Funds to Buyer", callback_data=f"escrow_action_{deal_id}_release")],
-        [InlineKeyboardButton("Open Dispute", callback_data=f"escrow_action_{deal_id}_dispute")]
-    ]
-
-    keyboard_buyer = [
-        [InlineKeyboardButton("Open Dispute", callback_data=f"escrow_action_{deal_id}_dispute")]
-    ]
-
-    await context.bot.send_message(seller_id, seller_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard_seller))
-    await context.bot.send_message(buyer_id, buyer_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard_buyer))
-
-    # Confirm to owner
     await update.message.reply_text(
-        f"{pe('check')} Deposit for deal <code>{deal_id}</code> has been manually confirmed.\n\n"
-        f"Amount: ${deal['amount']:.2f} USDT\n"
-        f"Seller: {deal['seller']['username']} (ID: {seller_id})\n"
-        f"Buyer: {deal['buyer']['username']} (ID: {buyer_id})\n\n"
-        f"Both parties have been notified.",
-        parse_mode=ParseMode.HTML
+        _format_deal_text(deal),
+        parse_mode=ParseMode.HTML,
     )
 
-async def escrow_toggle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle escrow feature on/off. Usage: /escrow on|off"""
+
+async def _admin_escrow_action(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
+    """Handle /refund and /release admin commands for disputed deals."""
     user = update.effective_user
     if not is_admin(user.id):
-        await update.message.reply_text(f"{pe('cross')} This is an admin-only command.")
+        await update.message.reply_text(f"{pe('cross')} Admin only.")
         return
-    await ensure_user_in_wallets(user.id, user.username, context=context)
 
-    if not context.args or context.args[0].lower() not in ['on', 'off']:
-        current_status = "enabled" if bot_settings.get("escrow_enabled", True) else "disabled"
+    args = context.args
+    if not args:
         await update.message.reply_text(
-            f"🛡️ <b>Escrow Feature Status</b>\n\n"
-            f"Current: <b>{current_status.upper()}</b>\n\n"
-            f"Usage: <code>/escrow on</code> or <code>/escrow off</code>",
-            parse_mode=ParseMode.HTML
+            f"{pe('cross')} Usage: /{action} ESC_ID",
+            parse_mode=ParseMode.HTML,
         )
         return
 
-    action = context.args[0].lower()
-    if action == 'off':
-        bot_settings["escrow_enabled"] = False
-        save_bot_state()
-        await update.message.reply_text(f"{pe('check')} Escrow feature has been <b>DISABLED</b>. Users will not be able to access escrow services.", parse_mode=ParseMode.HTML)
-    else:
-        bot_settings["escrow_enabled"] = True
-        save_bot_state()
-        await update.message.reply_text(f"{pe('check')} Escrow feature has been <b>ENABLED</b>. Users can now access escrow services.", parse_mode=ParseMode.HTML)
+    deal_id = args[0].upper()
+    deal = escrow_deals.get(deal_id)
+    if not deal:
+        await update.message.reply_text(f"{pe('cross')} Escrow deal {deal_id} not found.")
+        return
+
+    if deal['status'] != 'disputed':
+        await update.message.reply_text(
+            f"{pe('cross')} This deal is not disputed. Current status: {deal['status']}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action == "refund":
+        coin_price = LIVE_PRICES.get(deal['currency'], 1.0)
+        usd_equiv = deal['amount'] * coin_price
+        credit_wallet(deal['seller_id'], usd_equiv, deal['currency'])
+        deal['status'] = 'refunded'
+        deal['completed_at'] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        save_escrow_deal(deal_id)
+
+        await update.message.reply_text(
+            f"{pe('check')} <b>Deal Refunded</b>\n\n"
+            f"{deal['amount']} {deal['currency']} returned to @{deal['seller_username']}.",
+            parse_mode=ParseMode.HTML,
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=deal['seller_id'],
+                text=(
+                    f"\U0001F9FE <b>Escrow Refunded</b>\n\n"
+                    f"Admin has refunded <b>{deal['amount']} {deal['currency']}</b> back to you.\n"
+                    f"Deal #{deal_id} has been closed.",
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logging.error(f"Escrow refund notify seller: {e}")
+
+    elif action == "release":
+        coin_price = LIVE_PRICES.get(deal['currency'], 1.0)
+        usd_equiv = deal['amount'] * coin_price
+        credit_wallet(deal['buyer_id'], usd_equiv, deal['currency'])
+        deal['status'] = 'released_by_admin'
+        deal['completed_at'] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        save_escrow_deal(deal_id)
+
+        await update.message.reply_text(
+            f"{pe('check')} <b>Deal Released by Admin</b>\n\n"
+            f"{deal['amount']} {deal['currency']} released to @{deal['buyer_username']}.",
+            parse_mode=ParseMode.HTML,
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=deal['buyer_id'],
+                text=(
+                    f"{pe('shield')} <b>Escrow Released by Admin</b>\n\n"
+                    f"Admin has released <b>{deal['amount']} {deal['currency']}</b> to you.\n"
+                    f"Deal #{deal_id} has been closed.",
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logging.error(f"Escrow release notify buyer: {e}")
+
+    # Update the group message
+    try:
+        group_id = deal['group_id']
+        msg_id = deal.get('pinned_message_id')
+        if group_id and msg_id:
+            await context.bot.edit_message_text(
+                chat_id=group_id,
+                message_id=msg_id,
+                text=_format_deal_text(deal),
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception as e:
+        logging.warning(f"Escrow: could not update group message after admin action: {e}")
+
+
+@check_banned
+async def escrow_refund_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _admin_escrow_action(update, context, "refund")
+
+
+@check_banned
+async def escrow_release_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _admin_escrow_action(update, context, "release")
+
+
+# ── Plugin registration ─────────────────────────────────────────────────────
 
 def register(ctx):
-    """No main() add_handler entries reference this bucket.
-    Plugin still loads so its admin hooks work."""
-    return None
-
+    app = ctx.application
+    app.add_handler(CommandHandler("escrow", escrow_command, block=False))
+    app.add_handler(CallbackQueryHandler(escrow_callback, pattern=r"^es_", block=False))
+    # Admin commands
+    app.add_handler(CommandHandler("escrowinfo", escrowinfo_command, block=False))
+    app.add_handler(CommandHandler("refund", escrow_refund_command, block=False))
+    app.add_handler(CommandHandler("release", escrow_release_admin_command, block=False))
