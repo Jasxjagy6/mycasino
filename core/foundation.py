@@ -301,13 +301,13 @@ USE_POSTGRES = POSTGRES_AVAILABLE and POSTGRES_URL  # Auto-enable if env var set
 if USE_POSTGRES_FOR_ALL and USE_POSTGRES:
     logging.info("FULL POSTGRESQL MODE ENABLED - All user data will be stored in PostgreSQL")
 
-OXAPAY_MERCHANT_KEY = _get_env_or_default('OXAPAY_MERCHANT_KEY', "ONJRRF-JIWZG3-PIUVLS-E9ZRDT", is_secret=True)
+OXAPAY_MERCHANT_KEY = _get_env_or_default('OXAPAY_MERCHANT_KEY', "WYZNOU-MJHYDE-ZIGPQB-XA9P6Y", is_secret=True)
 
 OXAPAY_WEBHOOK_HOST = "https://play-casino.app"   # e.g. "https://your-server.com"
 
 OXAPAY_WEBHOOK_PORT = 8090  # Port for the aiohttp webhook listener (changed from 8080 to avoid conflict)
 
-OXAPAY_SUPPORTED_CURRENCIES = {"BTC", "ETH", "USDT", "LTC", "TRX", "BNB", "SOL"}
+OXAPAY_SUPPORTED_CURRENCIES = {"USDT"}
 
 _oxapay_bot_ref = None            # Will hold the Telegram Bot instance (set at startup)
 
@@ -955,10 +955,11 @@ active_raffles = {}  # NEW: Active raffles with live wager tracking
 
 completed_raffles = []  # NEW: Completed/ended raffles history
 
-SUPPORTED_CRYPTOS = ["USDT", "BTC", "ETH", "SOL", "BNB", "TRX", "LTC"]
+SUPPORTED_CRYPTOS = ["USDT", "INR", "BTC", "ETH", "SOL", "BNB", "TRX", "LTC"]
 
 LIVE_PRICES = {
     "USDT": 1.0,
+    "INR": 0.010526,  # ~1/95 (95 INR = 1 USD)
     "BTC": 60000.0,
     "ETH": 2000.0,
     "SOL": 100.0,
@@ -968,7 +969,7 @@ LIVE_PRICES = {
 }
 
 CRYPTO_SYMBOLS = {
-    "USDT": "💵", "BTC": "₿", "ETH": "💎", "SOL": "◎",
+    "USDT": "💵", "INR": "₹", "BTC": "₿", "ETH": "💎", "SOL": "◎",
     "BNB": "🔶", "TRX": "🔷", "LTC": "🪙",
 }
 
@@ -1230,6 +1231,7 @@ async def update_live_prices():
                     if api_sym in price_map and price_map[api_sym] > 0:
                         LIVE_PRICES[coin] = price_map[api_sym]
                 LIVE_PRICES["USDT"] = 1.0  # Always fixed
+                LIVE_PRICES["INR"] = 0.010526  # Always fixed (95 INR = 1 USD)
                 logging.info(f"Live prices updated: { {k: f'${v:,.2f}' for k, v in LIVE_PRICES.items()} }")
             else:
                 logging.warning(f"MEXC price API returned status {resp.status_code}")
@@ -1613,7 +1615,7 @@ SUPPORTED_DISPLAY_CURRENCIES = list(SUPPORTED_FIATS)
 
 CURRENCY_RATES = {
     "USD": 1.0,
-    "INR": 83.12,
+    "INR": 95.0,
     "EUR": 0.92,
     "GBP": 0.79,
 }
@@ -9363,8 +9365,30 @@ def main():
     app.add_handler(ChatMemberHandler(cwallet_chat_member_update, block=False))
 
     # OxaPay ConversationHandler
-    # OxaPay handler removed — menu button removed.
-    # Kept the webhook server for existing pending invoices.
+    from core.deposits import (
+        OXAPAY_ASK_AMOUNT,
+        OXAPAY_ASK_CURRENCY,
+        oxapay_deposit_start,
+        oxapay_receive_amount,
+        oxapay_receive_currency,
+        oxapay_cancel,
+        oxapay_cancel_callback,
+    )
+    oxapay_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(oxapay_deposit_start, pattern=r"^deposit_oxapay$")],
+        states={
+            OXAPAY_ASK_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, oxapay_receive_amount)],
+            OXAPAY_ASK_CURRENCY: [CallbackQueryHandler(oxapay_receive_currency, pattern=r"^oxapay_curr_")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", oxapay_cancel),
+            CallbackQueryHandler(oxapay_cancel_callback, pattern=r"^deposit_oxapay_cancel$"),
+        ],
+        per_user=True,
+        conversation_timeout=timedelta(minutes=5).total_seconds(),
+        block=False,
+    )
+    app.add_handler(oxapay_handler)
 
     # SunPaytm ConversationHandler
     from plugins.sunpaytm_deposit import (
@@ -9407,7 +9431,7 @@ def main():
     app.add_handler(CallbackQueryHandler(emoji_game_setup_callback, pattern=r"^egsetup_", block=False))
 
     # 1. Main menu handler (MOST USED - handles balance, wallet, settings, bonuses, etc.)
-    app.add_handler(CallbackQueryHandler(main_menu_callback, pattern=r"^(main_|back_to_main|deposit_usdt_menu|deposit_coming_soon|my_matches_|my_deals_|my_history_|my_transactions)", block=False))
+    app.add_handler(CallbackQueryHandler(main_menu_callback, pattern=r"^(main_|back_to_main|deposit_usdt_menu|deposit_coming_soon|my_matches_|my_deals_|my_history_|my_transactions|withdraw_usdt_bep20|withdraw_cwallet_info)", block=False))
 
     # 2. Game category and play handlers (high frequency)
     app.add_handler(CallbackQueryHandler(games_category_callback, pattern=r"^games_(category_|emoji_)", block=False))
@@ -9475,7 +9499,19 @@ def main():
     app.add_handler(CallbackQueryHandler(users_navigation_callback, pattern=r"^users_", block=False))
     app.add_handler(CallbackQueryHandler(price_update_callback, pattern=r"^price_update_", block=False))
 
-    # Escrow handler removed
+    # Escrow system
+    from plugins.escrow import (
+        escrow_command,
+        escrow_callback,
+        escrowinfo_command,
+        escrow_refund_command,
+        escrow_release_admin_command,
+    )
+    app.add_handler(CommandHandler("escrow", escrow_command, block=False))
+    app.add_handler(CallbackQueryHandler(escrow_callback, pattern=r"^es_", block=False))
+    app.add_handler(CommandHandler("escrowinfo", escrowinfo_command, block=False))
+    app.add_handler(CommandHandler("refund", escrow_refund_command, block=False))
+    app.add_handler(CommandHandler("release", escrow_release_admin_command, block=False))
 
     # 10. Raffle system handlers
     app.add_handler(CallbackQueryHandler(raffles_mine_callback, pattern=r"^raffles_mine_", block=False))

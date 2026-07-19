@@ -206,18 +206,21 @@ async def cwallet_deposit_command(update: Update, context: ContextTypes.DEFAULT_
     if not user:
         return
     text = (
-        f"{pe('money')} <b>CWallet Deposit</b>\n\n"
-        f"Send any crypto tip via @{_resolve_cwallet_bot_username()} "
-        f"to <b>@{CWALLET_RECEIVE_USERNAME}</b> in any group and the "
-        f"USD value will be credited to your casino balance instantly!\n\n"
-        f"{pe('gem')} <b>Supported currencies:</b>\n"
-        f"USDT, BTC, ETH, LTC, TRX, SOL, BNB, and more\n\n"
-        f"{pe('light')} <b>How to deposit:</b>\n"
-        f"1. Go to any group that has @{_resolve_cwallet_bot_username()}\n"
-        f"2. Type: <code>/tip @{CWALLET_RECEIVE_USERNAME} &lt;amount&gt; &lt;currency&gt;</code>\n"
-        f"3. Confirm the tip\n"
-        f"4. The USD value is added to your balance here!\n\n"
-        f"{pe('star')} Prices are calculated at live market rates."
+        "\U0001FA99 <b>CWallet Deposit</b>\n\n"
+        "<b>Instructions:</b>\n"
+        "1. Go to our chat @Diwacasino\n"
+        "2. Make sure you have a balance in @cctip_bot\n"
+        "3. Send a tip using @cctip_bot to us:\n\n"
+        "<b>Format:</b>\n"
+        "<code>/tip 10 USDT @Ittz_surajj</code>\n"
+        "<code>/tip 0.1 ETH @Ittz_surajj</code>\n"
+        "<code>/tip 1 SOL @Ittz_surajj</code>\n\n"
+        "<b>Supported Coins:</b>\n"
+        "\u2022 USDT \u00B7 USDC \u00B7 TON \u00B7 ETH \u00B7 BNB \u00B7 SOL \u00B7 LTC\n\n"
+        "<b>Notes:</b>\n"
+        "\u2022 Use only @cctip_bot.\n"
+        "\u2022 All coins are auto-converted to USD at live market rates.\n"
+        "\u2022 The bot will detect your tip and credit your balance instantly."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 

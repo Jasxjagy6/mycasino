@@ -173,7 +173,7 @@ async def sunpaytm_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.
                     f"{pe('money')} Amount: <code>\u20b9{amount_inr:.2f}</code>\n"
                     f"{pe('dollar')} Credited: <code>${usd_amount:.2f}</code>\n"
                     f"{pe('lightning')} Rate: 95 INR = 1 USD\n"
-                    f"{pe('receipt')} TXN: <code>{trade_no or order_id}</code>\n\n"
+                    f"\uD83E\uDDFE TXN: <code>{trade_no or order_id}</code>\n\n"
                     f"Use /balance to check your updated balance."
                 ),
                 parse_mode=ParseMode.HTML,
@@ -193,22 +193,22 @@ async def sunpaytm_deposit_start(update: Update, context: ContextTypes.DEFAULT_T
     try:
         await safe_edit_message(
             query,
-            f"{pe('bank')} <b>UPI / Bank Deposit via SunPaytm</b>\n\n"
-            f"Enter the amount in <b>INR (\u20b9)</b> you want to deposit.\n\n"
-            f"{pe('dollar')} Rate: <b>95 INR = 1 USD</b>\n"
-            f"{pe('dollar')} Min: <b>\u20b9100</b>\n\n"
-            f"Example: <code>500</code> for \u20b9500 (\u2248 $5.26)",
+            "🏦 <b>UPI / Bank Deposit via SunPaytm</b>\n\n"
+            "Enter the amount in <b>INR (₹)</b> you want to deposit.\n\n"
+            "💲 Rate: <b>95 INR = 1 USD</b>\n"
+            "💲 Min: <b>₹100</b>\n\n"
+            "Example: <code>500</code> for ₹500 (≈ $5.26)",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="deposit_sunpaytm_cancel")]]),
         )
     except Exception as e:
         logging.error(f"SunPaytm deposit start edit failed: {e}", exc_info=True)
         await query.message.reply_text(
-            f"{pe('bank')} <b>UPI / Bank Deposit via SunPaytm</b>\n\n"
-            f"Enter the amount in <b>INR (\u20b9)</b> you want to deposit.\n\n"
-            f"{pe('dollar')} Rate: <b>95 INR = 1 USD</b>\n"
-            f"{pe('dollar')} Min: <b>\u20b9100</b>\n\n"
-            f"Example: <code>500</code> for \u20b9500 (\u2248 $5.26)",
+            "🏦 <b>UPI / Bank Deposit via SunPaytm</b>\n\n"
+            "Enter the amount in <b>INR (₹)</b> you want to deposit.\n\n"
+            "💲 Rate: <b>95 INR = 1 USD</b>\n"
+            "💲 Min: <b>₹100</b>\n\n"
+            "Example: <code>500</code> for ₹500 (≈ $5.26)",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="deposit_sunpaytm_cancel")]]),
         )
@@ -234,7 +234,7 @@ async def sunpaytm_receive_amount(update: Update, context: ContextTypes.DEFAULT_
     usd_amount = amount_inr / SUNPAYTM_INR_TO_USD
 
     await update.message.reply_text(
-        f"{pe('clock')} Creating your deposit order...",
+        "\u23F1 Creating your deposit order...",
     )
 
     result = await _sunpaytm_create_payin(
@@ -266,16 +266,15 @@ async def sunpaytm_receive_amount(update: Update, context: ContextTypes.DEFAULT_
     order_id = result.get("transaction", {}).get("id") or result.get("order_id", "")
 
     text = (
-        f"{pe('bank')} <b>UPI Deposit Order Created</b>\n\n"
-        f"{pe('money')} Amount: <b>\u20b9{amount_inr:.2f}</b>\n"
-        f"{pe('dollar')} You'll receive: <b>${usd_amount:.2f}</b>\n"
-        f"{pe('lightning')} Rate: 95 INR = 1 USD\n\n"
-        f"{pe('rocket')} Click the button below to complete payment:"
+        f"🏦 <b>UPI Deposit Order Created</b>\n\n"
+        f"💰 Amount: <b>\u20b9{amount_inr:.2f}</b>\n"
+        f"💲 You'll receive: <b>${usd_amount:.2f}</b>\n"
+        f"⚡ Rate: 95 INR = 1 USD\n\n"
+        f"🚀 Click the button below to complete payment:"
     )
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Pay Now", url=checkout_url)],
-        [InlineKeyboardButton("Cancel", callback_data="deposit_sunpaytm_cancel")],
     ])
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
